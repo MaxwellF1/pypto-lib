@@ -66,9 +66,9 @@ S = 128
 T = B * S
 START_POS = 0
 SCORE_TOKEN_TILE = 8
-TOPK_TILE = 16
-assert T % SCORE_TOKEN_TILE == 0
+TOPK_TILE = 4
 assert T % TOPK_TILE == 0
+assert T % SCORE_TOKEN_TILE == 0
 INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
 IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
@@ -87,7 +87,6 @@ WEIGHTS_ROW_TILE = 32
 QH_QUANT_BLOCK = 256
 QH_QUANT_ROW_TILE = 64
 ROPE_ROW_BLOCK = IDX_N_HEADS          # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
-ROPE_ROW_TILE = 32
 # Per-token sort-tile width. The sort32/mrgsort/gather path requires a wide tile: a narrow (256)
 # sort faults on device (507018) even with a proper prefix. 2048 matches the indexer KV length and
 # is the confirmed fault-free width. The real score occupies only the first INDEXER_SCORE_CAP
@@ -97,12 +96,15 @@ SORT_LEN = 2048
 # misaligned prefix (e.g. 2*192) faults like a narrow sort. The real score cap is 256, so two
 # merge stages are sufficient: the only finite values are sorted within the first 512-value run.
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
+TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
 assert PREFILL_TOPK_CAP < SORT_LEN and SORT_LEN >= INDEXER_SCORE_CAP
+assert TOPK_PAIR_WIDTH <= SORT_LEN
+assert TOPK_PAIR_WIDTH > 0 and (TOPK_PAIR_WIDTH & (TOPK_PAIR_WIDTH - 1)) == 0
 SCORE_INIT_TILE = 16                   # rows per -inf init write (keep [tile, SORT_LEN] under the Vec-buffer limit)
 assert T % SCORE_INIT_TILE == 0
 assert (IDX_N_HEADS * IDX_HEAD_DIM) % Q_OUT_TILE == 0
 assert (T * IDX_N_HEADS) % QH_QUANT_BLOCK == 0
-assert ROPE_ROW_BLOCK % ROPE_ROW_TILE == 0
+assert QH_QUANT_ROW_TILE == ROPE_ROW_BLOCK
 
 
 @pl.jit.inline
@@ -157,44 +159,56 @@ def prefill_indexer(
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
             qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
-    # === Q RoPE (A3 interleaved swap-gather), one task per token (its IDX_N_HEADS rows + cos/sin) ===
+    # === Q RoPE + Hadamard rotation + per-row INT8 quant ===
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="prefill_idx_qr_rope"):
-        o0 = idx * ROPE_ROW_BLOCK
-        token_idx = idx  # ROPE_ROW_BLOCK == IDX_N_HEADS, so one task == one token
-        cos_b = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        rope_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), cos_b)
-        sin_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), sin_b)
-        cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b32, dim=-1, index=rope_dup_idx)
-        for ro in pl.range(0, ROPE_ROW_BLOCK, ROPE_ROW_TILE):
-            r0 = o0 + ro
-            qr_rope_slice = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-            qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-            rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(pl.mul(qr_swapped, rope_sign), sin_il))
-            qr_rope_out[r0 : r0 + ROPE_ROW_TILE, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-
-    # === Q Hadamard rotation + per-row INT8 quant (mirrors decode_indexer qr_hadamard_quant) ===
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_BLOCK, name_hint="prefill_idx_qr_hadamard_quant"):
+    for idx in pl.spmd(
+        T * IDX_N_HEADS // QH_QUANT_BLOCK,
+        name_hint="prefill_idx_qr_hadamard_quant",
+    ):
         o0 = idx * QH_QUANT_BLOCK
+        rope_col = pl.cast(
+            pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32),
+            target_type=pl.FP32,
+        )
+        rope_dup_f = pl.cast(
+            pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"),
+            target_type=pl.FP32,
+        )
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
+        rope_swap_row = pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0))
+        rope_swap_idx = pl.cast(
+            pl.col_expand_mul(
+                pl.full([QH_QUANT_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
+                rope_swap_row,
+            ),
+            target_type=pl.INT32,
+        )
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
         for ro in pl.range(0, QH_QUANT_BLOCK, QH_QUANT_ROW_TILE):
+            r0 = o0 + ro
+            token_idx = r0 // ROPE_ROW_BLOCK
             qh_nope = pl.cast(
-                qr_proj_flat[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM],
+                qr_proj_flat[r0 : r0 + QH_QUANT_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM],
                 target_type=pl.BF16, mode="rint",
             )
-            qh_rope = qr_rope_out[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, :]
             qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
+            cos_b = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+            sin_b = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+            cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
+            sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
+            qr_rope_slice = qr_proj_flat[
+                r0 : r0 + QH_QUANT_ROW_TILE,
+                IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM,
+            ]
+            qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
+            rope_rot = pl.add(
+                pl.col_expand_mul(qr_rope_slice, cos_il),
+                pl.col_expand_mul(pl.col_expand_mul(qr_swapped, rope_sign), sin_il),
+            )
+            qh_rope = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
             qh_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
             qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
@@ -310,7 +324,7 @@ def prefill_indexer(
                     sorted_tile = pl.sort32(score_row, idx_init)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=64)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=256)
-                    topk_pairs = sorted_tile[:, 0 : 2 * PREFILL_TOPK_CAP]
+                    topk_pairs = sorted_tile[:, 0:TOPK_PAIR_WIDTH]
                     topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     valid_topk = pl.min(PREFILL_TOPK_CAP, visible_t)
                     cmp_topk_indices[t : t + 1, 0:PREFILL_TOPK_CAP] = pl.set_validshape(
@@ -333,6 +347,46 @@ def _int8_quant_per_row(x):
     out_i8 = torch.round(rows * scale_quant).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
+
+
+def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
+    """Return an error string if the top-k prefix contract is broken."""
+    import torch
+
+    if hasattr(num_tokens, "item"):
+        num_tokens = num_tokens.item()
+    num_tokens = int(num_tokens)
+    for t in range(T):
+        row = topk_indices[t]
+        if t >= num_tokens:
+            non_padding = int((row != -1).count_nonzero().item())
+            if non_padding:
+                return f"inactive top-k row {t} contains {non_padding} non--1 entries"
+            continue
+        visible = min(
+            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
+            INDEXER_TOPK_CAP,
+        )
+        prefix = row[:visible]
+        if visible:
+            out_of_range = int(
+                ((prefix < 0) | (prefix >= visible)).count_nonzero().item()
+            )
+            if out_of_range:
+                return (
+                    f"top-k row {t} has {out_of_range} entries outside "
+                    f"[0, {visible}) in its visible prefix"
+                )
+            unique_count = int(torch.unique(prefix).numel())
+            if unique_count != visible:
+                return (
+                    f"top-k row {t} visible prefix has "
+                    f"{unique_count}/{visible} unique entries"
+                )
+        tail_non_padding = int((row[visible:] != -1).count_nonzero().item())
+        if tail_non_padding:
+            return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
+    return None
 
 
 def golden_prefill_indexer_core(tensors):
@@ -518,17 +572,18 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
     from golden import ScalarSpec, TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    num_tokens = T
+    if num_tokens <= 0 or num_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
     if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")
-    max_visible = (start_pos + T) // COMPRESS_RATIO
+    max_visible = (start_pos + num_tokens) // COMPRESS_RATIO
     if max_visible > INDEXER_SCORE_CAP:
         raise ValueError(
             f"prefill_indexer needs max_visible={max_visible} compressed slots for start_pos={start_pos}, "
@@ -699,14 +754,36 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token prefix; inactive top-k rows must remain all -1.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    active_score_cmp = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+
+    def score_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        return active_score_cmp(
+            actual[:args.num_tokens],
+            expected[:args.num_tokens],
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
 
     def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         score = actual_outputs["score"]
         a_top = actual[..., :IDX_TOPK]
         e_top = expected[..., :IDX_TOPK]
+        contract_error = topk_prefix_contract_error(
+            a_top,
+            inputs["position_ids"],
+            args.num_tokens,
+        )
+        if contract_error:
+            return False, f"    {contract_error}"
         invalid_top = a_top < 0
         a_orig = a_top.long().clamp(min=0, max=score.shape[-1] - 1)
         paired = torch.gather(score, dim=-1, index=a_orig)
@@ -723,7 +800,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=prefill_indexer_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
@@ -731,7 +808,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "score": score_compare,
             "topk_idxs": topk_idxs_compare,
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),

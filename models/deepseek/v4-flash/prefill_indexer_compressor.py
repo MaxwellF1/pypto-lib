@@ -44,7 +44,8 @@ S = 128
 START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 PREFILL_ROWS = B * PREFILL_COMPRESSED_LEN
-HEAD_CHUNK = 32
+HEAD_CHUNK = 128
+assert HEAD_DIM % HEAD_CHUNK == 0
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_TILE = 512
 OUT_TILE = 64
@@ -374,35 +375,34 @@ def prefill_indexer_compressor(
                 ]
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
 
-    for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
-        update_ob = update_idx % PACKED_PROJ_BLOCKS
-        update_t = update_idx // PACKED_PROJ_BLOCKS
-        update_o0 = update_ob * OUT_TILE
+    for update_t in pl.spmd(T, name_hint="prefill_idx_c4_state_update"):
         if update_t < num_tokens:
             state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
             if state_row_raw >= 0:
                 state_row = pl.cast(state_row_raw, pl.INDEX)
                 update_pos = pl.read(position_ids, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
                 pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                    kv_proj_scratch[
-                        update_t : update_t + 1,
-                        update_o0 : update_o0 + OUT_TILE,
-                    ],
-                    pool_dep,
-                )
-                compress_state_flat[
-                    state_row : state_row + 1,
-                    OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
-                ] = pl.add(
-                    pl.add(
-                        score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                        ape_row,
-                    ),
-                    pool_dep,
-                )
+                for update_ob in pl.range(PACKED_PROJ_BLOCKS):
+                    update_o0 = update_ob * OUT_TILE
+                    ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
+                    compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                        kv_proj_scratch[
+                            update_t : update_t + 1,
+                            update_o0 : update_o0 + OUT_TILE,
+                        ],
+                        pool_dep,
+                    )
+                    compress_state_flat[
+                        state_row : state_row + 1,
+                        OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                    ] = pl.add(
+                        pl.add(
+                            score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
+                            ape_row,
+                        ),
+                        pool_dep,
+                    )
 
     # Writes through the flattened views already update the caller-owned buffers.
     # Avoid a dynamic reshape-back here because this inline kernel is nested.

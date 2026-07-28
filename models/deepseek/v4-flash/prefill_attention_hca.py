@@ -44,9 +44,12 @@ from prefill_compressor_ratio128 import (
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
+    PREFILL_ATTN_TILE,
+    SPARSE_BIAS_COLS,
+    VALID_BLOCK_MASK_COLS,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    prefill_sparse_attn,
+    _prefill_sparse_attn_with_block_mask,
 )
 
 
@@ -192,12 +195,16 @@ def prefill_attention_hca(
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
     cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    cmp_counts = pl.create_tensor([T, 8], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor(
+        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
+    )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_sparse_indices"):
         for idx_t in pl.range(T):
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            cmp_count = pl.full([1, 8], dtype=pl.INT32, value=0)
+            mask_row = pl.full(
+                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
+            )
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -211,29 +218,37 @@ def prefill_attention_hca(
                         if blk >= 0:
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(swa_row, [0, win_col], row)
+                            if win_col < SPARSE_BIAS_COLS:
+                                pl.write(
+                                    mask_row,
+                                    [0, win_col // PREFILL_ATTN_TILE],
+                                    pl.cast(1, pl.INT32),
+                                )
                 visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                pl.write(
-                    cmp_count,
-                    [0, 0],
-                    pl.cast(
-                        pl.min(pl.min(visible_cmp, IDX_TOPK), SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE),
-                        pl.INT32,
-                    ),
-                )
                 for cmp_col in pl.range(IDX_TOPK):
                     cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
                     if cmp_col_i32 < visible_cmp:
                         if cmp_col_i32 < pl.cast(SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INT32):
                             pl.write(cmp_row, [0, cmp_col], cmp_col_i32)
+                            sparse_col = WIN + cmp_col
+                            if sparse_col < SPARSE_BIAS_COLS:
+                                pl.write(
+                                    mask_row,
+                                    [0, sparse_col // PREFILL_ATTN_TILE],
+                                    pl.cast(1, pl.INT32),
+                                )
             swa_indices = pl.assemble(swa_indices, swa_row, [idx_t, 0])
             cmp_indices = pl.assemble(cmp_indices, cmp_row, [idx_t, 0])
-            cmp_counts = pl.assemble(cmp_counts, cmp_count, [idx_t, 0])
+            valid_block_mask = pl.assemble(
+                valid_block_mask, mask_row, [idx_t, 0]
+            )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    prefill_sparse_attn(
+    _prefill_sparse_attn_with_block_mask(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
-        cmp_indices, cmp_counts,
+        cmp_indices,
+        valid_block_mask,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,

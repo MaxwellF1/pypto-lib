@@ -33,9 +33,12 @@ from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
+    PREFILL_ATTN_TILE,
+    SPARSE_BIAS_COLS,
+    VALID_BLOCK_MASK_COLS,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    prefill_sparse_attn,
+    _prefill_sparse_attn_with_block_mask,
 )
 
 
@@ -176,9 +179,15 @@ def prefill_attention_swa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor(
+        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
+    )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
         for idx_t in pl.range(T):
             idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            mask_row = pl.full(
+                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
+            )
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -192,19 +201,28 @@ def prefill_attention_swa(
                         if blk >= 0:
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(idx_row, [0, win_col], row)
+                            if win_col < SPARSE_BIAS_COLS:
+                                pl.write(
+                                    mask_row,
+                                    [0, win_col // PREFILL_ATTN_TILE],
+                                    pl.cast(1, pl.INT32),
+                                )
             swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
+            valid_block_mask = pl.assemble(
+                valid_block_mask, mask_row, [idx_t, 0]
+            )
 
     cmp_block_table_dummy = pl.create_tensor(
         [SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0
     )
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
-    cmp_counts_dummy = pl.create_tensor([T, 8], dtype=pl.INT32, init_value=0)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    prefill_sparse_attn(
+    _prefill_sparse_attn_with_block_mask(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy,
-        cmp_indices_dummy, cmp_counts_dummy,
+        cmp_indices_dummy,
+        valid_block_mask,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,

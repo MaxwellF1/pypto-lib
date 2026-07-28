@@ -44,12 +44,15 @@ from prefill_compressor_ratio4 import (
 from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
+    COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,
     IDX_CACHE_MAX_BLOCKS,
     INDEXER_SCORE_CAP,
+    INDEXER_TOPK_CAP,
     _int8_quant_per_row as _idx_int8_quant_per_row,
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
+    topk_prefix_contract_error,
 )
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
@@ -59,9 +62,14 @@ from prefill_indexer_compressor import (
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
+    PREFILL_ATTN_BLOCKS,
+    PREFILL_ATTN_TILE,
+    PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
+    SPARSE_CMP_BIAS_COLS,
+    VALID_BLOCK_MASK_COLS,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    prefill_sparse_attn,
+    _prefill_sparse_attn_with_block_mask,
 )
 
 B = PREFILL_BATCH
@@ -82,7 +90,6 @@ IDX_HEAD_DIM = M.index_head_dim
 IDX_N_HEADS = M.index_n_heads
 IDX_TOPK = M.index_topk
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-SPARSE_TOPK = WIN + IDX_TOPK
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -108,14 +115,8 @@ CSA_TOPK_TOKEN_TILE = 2
 WRITEBACK_GUARD_TILE = 16
 
 
-# prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
-PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
-PREFILL_SPARSE_TOPK = min(SPARSE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
-PREFILL_ATTN_TILE = 128
-PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
-SPARSE_PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
@@ -126,6 +127,9 @@ IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
+assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
+assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
+assert INDEXER_TOPK_CAP <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
 
 
 @pl.jit.inline
@@ -255,18 +259,41 @@ def prefill_attention_csa(
     )
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    cmp_counts = pl.create_tensor([T, 8], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor(
+        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
+    )
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
             t_idx = topk_t0 + topk_dt
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            cmp_count = pl.full([1, 8], dtype=pl.INT32, value=0)
+            mask_row = pl.full(
+                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
+            )
             if t_idx < num_tokens:
                 abs_pos = pl.read(position_ids, [t_idx])
+                # Derive block liveness from the dense top-k prefix and -1 padding.
+                visible_cmp = pl.min(
+                    (abs_pos + 1) // COMPRESS_RATIO,
+                    pl.cast(INDEXER_TOPK_CAP, pl.INT32),
+                )
+                for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
+                    cmp_lo = pl.max(
+                        mask_sb * PREFILL_ATTN_TILE - WIN,
+                        pl.cast(0, pl.INT32),
+                    )
+                    cmp_hi = pl.min(
+                        (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
+                        pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
+                    )
+                    if cmp_lo < cmp_hi:
+                        if visible_cmp > cmp_lo:
+                            pl.write(
+                                mask_row,
+                                [0, mask_sb],
+                                pl.cast(1, pl.INT32),
+                            )
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
                 key_start_abs = abs_pos + 1 - window_valid
                 for win_col in pl.range(WIN):
@@ -278,31 +305,22 @@ def prefill_attention_csa(
                         if blk >= 0:
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(swa_row, [0, win_col], row)
-                visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                pl.write(
-                    cmp_count,
-                    [0, 0],
-                    pl.cast(
-                        pl.min(pl.min(visible_cmp, IDX_TOPK), SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE),
-                        pl.INT32,
-                    ),
-                )
-                for cmp_col in pl.range(IDX_TOPK):
-                    cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
-                    if cmp_col_i32 < visible_cmp:
-                        topk_raw = pl.read(cmp_topk_indices, [t_idx, cmp_col])
-                        if topk_raw >= 0:
-                            if topk_raw < pl.cast(SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INT32):
-                                pl.write(cmp_row, [0, cmp_col], topk_raw)
+                            pl.write(
+                                mask_row,
+                                [0, win_col // PREFILL_ATTN_TILE],
+                                pl.cast(1, pl.INT32),
+                            )
             swa_indices = pl.assemble(swa_indices, swa_row, [t_idx, 0])
-            cmp_indices = pl.assemble(cmp_indices, cmp_row, [t_idx, 0])
-            cmp_counts = pl.assemble(cmp_counts, cmp_count, [t_idx, 0])
+            valid_block_mask = pl.assemble(
+                valid_block_mask, mask_row, [t_idx, 0]
+            )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    prefill_sparse_attn(
+    _prefill_sparse_attn_with_block_mask(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
-        cmp_indices, cmp_counts,
+        cmp_topk_indices,
+        valid_block_mask,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
@@ -493,12 +511,10 @@ def golden_prefill_attention_csa(tensors):
             return -1
         return phys_block * BLOCK_SIZE + intra
 
-    def assemble_sparse_indices(cmp_topk):
+    def assemble_swa_indices():
         swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
-        cmp_idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
         ori_table = tensors["ori_block_table"]
-        cmp_cap = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
         for t in range(num_tokens):
             abs_pos = int(pos[t].item())
             window_valid = min(WIN, abs_pos + 1)
@@ -507,14 +523,17 @@ def golden_prefill_attention_csa(tensors):
                 row = cache_row_from_table(ori_table, key_abs)
                 if row >= 0:
                     swa_idx[t, k] = row
-            visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-            for ck, raw_t in enumerate(cmp_topk[t, :IDX_TOPK].tolist()):
-                raw = int(raw_t)
-                if raw >= 0 and raw < visible_cmp and raw < cmp_cap:
-                    cmp_idx[t, ck] = raw
-        return swa_idx, cmp_idx
+        return swa_idx
 
-    swa_indices, cmp_indices = assemble_sparse_indices(cmp_topk_indices)
+    contract_error = topk_prefix_contract_error(
+        cmp_topk_indices,
+        tensors["position_ids"],
+        tensors["num_tokens"],
+    )
+    if contract_error:
+        raise AssertionError(f"prefill indexer top-k contract failed: {contract_error}")
+    swa_indices = assemble_swa_indices()
+    cmp_indices = cmp_topk_indices.clone()
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_prefill_sparse_attn({
         "q": q,
