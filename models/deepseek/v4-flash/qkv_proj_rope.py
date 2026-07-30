@@ -32,7 +32,7 @@ MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
 Q_PROJ_TILE = 128       # qproj K-tile (Q_LORA reduction); 8 slices -> deep stage=2 pipeline, double-buffered Mat fits
-QPROJ_MM_N_TILE = 1024  # full L2 lines per wq_b row (no over-fetch)
+QPROJ_MM_N_TILE = 512    # qproj output-column tile
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 256
@@ -225,22 +225,21 @@ def qkv_proj_rope(
     # downstream vector work. This lets the scheduler defer q dequant until AIV is free
     # instead of pinning it next to qproj and competing with the critical qr_proj AIV work.
     q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
-    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 2, name_hint="qproj_matmul", allow_early_resolve=True):
-        hg = hg_idx * 2
-        for h_inner in pl.range(2):
-            w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
-            for tc in pl.range(t_matmul // QPROJ_M_TILE):
-                t0 = tc * QPROJ_M_TILE
-                col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
-                for qb in pl.pipeline(0, Q_LORA // Q_PROJ_TILE, stage=2):
-                    qr_proj_col0 = qb * Q_PROJ_TILE
-                    qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
-                    wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                    if qr_proj_col0 == 0:
-                        col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                    else:
-                        col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
-                q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
+    # One output-column fragment per task.
+    for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+        w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
+        for tc in pl.range(t_matmul // QPROJ_M_TILE):
+            t0 = tc * QPROJ_M_TILE
+            col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+            for qb in pl.pipeline(0, Q_LORA // Q_PROJ_TILE, stage=2):
+                qr_proj_col0 = qb * Q_PROJ_TILE
+                qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
+                wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                if qr_proj_col0 == 0:
+                    col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
+                else:
+                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+            q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
     # Fuse qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
     # A full [token, head] tile fits in Vec UB, so dequantize each head once and

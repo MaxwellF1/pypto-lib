@@ -107,6 +107,7 @@ assert D % PROJ_B_ACT_N_TILE == 0 and O_LORA % QUANT_TILE == 0
 # Sparse K is split into compile-time blocks of PREFILL_ATTN_TILE rows.
 PREFILL_ATTN_TILE = 128
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+assert WIN == PREFILL_ATTN_TILE, f"Sparse prefill expects WIN ({WIN}) == PREFILL_ATTN_TILE ({PREFILL_ATTN_TILE})"
 PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 MASK_ALIGN_ELEMS = 32 // 4
 VALID_BLOCK_MASK_COLS = (
@@ -147,19 +148,42 @@ def _prefill_sparse_attn_with_block_mask(
     ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
-    # Dispatch token tiles in reverse order.
     with pl.spmd(
-        ((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS,
-        name_hint="gather_kv",
-    ) as gather_tid:
-        gather_block = pl.tile.get_block_idx()
-        gather_schedule_block = gather_block // PREFILL_ATTN_BLOCKS
+        (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE,
+        name_hint="gather_ori_kv",
+    ) as gather_ori_tid:
+        gather_schedule_block = pl.tile.get_block_idx()
         gather_token_block = (
             (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
             - 1
             - gather_schedule_block
         )
-        gather_sb = gather_block - gather_schedule_block * PREFILL_ATTN_BLOCKS
+        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
+        for gather_dt in pl.range(GATHER_TOKEN_TILE):
+            gather_t = gather_t0 + gather_dt
+            if gather_t < T:
+                if gather_t < num_tokens:
+                    block_base = gather_t * PREFILL_SPARSE_PAD
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                        gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
+                        if gather_raw >= 0:
+                            src = pl.cast(gather_raw, pl.INDEX)
+                            stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
+                    sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
+
+    with pl.spmd(
+        ((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * (PREFILL_ATTN_BLOCKS - 1),
+        name_hint="gather_cmp_kv",
+    ) as gather_cmp_tid:
+        gather_block = pl.tile.get_block_idx()
+        gather_schedule_block = gather_block // (PREFILL_ATTN_BLOCKS - 1)
+        gather_token_block = (
+            (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
+            - 1
+            - gather_schedule_block
+        )
+        gather_sb = gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1
         gather_t0 = gather_token_block * GATHER_TOKEN_TILE
         gather_k0 = gather_sb * PREFILL_ATTN_TILE
         for gather_dt in pl.range(GATHER_TOKEN_TILE):
@@ -167,30 +191,19 @@ def _prefill_sparse_attn_with_block_mask(
             if gather_t < T:
                 if gather_t < num_tokens:
                     gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    if gather_sb == 0:
-                        # Materialize zero K/V in block 0 for all-masked rows.
-                        gather_block_valid = pl.cast(1, pl.INT32)
                     if gather_block_valid > 0:
                         block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
                         stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                         for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                            gather_k = gather_k0 + gather_ki
-                            gather_raw = pl.cast(-1, pl.INT32)
-                            if gather_k < WIN:
-                                gather_raw = pl.read(swa_indices, [gather_t, gather_k])
+                            gather_cmp_k = gather_k0 + gather_ki - WIN
+                            if gather_cmp_k < IDX_TOPK:
+                                gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
                                 if gather_raw >= 0:
-                                    src = pl.cast(gather_raw, pl.INDEX)
-                                    stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
-                            else:
-                                gather_cmp_k = gather_k - WIN
-                                if gather_cmp_k < IDX_TOPK:
-                                    gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
-                                    if gather_raw >= 0:
-                                        cmp_slot = gather_raw
-                                        blk_slot = cmp_slot // BLOCK_SIZE
-                                        blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
-                                        src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                        stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
+                                    cmp_slot = gather_raw
+                                    blk_slot = cmp_slot // BLOCK_SIZE
+                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
+                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
+                                    stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
                         sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
     sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
@@ -280,7 +293,7 @@ def _prefill_sparse_attn_with_block_mask(
     with pl.spmd(
         T,
         name_hint="qk_pv",
-        deps=[gather_tid, bias_tid],
+        deps=[gather_ori_tid, gather_cmp_tid, bias_tid],
     ) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         if qk_t < num_tokens:

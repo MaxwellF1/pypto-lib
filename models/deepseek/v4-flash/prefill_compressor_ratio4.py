@@ -39,11 +39,11 @@ S = 128
 START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 PREFILL_ROWS = B * PREFILL_COMPRESSED_LEN
-HEAD_CHUNK = 256
+HEAD_CHUNK = 512
 assert HEAD_DIM % HEAD_CHUNK == 0
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_TILE = 512
-OUT_TILE = 32
+OUT_TILE = 64
 HEAD_TILE = 64
 RMS_TILE = 16
 
@@ -57,6 +57,11 @@ COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
 PACKED_STATE_UPDATE_TILE = 16
+STATE_UPDATE_TOKEN_TILE = 2
+STATE_UPDATE_OUT_TILE = 256
+assert T % STATE_UPDATE_TOKEN_TILE == 0
+assert OUT_DIM % STATE_UPDATE_OUT_TILE == 0
+assert STATE_UPDATE_OUT_TILE <= HEAD_DIM
 PACKED_RMS_TILE = 16
 
 
@@ -321,40 +326,47 @@ def prefill_compressor_ratio4(
                     0:HEAD_DIM,
                 ]
 
-    # State writeback: one SPMD task per token (was per token x out-block =
-    # T*PACKED_PROJ_BLOCKS tiny tasks). The per-token guard is checked
-    # once so a skipped token costs one empty task instead of PACKED_PROJ_BLOCKS
-    # of them; out-blocks are looped inside the task at the OUT_TILE width.
-    # pool_dep keeps the (zero-weighted) ordering after the pool and is hoisted
-    # to once per token.
-    for update_t in pl.spmd(T, name_hint="prefill_c4_state_update"):
-        if update_t < num_tokens:
-            state_row_raw = pl.read(state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                for update_ob in pl.range(PACKED_PROJ_BLOCKS):
-                    update_o0 = update_ob * OUT_TILE
-                    ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                    compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                        cmp4_kv_proj_scratch[
-                            update_t : update_t + 1,
-                            update_o0 : update_o0 + OUT_TILE,
-                        ],
-                        pool_dep,
-                    )
-                    compress_state_flat[
-                        state_row : state_row + 1,
-                        OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
-                    ] = pl.add(
-                        pl.add(
-                            cmp4_score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                            ape_row,
-                        ),
-                        pool_dep,
-                    )
+    # State writeback uses two-token tasks and 256-element output chunks.
+    for update_tb in pl.spmd(T // STATE_UPDATE_TOKEN_TILE, name_hint="prefill_c4_state_update"):
+        update_base = update_tb * STATE_UPDATE_TOKEN_TILE
+        for update_dt in pl.range(STATE_UPDATE_TOKEN_TILE):
+            update_t = update_base + update_dt
+            if update_t < num_tokens:
+                state_row_raw = pl.read(state_slot_mapping, [update_t])
+                if state_row_raw >= 0:
+                    state_row = pl.cast(state_row_raw, pl.INDEX)
+                    update_pos = pl.read(position_ids, [update_t])
+                    ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+                    pool_dep = pl.mul(pooled_kv[0:1, 0:STATE_UPDATE_OUT_TILE], 0.0)
+                    for update_ob in pl.range(OUT_DIM // STATE_UPDATE_OUT_TILE):
+                        update_o0 = update_ob * STATE_UPDATE_OUT_TILE
+                        ape_row = ape[
+                            ape_slot : ape_slot + 1,
+                            update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
+                        ]
+                        compress_state_flat[
+                            state_row : state_row + 1,
+                            update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
+                        ] = pl.add(
+                            cmp4_kv_proj_scratch[
+                                update_t : update_t + 1,
+                                update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
+                            ],
+                            pool_dep,
+                        )
+                        compress_state_flat[
+                            state_row : state_row + 1,
+                            OUT_DIM + update_o0 : OUT_DIM + update_o0 + STATE_UPDATE_OUT_TILE,
+                        ] = pl.add(
+                            pl.add(
+                                cmp4_score_proj_scratch[
+                                    update_t : update_t + 1,
+                                    update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
+                                ],
+                                ape_row,
+                            ),
+                            pool_dep,
+                        )
 
     # Writes through the flattened views already update the caller-owned buffers.
     # Avoid a dynamic reshape-back here because this inline kernel is nested.
