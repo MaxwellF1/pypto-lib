@@ -18,14 +18,14 @@ from config import (
     HCA_STATE_PHYSICAL_BLOCKS,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    PREFILL_BATCH,
     KV_CMP_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
+    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
-from hc_post import golden_hc_post_prefill, hc_post_prefill
+from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
@@ -34,26 +34,24 @@ from prefill_compressor_ratio128 import (
     golden_prefill_compressor_ratio128,
     prefill_compressor_ratio128,
 )
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
+from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows_dynamic, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     PREFILL_ATTN_TILE,
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    sparse_attn,
+    sparse_attn_physical,
 )
 
 
 # Dynamic shape variables.
+T_DYN = pl.dynamic("PREFILL_HCA_T_DYN")
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
 STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
 
 # model config
-B = PREFILL_BATCH
-S = PREFILL_SEQ
-T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -90,12 +88,13 @@ HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 # shared prefill pruning width must cover the whole cache, not a top-k budget.
 assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
     f"prefill HCA compressed tail ({PREFILL_MAX_COMPRESSED} slots) must cover "
-    f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)")
+    f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)"
+)
 
 
 @pl.jit.inline
 def prefill_attention_hca(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -112,121 +111,144 @@ def prefill_attention_hca(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    compress_state: pl.Tensor[
-        [STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32
-    ],
+    compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
+    x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-    comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    t_dim = pl.tensor.dim(x_hc, 0)
+    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    post = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
 
-    rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
+    rope_cos_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.BF16)
+    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t)
 
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, late_dep,
+        x_normed,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
+        late_dep,
     )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     kv_cache_flat = pl.reshape(kv_cache, [ori_cache_rows, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_cache_write"):
-        for write_t in pl.range(T):
-            if write_t < num_tokens:
-                write_row_raw = pl.read(ori_slot_mapping, [write_t])
-                if write_row_raw >= 0:
-                    write_row = pl.cast(write_row_raw, pl.INDEX)
-                    kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
+        for write_t in pl.range(t_dim):
+            write_row_raw = pl.read(ori_slot_mapping, [write_t])
+            if write_row_raw >= 0:
+                write_row = pl.cast(write_row_raw, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     prefill_compressor_ratio128(
-        x_normed, compress_state, compress_state_block_table,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        freqs_cos, freqs_sin, cmp_kv,
-        position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        x_normed,
+        compress_state,
+        compress_state_block_table,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        freqs_cos,
+        freqs_sin,
+        cmp_kv,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
     )
 
-    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
+    cmp_indices = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_sparse_indices"):
-        for idx_t in pl.range(T):
+        for idx_t in pl.range(t_dim):
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            if idx_t < num_tokens:
-                abs_pos = pl.read(position_ids, [idx_t])
-                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-                key_start_abs = abs_pos + 1 - window_valid
-                for win_col in pl.range(WIN):
-                    win_col_i32 = pl.cast(win_col, pl.INT32)
-                    if win_col_i32 < window_valid:
-                        key_abs = key_start_abs + win_col_i32
-                        blk_slot = key_abs // BLOCK_SIZE
-                        blk = pl.read(ori_block_table, [pl.cast(blk_slot, pl.INDEX)])
-                        if blk >= 0:
-                            row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                            pl.write(swa_row, [0, win_col], row)
-                            if win_col < SPARSE_BIAS_COLS:
-                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
-                visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                for cmp_col in pl.range(IDX_TOPK):
-                    cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
-                    if cmp_col_i32 < visible_cmp:
-                        if cmp_col_i32 < pl.cast(SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INT32):
-                            pl.write(cmp_row, [0, cmp_col], cmp_col_i32)
-                            sparse_col = WIN + cmp_col
-                            if sparse_col < SPARSE_BIAS_COLS:
-                                pl.write(mask_row, [0, sparse_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+            abs_pos = pl.read(position_ids, [idx_t])
+            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            for win_col in pl.range(WIN):
+                win_col_i32 = pl.cast(win_col, pl.INT32)
+                if win_col_i32 < window_valid:
+                    key_abs = key_start_abs + win_col_i32
+                    blk_slot = key_abs // BLOCK_SIZE
+                    blk = pl.read(ori_block_table, [pl.cast(blk_slot, pl.INDEX)])
+                    if blk >= 0:
+                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                        pl.write(swa_row, [0, win_col], row)
+                        if win_col < SPARSE_BIAS_COLS:
+                            pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+            visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
+            for cmp_col in pl.range(IDX_TOPK):
+                cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
+                if cmp_col_i32 < visible_cmp:
+                    if cmp_col_i32 < pl.cast(SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INT32):
+                        pl.write(cmp_row, [0, cmp_col], cmp_col_i32)
+                        sparse_col = WIN + cmp_col
+                        if sparse_col < SPARSE_BIAS_COLS:
+                            pl.write(mask_row, [0, sparse_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
             swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
             cmp_indices[idx_t : idx_t + 1, 0:IDX_TOPK] = cmp_row
             valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn(
-        q, kv_cache, swa_indices,
-        cmp_kv, cmp_block_table,
+    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    sparse_attn_physical(
+        q,
+        kv_cache,
+        swa_indices,
+        cmp_kv,
+        cmp_block_table,
         cmp_indices,
         valid_block_mask,
-        attn_sink, num_tokens,
-        rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
+        attn_sink,
+        rope_cos_t,
+        rope_sin_t,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
     )
 
-    hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
+    hc_post(attn_out, x_hc, post, comb, x_out)
     return x_out
 
 
 @pl.jit
 def prefill_attention_hca_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -248,32 +270,62 @@ def prefill_attention_hca_test(
     ],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
+    x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
+    x_hc.bind_dynamic(0, T_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
+    ori_slot_mapping.bind_dynamic(0, T_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
+    x_out.bind_dynamic(0, T_DYN)
+
     prefill_attention_hca(
         x_hc,
-        hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        compress_state, compress_state_block_table,
-        kv_cache, ori_slot_mapping, ori_block_table,
-        cmp_kv, cmp_block_table,
-        position_ids, cmp_slot_mapping, state_slot_mapping,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, num_tokens,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        compress_state,
+        compress_state_block_table,
+        kv_cache,
+        ori_slot_mapping,
+        ori_block_table,
+        cmp_kv,
+        cmp_block_table,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        x_out,
     )
     return x_out
 
@@ -295,80 +347,82 @@ def golden_prefill_attention_hca(tensors):
 
     from utils import cache_row_from_table
 
-    num_tokens = int(tensors["num_tokens"])
-    x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
-    x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
-    x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
-    post = torch.zeros(T, HC_MULT, dtype=torch.float32)
-    comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
-    golden_hc_pre({
-        "x": x_hc_flat,
-        "hc_fn": tensors["hc_attn_fn"],
-        "hc_scale": tensors["hc_attn_scale"],
-        "hc_base": tensors["hc_attn_base"],
-        "x_mixed": x_mixed,
-        "post": post,
-        "comb": comb,
-    })
+    token_count = tensors["x_hc"].shape[0]
+    x_hc_flat = tensors["x_hc"].view(token_count, HC_MULT, D)
+    x_mixed = torch.zeros(token_count, D, dtype=torch.bfloat16)
+    post = torch.zeros(token_count, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(token_count, HC_MULT * HC_MULT, dtype=torch.float32)
+    golden_hc_pre(
+        {
+            "x": x_hc_flat,
+            "hc_fn": tensors["hc_attn_fn"],
+            "hc_scale": tensors["hc_attn_scale"],
+            "hc_base": tensors["hc_attn_base"],
+            "x_mixed": x_mixed,
+            "post": post,
+            "comb": comb,
+        }
+    )
 
-    q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
-    kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
-    qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
-    qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    q = torch.zeros(token_count, H, HEAD_DIM, dtype=torch.bfloat16)
+    kv = torch.zeros(token_count, HEAD_DIM, dtype=torch.bfloat16)
+    qr = torch.zeros(token_count, Q_LORA, dtype=torch.int8)
+    qr_scale = torch.zeros(token_count, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
-    rope_cos_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
-    rope_sin_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
     positions = tensors["position_ids"].to(torch.long)
     rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
-    golden_qkv_proj_rope({
-        "x": x_normed.view(T, D),
-        "wq_a": tensors["wq_a"],
-        "wq_b": tensors["wq_b"],
-        "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
-        "rope_cos": rope_cos_t,
-        "rope_sin": rope_sin_t,
-        "gamma_cq": tensors["gamma_cq"],
-        "gamma_ckv": tensors["gamma_ckv"],
-        "q": q,
-        "kv": kv,
-        "qr": qr,
-        "qr_scale": qr_scale,
-    })
+    golden_qkv_proj_rope(
+        {
+            "x": x_normed.view(token_count, D),
+            "wq_a": tensors["wq_a"],
+            "wq_b": tensors["wq_b"],
+            "wq_b_scale": tensors["wq_b_scale"],
+            "wkv": tensors["wkv"],
+            "rope_cos": rope_cos_t,
+            "rope_sin": rope_sin_t,
+            "gamma_cq": tensors["gamma_cq"],
+            "gamma_ckv": tensors["gamma_ckv"],
+            "q": q,
+            "kv": kv,
+            "qr": qr,
+            "qr_scale": qr_scale,
+        }
+    )
 
     ori_kv = tensors["kv_cache"]
     ori_kv_flat = ori_kv.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-    for t in range(num_tokens):
+    for t in range(token_count):
         dst_row = int(tensors["ori_slot_mapping"][t].item())
         if dst_row >= 0:
             ori_kv_flat[dst_row, :] = kv[t]
 
     cmp_kv = tensors["cmp_kv"]
-    golden_prefill_compressor_ratio128({
-        "x": x_normed.view(T, D),
-        "compress_state": tensors["compress_state"],
-        "compress_state_block_table": tensors["compress_state_block_table"],
-        "wkv": tensors["cmp_wkv"],
-        "wgate": tensors["cmp_wgate"],
-        "ape": tensors["cmp_ape"],
-        "norm_w": tensors["cmp_norm_w"],
-        "freqs_cos": tensors["freqs_cos"],
-        "freqs_sin": tensors["freqs_sin"],
-        "cmp_kv": cmp_kv,
-        "position_ids": tensors["position_ids"],
-        "num_tokens": tensors["num_tokens"],
-        "cmp_slot_mapping": tensors["cmp_slot_mapping"],
-        "state_slot_mapping": tensors["state_slot_mapping"],
-    })
+    golden_prefill_compressor_ratio128(
+        {
+            "x": x_normed.view(token_count, D),
+            "compress_state": tensors["compress_state"],
+            "compress_state_block_table": tensors["compress_state_block_table"],
+            "wkv": tensors["cmp_wkv"],
+            "wgate": tensors["cmp_wgate"],
+            "ape": tensors["cmp_ape"],
+            "norm_w": tensors["cmp_norm_w"],
+            "freqs_cos": tensors["freqs_cos"],
+            "freqs_sin": tensors["freqs_sin"],
+            "cmp_kv": cmp_kv,
+            "position_ids": tensors["position_ids"],
+            "cmp_slot_mapping": tensors["cmp_slot_mapping"],
+            "state_slot_mapping": tensors["state_slot_mapping"],
+        }
+    )
 
     def build_sparse_metadata():
-        swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
-        cmp_idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+        swa_idx = torch.full((token_count, WIN), -1, dtype=torch.int32)
+        cmp_idx = torch.full((token_count, IDX_TOPK), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
         ori_table = tensors["ori_block_table"]
         cmp_cap = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
-        for t in range(num_tokens):
+        for t in range(token_count):
             abs_pos = int(pos[t].item())
             window_valid = min(WIN, abs_pos + 1)
             key_start_abs = abs_pos + 1 - window_valid
@@ -382,57 +436,59 @@ def golden_prefill_attention_hca(tensors):
         return swa_idx, cmp_idx
 
     swa_indices, cmp_indices = build_sparse_metadata()
-    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_prefill_sparse_attn({
-        "q": q,
-        "ori_kv": ori_kv,
-        "swa_indices": swa_indices,
-        "cmp_kv": cmp_kv,
-        "cmp_block_table": tensors["cmp_block_table"],
-        "cmp_indices": cmp_indices,
-        "attn_sink": tensors["attn_sink"],
-        "num_tokens": tensors["num_tokens"],
-        "freqs_cos": rope_cos_t,
-        "freqs_sin": rope_sin_t,
-        "wo_a": tensors["wo_a"],
-        "wo_b": tensors["wo_b"],
-        "wo_b_scale": tensors["wo_b_scale"],
-        "attn_out": attn_out,
-    })
+    attn_out = torch.zeros(token_count, D, dtype=torch.bfloat16)
+    golden_prefill_sparse_attn(
+        {
+            "q": q,
+            "ori_kv": ori_kv,
+            "swa_indices": swa_indices,
+            "cmp_kv": cmp_kv,
+            "cmp_block_table": tensors["cmp_block_table"],
+            "cmp_indices": cmp_indices,
+            "attn_sink": tensors["attn_sink"],
+            "freqs_cos": rope_cos_t,
+            "freqs_sin": rope_sin_t,
+            "wo_a": tensors["wo_a"],
+            "wo_b": tensors["wo_b"],
+            "wo_b_scale": tensors["wo_b_scale"],
+            "attn_out": attn_out,
+        }
+    )
 
-    y = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post_prefill({
-        "x": attn_out.view(T, D),
-        "residual": x_hc_flat,
-        "post": post,
-        "comb": comb,
-        "y": y.view(T, HC_MULT, D),
-        "num_tokens": tensors["num_tokens"],
-    })
-    tensors["x_out"][:] = y.view(T, HC_MULT, D)
+    y = torch.zeros(token_count, HC_MULT, D, dtype=torch.float32)
+    golden_hc_post(
+        {
+            "x": attn_out.view(token_count, D),
+            "residual": x_hc_flat,
+            "post": post,
+            "comb": comb,
+            "y": y,
+        }
+    )
+    tensors["x_out"][:] = y
 
 
 @functools.lru_cache(maxsize=None)
 def _state_block_table(max_blocks, physical_blocks):
     """Constant scrambled state block table [max_blocks]."""
     import torch
+
     blocks = torch.arange(max_blocks, dtype=torch.int32)
     return (blocks * 17 + 3) % physical_blocks
 
 
-def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
     from utils import build_rope_tables, cache_row_from_table, quant_w_per_channel
 
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    # Single-request geometry: q_len = num_tokens (active prefix), context_len =
-    # start_pos (absolute position base, a multiple of S=WIN under chunked prefill).
+    # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
-    q_len = num_tokens
-    if num_tokens <= 0 or num_tokens > T:
-        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
+    q_len = token_count
+    if token_count <= 0 or token_count > PREFILL_MAX_TOKENS:
+        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
     if context_len < 0:
         raise ValueError(f"context length must be non-negative, got {context_len}")
     max_position = context_len + q_len - 1
@@ -440,13 +496,8 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
 
     def token_meta():
-        # Single-request absolute positions: pos[t] = context_len + local_idx
-        # Padding rows keep their arange default; they are inactive.
-        local_pos = torch.zeros(T, dtype=torch.int32)
-        pos = torch.arange(T, dtype=torch.int32)
-        for local_s in range(q_len):
-            local_pos[local_s] = local_s
-            pos[local_s] = context_len + local_s
+        local_pos = torch.arange(q_len, dtype=torch.int32)
+        pos = torch.arange(context_len, context_len + q_len, dtype=torch.int32)
         return local_pos, pos
 
     def cmp_write_records():
@@ -459,70 +510,118 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
                 records.append((token_id, cmp_slot))
         return records
 
-
     def init_x_hc():
-        x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
-        x[num_tokens:] = 0
-        return x
+        return torch.empty(token_count, HC_MULT, D).uniform_(-1, 1)
+
     # Real layer-9 (HCA, ratio-128) hc_attn scale/base, fn synthetic at real magnitude. A synthetic
     # scale=0.5/base=0 cancels attn_out and the hc residual to near-zero in x_out, where W8A8 noise
     # blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0495
+
     def init_hc_attn_scale():
         return torch.tensor([0.079046, 0.04213, 0.121901])
+
     def init_hc_attn_base():
-        return torch.tensor([
-            -3.3004, 2.5553, -2.2787, -3.4925,
-            -3.8197, -3.4161, -2.7144, -2.9181,
-            2.362, -2.4746, -2.1352, -3.2216,
-            -4.474, 2.2488, -2.1053, -3.1675,
-            -2.8362, -1.9042, 2.0432, -3.062,
-            -2.7902, -3.0908, -3.002, 3.1161,
-        ])
+        return torch.tensor(
+            [
+                -3.3004,
+                2.5553,
+                -2.2787,
+                -3.4925,
+                -3.8197,
+                -3.4161,
+                -2.7144,
+                -2.9181,
+                2.362,
+                -2.4746,
+                -2.1352,
+                -3.2216,
+                -4.474,
+                2.2488,
+                -2.1053,
+                -3.1675,
+                -2.8362,
+                -1.9042,
+                2.0432,
+                -3.062,
+                -2.7902,
+                -3.0908,
+                -3.002,
+                3.1161,
+            ]
+        )
+
     def init_attn_norm_w():
         return torch.ones(D)
+
     def init_wq_a():
-        return (torch.rand(D, Q_LORA) - 0.5) * D ** -0.5
+        return (torch.rand(D, Q_LORA) - 0.5) * D**-0.5
+
     def init_wq_b():
-        return (torch.rand(Q_LORA, H * HEAD_DIM) - 0.5) * Q_LORA ** -0.5
+        return (torch.rand(Q_LORA, H * HEAD_DIM) - 0.5) * Q_LORA**-0.5
+
     def init_wkv():
-        return (torch.rand(D, HEAD_DIM) - 0.5) * D ** -0.5
+        return (torch.rand(D, HEAD_DIM) - 0.5) * D**-0.5
+
     def init_gamma_cq():
         return torch.ones(Q_LORA)
+
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
+
     def init_freqs_cos():
         return shared_freqs_cos.clone()
+
     def init_freqs_sin():
         return shared_freqs_sin.clone()
+
     # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0240
+
     def init_cmp_wgate():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0309
+
     def init_cmp_ape():
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0332
+
     def init_cmp_norm_w():
-        return 0.0982 + torch.randn(HEAD_DIM,) * 0.0539
+        return (
+            0.0982
+            + torch.randn(
+                HEAD_DIM,
+            )
+            * 0.0539
+        )
+
     state_table = _state_block_table(HCA_STATE_MAX_BLOCKS, HCA_STATE_PHYSICAL_BLOCKS)
+
     def init_compress_state_block_table():
         return state_table.clone()
+
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // HCA_STATE_BLOCK_SIZE
         intra = abs_pos % HCA_STATE_BLOCK_SIZE
         return int(state_table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
+
     def init_compress_state():
         state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
         flat = state.view(-1, MAIN_COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(MAIN_COMPRESS_STATE_DIM,) - 0.5) * 0.05
+                flat[row] = (
+                    torch.rand(
+                        MAIN_COMPRESS_STATE_DIM,
+                    )
+                    - 0.5
+                ) * 0.05
         return state
+
     def init_kv_cache():
         cache = torch.zeros(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -535,19 +634,22 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
                 if row >= 0:
                     cache_flat[row] = prefix[pos_i]
         return cache
+
     def init_ori_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
+        mapping = torch.full((token_count,), -1, dtype=torch.int64)
         local_pos, _ = token_meta()
         table = init_ori_block_table()
-        for t in range(num_tokens):
+        for t in range(token_count):
             logical_pos = context_len + int(local_pos[t].item())
             mapping[t] = cache_row_from_table(table, logical_pos)
         return mapping
+
     def init_ori_block_table():
         table = torch.full((SPARSE_ORI_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(SPARSE_ORI_MAX_BLOCKS):
             table[block] = block
         return table
+
     def init_cmp_kv():
         cache = torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -560,30 +662,37 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
                 if row >= 0:
                     cache_flat[row] = prefix_cmp[cmp_slot]
         return cache
+
     def init_cmp_block_table():
-        # Single-request paged table: one compressed page mapped to physical block 0.
         table = torch.full((SPARSE_CMP_MAX_BLOCKS,), -1, dtype=torch.int32)
-        table[0] = 0
+        for block in range(min(SPARSE_CMP_MAX_BLOCKS, HCA_CMP_BLOCK_NUM)):
+            table[block] = block
         return table
+
     def init_position_ids():
         return token_meta()[1]
+
     def init_cmp_slot_mapping():
-        out = torch.full((T,), -1, dtype=torch.int64)
+        out = torch.full((token_count,), -1, dtype=torch.int64)
         table = init_cmp_block_table()
         records = cmp_write_records()
         for token_id, cmp_slot in records:
             out[token_id] = cache_row_from_table(table, cmp_slot)
         return out
+
     def init_state_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
+        mapping = torch.full((token_count,), -1, dtype=torch.int64)
         _, pos = token_meta()
-        for t in range(num_tokens):
+        for t in range(token_count):
             mapping[t] = state_row(int(pos[t].item()))
         return mapping
+
     def init_attn_sink():
         return torch.zeros(H)
+
     def init_wo_a():
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN**-0.5
+
     def init_wo_b():
         return (torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5
 
@@ -593,7 +702,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     return [
-        TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -610,22 +719,44 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
-        TensorSpec("compress_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
-        TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("kv_cache", [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec(
+            "compress_state",
+            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
+            torch.float32,
+            init_value=init_compress_state,
+            is_output=True,
+        ),
+        TensorSpec(
+            "compress_state_block_table",
+            [HCA_STATE_MAX_BLOCKS],
+            torch.int32,
+            init_value=init_compress_state_block_table,
+        ),
+        TensorSpec(
+            "kv_cache",
+            [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_kv_cache,
+            is_output=True,
+        ),
+        TensorSpec("ori_slot_mapping", [token_count], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
+        TensorSpec(
+            "cmp_kv",
+            [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+            is_output=True,
+        ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [token_count], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [token_count], torch.int64, init_value=init_state_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        TensorSpec("x_out", [token_count, HC_MULT, D], torch.float32, is_output=True),
     ]
 
 
@@ -633,23 +764,35 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, ratio_reldiff, run_jit
 
-    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill HCA correctness test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser = argparse.ArgumentParser(
+        description="Standalone DeepSeek V4 packed prefill HCA correctness test."
+    )
+    parser.add_argument(
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+    )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="context_len (multiple of S=WIN); fixture-only, lowered into token metadata.")
-    parser.add_argument("--num-tokens", type=int, default=T,
-                        help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=START_POS,
+        help="context_len (multiple of S=WIN); fixture-only, lowered into token metadata.",
+    )
+    parser.add_argument(
+        "--token-count",
+        "--num-tokens",
+        dest="token_count",
+        type=int,
+        default=PREFILL_SEQ,
+        help="Physical query-token extent, up to 8192.",
+    )
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-    compare_tokens = args.num_tokens
-
     result = run_jit(
         fn=prefill_attention_hca_test,
-        specs=build_tensor_specs(args.start_pos, args.num_tokens),
+        specs=build_tensor_specs(args.start_pos, args.token_count),
         golden_fn=golden_prefill_attention_hca,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
@@ -662,8 +805,7 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1,
-                                   valid_rows=compare_tokens, zero_tail=True),
+            "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),

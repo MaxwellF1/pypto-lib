@@ -247,6 +247,8 @@ DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 512                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
+# Public physical-dynamic prefill limit for Issue #905 P4.
+PREFILL_MAX_TOKENS = 8192
 
 # Paging constants
 BLOCK_SIZE = 32                           # paged-KV page size / weight-quant block size

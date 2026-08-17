@@ -161,6 +161,7 @@ def _hc_pre_syncall(
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
 ):
     t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
@@ -178,6 +179,9 @@ def _hc_pre_syncall(
     # [T_TILE, HC_MULT] FP32 tile is 16B rows and pto.alloc_tile rejects it. pre (mix_x) and
     # comb (loaded straight from mixes_raw) are consumed in-tile, so they need no scratch.
     post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)  # HC_PAD-wide same-core scratch; write_post narrows to post
+    # Only the final partial token tile uses these fixed-size staging buffers.
+    x_mixed_tail_store = pl.create_tensor([T_TILE, D], dtype=pl.BF16)
+    comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
     # inv_rms same-core scratch for the comb gate: the per-token inv is a [T_TILE,1] COLUMN,
     # which the comb groups (Tiles) need as a Tile too. pto rejects a transposed [T_TILE,1]
     # tile (row-major, 4B row < 32B) and forbids Tile x Tensor ops, so the tensor-world inv
@@ -187,7 +191,7 @@ def _hc_pre_syncall(
     sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)  # RMS split-K sum-of-squares (row layout: [1,T_TILE] tiles stay 32B-aligned)
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
-    tt_n = t_dim // T_TILE            # token-tiles (pre / post / comb / rsqrt / sinkhorn / write_post base)
+    tt_n = token_tiles                 # token-tiles (pre / post / comb / rsqrt / sinkhorn / write_post base)
     cast_n = tt_n * CAST_KS           # cast fans over token-tile x K-slice
     seed_n = t_linear // T_TILE       # seed zeros t_linear rows (includes the 8->16 pad rows)
     lin_n = (t_linear // LINEAR_T_TILE) * LINEAR_OK  # linear fans over row-block x OK K-slice
@@ -231,10 +235,16 @@ def _hc_pre_syncall(
             for task in pl.range(lane, rms_n, NUM_CORES * 2):
                 t0 = (task // RMS_OK) * T_TILE
                 k_base = (task % RMS_OK) * RMS_K_PER_SPLIT
+                valid_rows = pl.min(T_TILE, t_dim - t0)
                 sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for kb in pl.pipeline(RMS_CHUNKS_PER_SPLIT, stage=4):
                     k0 = k_base + kb * RMS_K_CHUNK
-                    x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+                    x_chunk = pl.slice(
+                        x_flat,
+                        [T_TILE, RMS_K_CHUNK],
+                        [t0, k0],
+                        valid_shape=[valid_rows, RMS_K_CHUNK],
+                    )
                     sq_part = pl.add(sq_part, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
                 sq_sum_acc = pl.assemble(sq_sum_acc, sq_part, [0, t0], atomic=pl.AtomicType.Add)
         pl.system.syncall(core_type="mix")
@@ -261,6 +271,7 @@ def _hc_pre_syncall(
             for gw in pl.range(lane, pool_d, NUM_CORES * 2):
                 if gw < tt_n:
                     t0 = gw * COMB_T_TILE
+                    valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
                     # Fold Phase C's comb gate here AND skip the comb_logits GM round-trip:
                     # load the 4 comb groups DIRECTLY from mixes_raw (pad-capable loads at cols
                     # 8/12/16/20 within the 32-wide MIX_PAD row), then apply inv_rms * scale2 +
@@ -274,12 +285,18 @@ def _hc_pre_syncall(
                     ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,T_TILE] tensor
                     inv_col_tensor = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
                     inv_gm = pl.assemble(inv_gm, inv_col_tensor, [t0, 0])
-                    inv_col_t = pl.load(inv_gm, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)  # [T_TILE,1] tile
+                    inv_col_t = pl.load(
+                        inv_gm,
+                        [t0, 0],
+                        [COMB_T_TILE, 1],
+                        valid_shape=[valid_rows, 1],
+                        target_memory=pl.MemorySpace.Vec,
+                    )
                     comb_off = HC_MULT * 2
-                    mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
                     cb0 = pl.load(hc_reshaped, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
                     cb1 = pl.load(hc_reshaped, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
                     cb2 = pl.load(hc_reshaped, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -345,19 +362,58 @@ def _hc_pre_syncall(
                         row2_cur = pl.div(row2_norm, col_sum)
                         row3_cur = pl.div(row3_norm, col_sum)
 
-                    row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
-                    row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
-                    row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
-                    row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
-                    pl.store(row0_out, [t0, 0 * HC_MULT], comb)
-                    pl.store(row1_out, [t0, 1 * HC_MULT], comb)
-                    pl.store(row2_out, [t0, 2 * HC_MULT], comb)
-                    pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+                    if valid_rows == COMB_T_TILE:
+                        row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+                        row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+                        row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+                        row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+                        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+                        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+                        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+                        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+                    else:
+                        pl.store(row0_cur, [0, 0 * HC_PAD], comb_tail_store)
+                        pl.store(row1_cur, [0, 1 * HC_PAD], comb_tail_store)
+                        pl.store(row2_cur, [0, 2 * HC_PAD], comb_tail_store)
+                        pl.store(row3_cur, [0, 3 * HC_PAD], comb_tail_store)
+                        row0_tail = pl.load(
+                            comb_tail_store,
+                            [0, 0 * HC_PAD],
+                            [COMB_T_TILE, HC_PAD],
+                            valid_shape=[valid_rows, HC_MULT],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
+                        row1_tail = pl.load(
+                            comb_tail_store,
+                            [0, 1 * HC_PAD],
+                            [COMB_T_TILE, HC_PAD],
+                            valid_shape=[valid_rows, HC_MULT],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
+                        row2_tail = pl.load(
+                            comb_tail_store,
+                            [0, 2 * HC_PAD],
+                            [COMB_T_TILE, HC_PAD],
+                            valid_shape=[valid_rows, HC_MULT],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
+                        row3_tail = pl.load(
+                            comb_tail_store,
+                            [0, 3 * HC_PAD],
+                            [COMB_T_TILE, HC_PAD],
+                            valid_shape=[valid_rows, HC_MULT],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
+                        pl.store(row0_tail, [t0, 0 * HC_MULT], comb)
+                        pl.store(row1_tail, [t0, 1 * HC_MULT], comb)
+                        pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
+                        pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
                 elif gw < tt_n + mixx_n:
                     blk = gw - tt_n
                     t0 = (blk // MIXX_DS) * T_TILE
                     d_base = (blk % MIXX_DS) * D_SPMD
+                    valid_rows = pl.min(T_TILE, t_dim - t0)
                     # Fold Phase C's pre gate: pre = sigmoid(mix[:, :hc] * inv * scale0 + base) + eps.
                     # Recomputed here from mixes_raw (every D-slice of a token-tile redoes this
                     # tiny [T_TILE, HC_PAD] sigmoid -- free, and it drops the pre_val HBM buffer).
@@ -377,20 +433,33 @@ def _hc_pre_syncall(
                     pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
                     for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
                         d0 = d_base + db * D_CHUNK
-                        x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK]
-                        x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK]
-                        x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK]
-                        x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK]
+                        x0 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 0 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                        x1 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 1 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                        x2 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 2 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+                        x3 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 3 * D + d0], valid_shape=[valid_rows, D_CHUNK])
                         y0 = pl.row_expand_mul(x0, pre0)
                         y1 = pl.row_expand_mul(x1, pre1)
                         y2 = pl.row_expand_mul(x2, pre2)
                         y3 = pl.row_expand_mul(x3, pre3)
                         y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-                        x_mixed = pl.assemble(x_mixed, pl.cast(y_tile, target_type=pl.BF16, mode="rint"), [t0, d0])
+                        y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                        if valid_rows == T_TILE:
+                            x_mixed = pl.assemble(x_mixed, y_bf16, [t0, d0])
+                        else:
+                            x_mixed_tail_store = pl.assemble(x_mixed_tail_store, y_bf16, [0, d0])
+                            y_out = pl.load(
+                                x_mixed_tail_store,
+                                [0, d0],
+                                [T_TILE, D_CHUNK],
+                                valid_shape=[valid_rows, D_CHUNK],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            pl.store(y_out, [t0, d0], x_mixed)
 
                 else:
                     ob = gw - tt_n - mixx_n
                     t0 = ob * COMB_T_TILE
+                    valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
                     # Fold Phase C's post gate: post = 2 * sigmoid(mix[:, hc:2hc] * inv * scale1 + base).
                     # The gate is tensor-world (mixes_raw slice -> sigmoid), and pl.store needs a Vec
                     # TILE -- so post_pad is stashed HC_PAD-wide in same-core scratch and loaded back as
@@ -404,9 +473,14 @@ def _hc_pre_syncall(
                     post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
                     post_pad = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
                     post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
-                    post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
-                                        valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    pl.store(post_tile, [t0, 0], post)
+                    if valid_rows == COMB_T_TILE:
+                        post_full = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
+                                            valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                        pl.store(post_full, [t0, 0], post)
+                    else:
+                        post_tail = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
+                                            valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                        pl.store(post_tail, [t0, 0], post)
     return x_mixed
 
 
@@ -432,6 +506,7 @@ def _hc_pre_separate(
     T_MAX. Kept as a switchable alternative to the fused kernel (perf is not the goal here).
     """
     t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
@@ -448,13 +523,29 @@ def _hc_pre_separate(
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
+    for t in pl.spmd(token_tiles, name_hint="hc_pre_rms", allow_early_resolve=True):
         t0 = t * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
+            if valid_rows == T_TILE:
+                x_chunk_full = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk_full, x_chunk_full)), [1, T_TILE]),
+                )
+            else:
+                x_chunk_tail = pl.slice(
+                    x_flat,
+                    [T_TILE, RMS_K_CHUNK],
+                    [t0, k0],
+                    valid_shape=[valid_rows, RMS_K_CHUNK],
+                )
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk_tail, x_chunk_tail)), [1, T_TILE]),
+                )
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
@@ -487,8 +578,13 @@ def _hc_pre_separate(
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
+    # Only the final partial token tile uses these fixed-size staging buffers.
+    post_tail_store = pl.create_tensor([T_TILE, HC_PAD], dtype=pl.FP32)
+    x_mixed_tail_store = pl.create_tensor([T_TILE, D], dtype=pl.BF16)
+    comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
+    for ob in pl.spmd(token_tiles, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
         pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
@@ -503,20 +599,43 @@ def _hc_pre_separate(
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
-        post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+        if valid_rows == T_TILE:
+            post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(
+                post_pad,
+                [T_TILE, HC_PAD],
+                [0, 0],
+                valid_shape=[T_TILE, HC_MULT],
+            )
+        else:
+            post_tail_store = pl.assemble(post_tail_store, post_pad, [0, 0])
+            post_tile = pl.load(
+                post_tail_store,
+                [0, 0],
+                [T_TILE, HC_PAD],
+                valid_shape=[valid_rows, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pl.store(post_tile, [t0, 0], post)
 
     # comb_sinkhorn: comb gate (direct from mixes_raw, no comb_logits round-trip) + softmax +
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
     # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
     # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
-    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True):
+    for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
         t0 = ob * COMB_T_TILE
-        inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
+        inv_col_t = pl.load(
+            inv_rms,
+            [t0, 0],
+            [COMB_T_TILE, 1],
+            valid_shape=[valid_rows, 1],
+            target_memory=pl.MemorySpace.Vec,
+        )
         comb_off = HC_MULT * 2
-        mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb0 = pl.load(hc_base_2d, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb1 = pl.load(hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb2 = pl.load(hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shape=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -582,19 +701,58 @@ def _hc_pre_separate(
             row2_cur = pl.div(row2_norm, col_sum)
             row3_cur = pl.div(row3_norm, col_sum)
 
-        row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
-        row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
-        row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
-        row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
-        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
-        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
-        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
-        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+        if valid_rows == COMB_T_TILE:
+            row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+            row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+            row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+            row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+            pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+            pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+            pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+            pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+        else:
+            pl.store(row0_cur, [0, 0 * HC_PAD], comb_tail_store)
+            pl.store(row1_cur, [0, 1 * HC_PAD], comb_tail_store)
+            pl.store(row2_cur, [0, 2 * HC_PAD], comb_tail_store)
+            pl.store(row3_cur, [0, 3 * HC_PAD], comb_tail_store)
+            row0_tail = pl.load(
+                comb_tail_store,
+                [0, 0 * HC_PAD],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[valid_rows, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            row1_tail = pl.load(
+                comb_tail_store,
+                [0, 1 * HC_PAD],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[valid_rows, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            row2_tail = pl.load(
+                comb_tail_store,
+                [0, 2 * HC_PAD],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[valid_rows, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            row3_tail = pl.load(
+                comb_tail_store,
+                [0, 3 * HC_PAD],
+                [COMB_T_TILE, HC_PAD],
+                valid_shape=[valid_rows, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            pl.store(row0_tail, [t0, 0 * HC_MULT], comb)
+            pl.store(row1_tail, [t0, 1 * HC_MULT], comb)
+            pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
+            pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD tasks per tile).
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
+    for blk in pl.spmd(token_tiles * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
@@ -602,16 +760,28 @@ def _hc_pre_separate(
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
         for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
             d0 = d_base + db * D_CHUNK
-            x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK]
-            x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK]
-            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK]
-            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK]
+            x0 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 0 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+            x1 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 1 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+            x2 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 2 * D + d0], valid_shape=[valid_rows, D_CHUNK])
+            x3 = pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 3 * D + d0], valid_shape=[valid_rows, D_CHUNK])
             y0 = pl.row_expand_mul(x0, pre0)
             y1 = pl.row_expand_mul(x1, pre1)
             y2 = pl.row_expand_mul(x2, pre2)
             y3 = pl.row_expand_mul(x3, pre3)
             y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            x_mixed[t0:t0 + T_TILE, d0:d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+            if valid_rows == T_TILE:
+                x_mixed = pl.assemble(x_mixed, y_bf16, [t0, d0])
+            else:
+                x_mixed_tail_store = pl.assemble(x_mixed_tail_store, y_bf16, [0, d0])
+                y_out = pl.load(
+                    x_mixed_tail_store,
+                    [0, d0],
+                    [T_TILE, D_CHUNK],
+                    valid_shape=[valid_rows, D_CHUNK],
+                    target_memory=pl.MemorySpace.Vec,
+                )
+                pl.store(y_out, [t0, d0], x_mixed)
     return x_mixed
 
 
