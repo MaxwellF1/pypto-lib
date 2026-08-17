@@ -507,6 +507,9 @@ def _sparse_attn_heads(
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write one bounded dense tile through static 128-row waves."""
     merge_tids = pl.array.create(1, pl.TASK_ID)
+    # The first wave reads this slot as its prior dependency, so seed it with an
+    # already-satisfied task rather than whatever create leaves behind.
+    merge_tids[0] = pl.system.task_dummy(deps=[])
     with pl.scope():
         sparse_kv = pl.create_tensor(
             [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],

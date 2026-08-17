@@ -138,7 +138,7 @@ def _prefill_indexer_dense_tile(
     tile_rows: pl.Scalar[pl.INDEX],
     max_visible: pl.Scalar[pl.INDEX],
 ):
-    """Project and select one bounded 2048-token dense tile."""
+    """Project and select one bounded PREFILL_DENSE_TILE-row dense tile."""
     t_dim = pl.tensor.dim(x, 0)
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_cache_i8_flat = pl.reshape(
@@ -439,8 +439,9 @@ def _prefill_indexer_dense_tile(
         if wave_token0 < score_wave_rows:
             for cb in pl.range(INDEXER_SCORE_BLOCKS):
                 cache0 = cb * CACHE_TILE
-                if wave_max_visible > cache0:
-                    idx_blk_id_raw = pl.read(idx_block_table, [cache0 // BLOCK_SIZE])
+                logical_block = cache0 // BLOCK_SIZE
+                if wave_max_visible > cache0 and logical_block < IDX_CACHE_MAX_BLOCKS:
+                    idx_blk_id_raw = pl.read(idx_block_table, [logical_block])
                     if idx_blk_id_raw >= 0 and idx_blk_id_raw < idx_block_num:
                         idx_blk_id = pl.cast(idx_blk_id_raw, pl.INDEX)
                         kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
