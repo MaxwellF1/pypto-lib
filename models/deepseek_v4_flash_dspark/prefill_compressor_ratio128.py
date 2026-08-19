@@ -20,7 +20,7 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
+
 
 # Bounded physical-row tile for ratio-128 projection/state updates.
 PREFILL_STATE_TILE = 512
@@ -589,8 +589,8 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    if token_count <= 0 or token_count > PREFILL_MAX_TOKENS:
-        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
     if start_pos < 0:
         raise ValueError("start_pos must be non-negative")
     if start_pos + token_count > MAX_SEQ_LEN:

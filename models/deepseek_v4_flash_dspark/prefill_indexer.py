@@ -23,7 +23,6 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
@@ -32,6 +31,10 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
+
+
+# Largest runtime token count the prefill path accepts (Issue #905 P4).
+PREFILL_MAX_TOKENS = 8192
 
 # Bounded physical-row tile for index projection and score scratch.
 PREFILL_DENSE_TILE = 512

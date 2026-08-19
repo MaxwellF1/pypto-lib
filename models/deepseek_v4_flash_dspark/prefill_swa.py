@@ -21,7 +21,6 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows_dynamic, qkv_proj_rope
@@ -33,6 +32,7 @@ from prefill_sparse_attn import (
     golden_prefill_sparse_attn,
     sparse_attn_physical,
 )
+
 
 
 # Dynamic shape variables.
@@ -330,8 +330,8 @@ def build_tensor_specs(
     context_len = start_pos
     q_len = token_count
 
-    if token_count <= 0 or token_count > PREFILL_MAX_TOKENS:
-        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
     max_position = context_len + q_len
     if context_len < 0:
         raise ValueError(f"context_len must be non-negative, got {context_len}")

@@ -20,8 +20,9 @@ from config import (
     TP,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
 
+# Longest sequence the model config admits; the host-side bound on token_count.
+MAX_SEQ_LEN = M.max_position_embeddings
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -294,8 +295,8 @@ def build_tensor_specs(token_count: int = T):
     import torch
     from golden import TensorSpec
 
-    if token_count <= 0 or token_count > PREFILL_MAX_TOKENS:
-        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
 
     def init_x_hc():
         return torch.randn(token_count, HC_MULT, D) * 0.05

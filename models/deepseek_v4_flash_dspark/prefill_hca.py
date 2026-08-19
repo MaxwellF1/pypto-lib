@@ -25,7 +25,6 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
@@ -91,6 +90,7 @@ assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
     f"prefill HCA compressed tail ({PREFILL_MAX_COMPRESSED} slots) must cover "
     f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)"
 )
+
 
 
 @pl.jit.inline
@@ -488,8 +488,8 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
     q_len = token_count
-    if token_count <= 0 or token_count > PREFILL_MAX_TOKENS:
-        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
+    if token_count <= 0 or token_count > MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
     if context_len < 0:
         raise ValueError(f"context length must be non-negative, got {context_len}")
     max_position = context_len + q_len - 1

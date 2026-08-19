@@ -29,8 +29,11 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
 from prefill_indexer import INDEXER_TOPK_CAP
+
+
+# Longest sequence the model config admits; the host-side bound on token_count.
+MAX_SEQ_LEN = M.max_position_embeddings
 
 # Sparse attention's internal physical-row geometry and runtime workspace.
 PREFILL_DENSE_TILE = 512
@@ -1046,8 +1049,8 @@ def build_tensor_specs(
     from golden import TensorSpec
     from utils import build_rope_tables, materialize_token_rope_tables, quant_w_per_channel
 
-    if not 0 < token_count <= PREFILL_MAX_TOKENS:
-        raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
+    if not 0 < token_count <= MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
     if ori_block_num <= 0 or cmp_block_num <= 0:
         raise ValueError("dynamic cache block counts must be positive")
     cmp_valid = get_prefill_cmp_valid(compress_ratio, token_count)
@@ -1168,7 +1171,7 @@ if __name__ == "__main__":
     ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
     parser.add_argument(
-        "--tokens", type=int, default=T, help=f"Physical token rows, up to {PREFILL_MAX_TOKENS}."
+        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
     )
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)

@@ -27,8 +27,6 @@ from config import (
     PREFILL_SEQ,
 )
 
-from prefill_limits import PREFILL_MAX_TOKENS
-
 from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
@@ -64,6 +62,10 @@ from prefill_sparse_attn import (
     golden_prefill_sparse_attn,
     sparse_attn_physical,
 )
+
+
+# Largest runtime token count the prefill path accepts (Issue #905 P4).
+PREFILL_MAX_TOKENS = 8192
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_CSA_T_DYN")
