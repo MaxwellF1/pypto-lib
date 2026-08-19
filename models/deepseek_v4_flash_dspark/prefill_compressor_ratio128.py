@@ -17,9 +17,10 @@ from config import (
     HCA_STATE_PHYSICAL_BLOCKS,
     KV_CMP_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 
 # Bounded physical-row tile for ratio-128 projection/state updates.
 PREFILL_STATE_TILE = 512

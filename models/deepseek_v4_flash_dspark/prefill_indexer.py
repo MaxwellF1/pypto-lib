@@ -19,10 +19,11 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
     IDX_CACHE_BLOCK_NUM,
-    PREFILL_MAX_TOKENS,
     PREFILL_BATCH,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,

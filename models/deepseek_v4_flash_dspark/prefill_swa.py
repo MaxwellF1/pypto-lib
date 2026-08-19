@@ -18,9 +18,10 @@ from config import (
     KV_CMP_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_BLOCK_NUM,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows_dynamic, qkv_proj_rope

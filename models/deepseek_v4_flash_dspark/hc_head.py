@@ -16,10 +16,11 @@ from config import (
     DECODE_BATCH,
     DECODE_SEQ,
     PREFILL_BATCH,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
     TP,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 
 
 # Dynamic shape variables.

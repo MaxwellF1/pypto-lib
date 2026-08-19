@@ -20,9 +20,10 @@ from config import (
     IDX_CACHE_MAX_BLOCKS,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 
 # Bounded physical-row tile for index projection/state updates.
 PREFILL_STATE_TILE = 512

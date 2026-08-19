@@ -17,9 +17,10 @@ from config import (
     FLASH as M,
     FP32_NEG_INF,
     KV_CMP_BLOCK_NUM,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 
 # Bounded physical-row tile for ratio-4 projection/state updates.
 PREFILL_STATE_TILE = 512

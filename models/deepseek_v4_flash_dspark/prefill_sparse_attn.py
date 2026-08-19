@@ -27,8 +27,9 @@ from config import (
     KV_CMP_MAX_BLOCKS,
     KV_ORI_BLOCK_NUM,
     PREFILL_SEQ,
-    PREFILL_MAX_TOKENS,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 from prefill_indexer import INDEXER_TOPK_CAP
 
 # Sparse attention's internal physical-row geometry and runtime workspace.

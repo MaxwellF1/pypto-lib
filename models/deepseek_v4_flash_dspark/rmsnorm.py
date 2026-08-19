@@ -41,20 +41,78 @@ def _rms_norm_full_tile(
     x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
     for rms_db in pl.pipeline(D // D_TILE, stage=2):
         rms_d0 = rms_db * D_TILE
-        rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
-        x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
+        rms_x_input = x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE]
+        rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
+        rms_x_sq = pl.mul(rms_x_chunk, rms_x_chunk)
+        rms_x_row_sum = pl.reshape(pl.row_sum(rms_x_sq), [1, T_TILE])
+        x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
     x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
     x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
     for apply_db in pl.pipeline(D // D_TILE, stage=2):
         apply_d0 = apply_db * D_TILE
-        apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
-        norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE]), pl.FP32)
-        x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
+        apply_x_input = x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE]
+        apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
+        norm_w_input = norm_w[apply_d0 : apply_d0 + D_TILE]
+        norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
+        x_scaled = pl.row_expand_mul(apply_x_chunk, x_inv_rms_t)
+        x_normed_chunk = pl.col_expand_mul(x_scaled, norm_w_chunk)
         x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
             x_normed_chunk,
             target_type=pl.BF16,
             mode="rint",
         )
+
+
+@pl.jit.inline
+def _rms_norm_tail_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Run the ragged last token tile through explicit `valid_shape` load/store.
+
+    Step for step the same RMSNorm as `_rms_norm_full_tile`. The two live in
+    separate scopes rather than in one `if`/`else` body because this path binds
+    the shared names (`x_sq_sum`, `x_inv_rms`, …) to Vec-space Tiles while the
+    aligned path binds them to Tensors, and a name cannot be rebound to a
+    different type inside one kernel.
+    """
+    tg = pl.tile.get_block_idx() * T_TILE
+    valid_rows = pl.min(T_TILE, pl.tensor.dim(x, 0) - tg)
+    row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+    for rms_db in pl.pipeline(D // D_TILE, stage=2):
+        rms_d0 = rms_db * D_TILE
+        rms_x_input = pl.load(
+            x,
+            [tg, rms_d0],
+            [T_TILE, D_TILE],
+            valid_shape=[valid_rows, D_TILE],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
+        rms_x_sq = pl.mul(rms_x_chunk, rms_x_chunk)
+        rms_x_row_sum = pl.reshape(pl.row_sum(rms_x_sq, row_reduce_tmp), [1, T_TILE])
+        x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
+    x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
+    x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
+    for apply_db in pl.pipeline(D // D_TILE, stage=2):
+        apply_d0 = apply_db * D_TILE
+        apply_x_input = pl.load(
+            x,
+            [tg, apply_d0],
+            [T_TILE, D_TILE],
+            valid_shape=[valid_rows, D_TILE],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
+        norm_w_input = pl.load(norm_w, [apply_d0], [D_TILE], target_memory=pl.MemorySpace.Vec)
+        norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
+        x_scaled = pl.row_expand_mul(apply_x_chunk, x_inv_rms_t)
+        x_normed_chunk = pl.col_expand_mul(x_scaled, norm_w_chunk)
+        x_normed_bf16 = pl.cast(x_normed_chunk, target_type=pl.BF16, mode="rint")
+        x_normed_valid = pl.set_validshape(x_normed_bf16, valid_rows, D_TILE)
+        pl.store(x_normed_valid, [tg, apply_d0], x_normed)
 
 
 @pl.jit.inline
@@ -74,39 +132,7 @@ def rms_norm(
         if valid_rows == T_TILE:
             _rms_norm_full_tile(x, norm_w, x_normed)
         else:
-            row_reduce_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            x_sq_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for rms_db in pl.pipeline(D // D_TILE, stage=2):
-                rms_d0 = rms_db * D_TILE
-                rms_x_input = pl.load(
-                    x,
-                    [tg, rms_d0],
-                    [T_TILE, D_TILE],
-                    valid_shape=[valid_rows, D_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                rms_x_chunk = pl.cast(rms_x_input, target_type=pl.FP32)
-                rms_x_sq = pl.mul(rms_x_chunk, rms_x_chunk)
-                rms_x_row_sum = pl.reshape(pl.row_sum(rms_x_sq, row_reduce_tmp), [1, T_TILE])
-                x_sq_sum = pl.add(x_sq_sum, rms_x_row_sum)
-            x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
-            x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-            for apply_db in pl.pipeline(D // D_TILE, stage=2):
-                apply_d0 = apply_db * D_TILE
-                apply_x_input = pl.load(
-                    x,
-                    [tg, apply_d0],
-                    [T_TILE, D_TILE],
-                    valid_shape=[valid_rows, D_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                apply_x_chunk = pl.cast(apply_x_input, target_type=pl.FP32)
-                norm_w_input = pl.load(norm_w, [apply_d0], [D_TILE], target_memory=pl.MemorySpace.Vec)
-                norm_w_chunk = pl.cast(pl.reshape(norm_w_input, [1, D_TILE]), pl.FP32)
-                x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-                x_normed_bf16 = pl.cast(x_normed_chunk, target_type=pl.BF16, mode="rint")
-                x_normed_valid = pl.set_validshape(x_normed_bf16, valid_rows, D_TILE)
-                pl.store(x_normed_valid, [tg, apply_d0], x_normed)
+            _rms_norm_tail_tile(x, norm_w, x_normed)
 
     return rms_tid
 

@@ -24,9 +24,10 @@ from config import (
     IDX_CACHE_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
-    PREFILL_MAX_TOKENS,
     PREFILL_SEQ,
 )
+
+from prefill_limits import PREFILL_MAX_TOKENS
 
 from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
