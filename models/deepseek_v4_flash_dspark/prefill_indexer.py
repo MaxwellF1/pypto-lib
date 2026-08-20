@@ -1448,32 +1448,6 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    def score_visible_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        del actual_outputs, expected_outputs
-        positions = inputs["position_ids"].cpu().to(torch.int64)
-        visible = ((positions + 1) // COMPRESS_RATIO).clamp(max=INDEXER_SCORE_CAP)
-        actual_prefixes = []
-        expected_prefixes = []
-        for token_id, visible_count in enumerate(visible.tolist()):
-            if visible_count:
-                actual_prefixes.append(actual[token_id, :visible_count])
-                expected_prefixes.append(expected[token_id, :visible_count])
-            if not torch.equal(actual[token_id, visible_count:], expected[token_id, visible_count:]):
-                return False, f"    score row {token_id} changed its masked tail after {visible_count}"
-        if not actual_prefixes:
-            return True, ""
-        return ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01)(
-            torch.cat(actual_prefixes),
-            torch.cat(expected_prefixes),
-            actual_outputs={},
-            expected_outputs={},
-            inputs=inputs,
-            rtol=rtol,
-            atol=atol,
-        )
-
-    score_visible_compare.__name__ = "visible_score_ratio_allclose"
-
     def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         del expected, expected_outputs, rtol, atol
         score = actual_outputs["score"]
@@ -1549,7 +1523,9 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "score": score_visible_compare,
+            # Inactive score columns carry -inf from the sort scratch, not zeros, hence no
+            # zero_tail; the whole row is compared, as on main.
+            "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128, valid_rows=args.token_count),
             "topk_idxs": topk_idxs_compare,
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
             "idx_kv_cache": mapped_active_rows(
