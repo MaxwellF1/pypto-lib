@@ -103,7 +103,7 @@ def _prefill_compressor_ratio128_tile(
         [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
-    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32, init_value=0)
+    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
     t_dim = pl.tensor.dim(x, 0)
@@ -306,10 +306,8 @@ def _prefill_compressor_ratio128_tile(
                 pooled_chunk_t, [1, HEAD_TILE]
             )
         else:
-            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_kv_pad[
-                write_i : write_i + 1,
-                h0 : h0 + HEAD_TILE,
-            ]
+            pooled_zero = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_zero
 
     # Publish completion through a one-output task.  Reading the pool result
     # makes this task wait for the whole 32-block pool dispatch; writing the
@@ -444,7 +442,9 @@ def prefill_compressor_ratio128(
     # a TaskId carrier through the inline boundary.  Scatter reads it (INPUT),
     # while the post-pool commit writes it (InOut), yielding
     # commit[i-1] -> scatter[i] -> pool[i] -> commit[i] in TensorMap.
-    state_order_fence = pl.create_tensor([1], dtype=pl.INT32, init_value=0)
+    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
+        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
     for tile_base in pl.range(0, t_dim, PREFILL_STATE_TILE):
         tile_rows = pl.min(PREFILL_STATE_TILE, t_dim - tile_base)
         with pl.scope():

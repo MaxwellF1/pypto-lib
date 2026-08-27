@@ -621,7 +621,9 @@ def _prefill_indexer_compressor_with_completion(
     # One GM token serializes the 520-row physical state ring across logical
     # 512-row tiles.  The block table is retained in the public ABI because the
     # caller owns the already-lowered physical slot mappings.
-    state_order_fence = pl.create_tensor([1], dtype=pl.INT32, init_value=0)
+    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_state_order_init"):
+        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
     for tile_base in pl.range(0, t_dim, PREFILL_STATE_TILE):
         tile_rows = pl.min(PREFILL_STATE_TILE, t_dim - tile_base)
         with pl.scope():

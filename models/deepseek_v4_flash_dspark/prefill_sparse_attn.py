@@ -506,14 +506,14 @@ def _sparse_attn_heads(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    packed_init_tid: pl.Scalar[pl.TASK_ID],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write one bounded dense tile through static 128-row waves."""
     merge_tids = pl.array.create(1, pl.TASK_ID)
-    # The first wave reads this slot as its prior dependency, so seed it with an
-    # already-satisfied task rather than whatever create leaves behind.
-    merge_tids[0] = pl.system.task_dummy(deps=[])
+    # Keep the manual-dependency zero-fill in the same chain as every head writer and the output projection.
+    merge_tids[0] = packed_init_tid
     with pl.scope():
         sparse_kv = pl.create_tensor(
             [PREFILL_QUERY_TILE * PREFILL_SPARSE_PAD, HEAD_DIM],
@@ -579,10 +579,11 @@ def _sparse_attn_o_proj(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
     heads_dep: pl.Scalar[pl.TASK_ID],
+    weight_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Project one local-token dense tile into BF16 hidden rows."""
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
@@ -612,7 +613,11 @@ def _sparse_attn_o_proj(
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep]) as pa_tid:
+                with pl.spmd(
+                    proj_a_rows,
+                    name_hint="proj_a_mm",
+                    deps=[heads_dep, weight_dep],
+                ) as pa_tid:
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
@@ -706,8 +711,10 @@ def _sparse_attn_o_proj(
     act_t_blks = (tile_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
     with pl.spmd(
-        act_blocks, name_hint="proj_b_act", deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)]
-    ) as act_tid:
+        act_blocks,
+        name_hint="proj_b_act",
+        deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)],
+    ) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // act_t_blks
         tblk = act_idx - nreg * act_t_blks
@@ -754,7 +761,8 @@ def sparse_attn_compute(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Run sparse heads and dense output projection over bounded physical tiles."""
     for tile_base in pl.range(0, active_rows, T_PAD):
@@ -767,8 +775,11 @@ def sparse_attn_compute(
                 [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM],
                 dtype=pl.BF16,
                 manual_dep=True,
-                init_value=0.0,
             )
+            with pl.spmd(T_PAD * H // PREFILL_QUERY_TILE, name_hint="prefill_sparse_packed_init") as packed_init_tid:
+                packed_row = pl.tile.get_block_idx() * PREFILL_QUERY_TILE
+                packed_zero = pl.full([PREFILL_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                o_packed_heads[packed_row : packed_row + PREFILL_QUERY_TILE, 0:HEAD_DIM] = packed_zero
             o_packed_heads, heads_dep = _sparse_attn_heads(
                 q,
                 ori_kv,
@@ -782,6 +793,7 @@ def sparse_attn_compute(
                 freqs_cos,
                 freqs_sin,
                 o_packed_heads,
+                packed_init_tid,
                 tile_base,
                 tile_rows,
             )
@@ -794,6 +806,7 @@ def sparse_attn_compute(
                 tile_base,
                 tile_rows,
                 heads_dep,
+                o_proj_weight_dep,
             )
     return attn_out
 
@@ -813,7 +826,8 @@ def sparse_attn_physical(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Run sparse attention over the full physical token dimension."""
     active_rows = pl.tensor.dim(q, 0)
@@ -833,59 +847,7 @@ def sparse_attn_physical(
         wo_b,
         wo_b_scale,
         attn_out,
-    )
-
-
-@pl.jit.inline
-def sparse_attn(
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-):
-    """Run the fixed-capacity legacy path until SWA/HCA/CSA become physical-dynamic."""
-    t_dim = pl.tensor.dim(q, 0)
-    requested_rows = pl.cast(num_tokens, pl.INDEX)
-    nonnegative_rows = pl.max(requested_rows, pl.cast(0, pl.INDEX))
-    active_rows = pl.min(t_dim, nonnegative_rows)
-    if active_rows < t_dim:
-        tail_rows = t_dim - active_rows
-        with pl.spmd(
-            (tail_rows + PROJ_B_ACT_T_TILE - 1) // PROJ_B_ACT_T_TILE,
-            name_hint="legacy_sparse_attn_zero_tail",
-        ):
-            tail_base = pl.tile.get_block_idx() * PROJ_B_ACT_T_TILE
-            valid_tail_rows = pl.min(PROJ_B_ACT_T_TILE, tail_rows - tail_base)
-            zero_tail = pl.full([PROJ_B_ACT_T_TILE, D], dtype=pl.BF16, value=0.0)
-            zero_tail = pl.set_validshape(zero_tail, valid_tail_rows, D)
-            pl.assemble(attn_out, zero_tail, [active_rows + tail_base, 0])
-    return sparse_attn_compute(
-        q,
-        ori_kv,
-        swa_indices,
-        cmp_kv,
-        cmp_block_table,
-        cmp_indices,
-        valid_block_mask,
-        attn_sink,
-        active_rows,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+        o_proj_weight_dep,
     )
 
 
@@ -915,6 +877,7 @@ def prefill_sparse_attn_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
+    o_proj_weight_dep = pl.system.task_dummy(deps=[])
     return sparse_attn_physical(
         q,
         ori_kv,
@@ -930,6 +893,7 @@ def prefill_sparse_attn_test(
         wo_b,
         wo_b_scale,
         attn_out,
+        o_proj_weight_dep,
     )
 
 
