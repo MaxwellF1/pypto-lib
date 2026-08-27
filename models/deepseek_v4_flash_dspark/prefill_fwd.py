@@ -978,27 +978,18 @@ def prefill_fwd(
             group_base, tp_rank, pl.const(43, pl.INT32),
         )
 
-    # Final head over the gathered TP-group tokens. After the layer-42 token
-    # gather every group member holds the complete hidden, so hc_head and the
-    # final norm run group-wide without extra communication, every rank reads
-    # any logit row locally, and the TP LM head reuses the decode protocol on
-    # its own windows and counters.
+    # Final head over the gathered TP-group tokens: after the layer-42 token
+    # gather x_hc holds every group token on each rank, and logit_row_indices
+    # index that group token space.
     with pl.scope():
         hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
         final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
         lm_head(
-            x_out,
-            lm_head_weight,
-            logit_row_indices,
-            logits,
-            lm_head_hidden_window,
-            lm_head_hidden_done,
-            lm_head_logits_window,
-            lm_head_logits_done,
-            group_base,
-            tp_rank,
-            pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
-            final_norm_tid,
+            x_out, lm_head_weight, logit_row_indices, logits,
+            lm_head_hidden_window, lm_head_hidden_done,
+            lm_head_logits_window, lm_head_logits_done,
+            group_base, tp_rank,
+            pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
         )
         greedy_sample(logits, sampled_ids)
         mask_inactive_sample_rows(logit_row_indices, sampled_ids)
@@ -1713,12 +1704,14 @@ def build_tensor_specs(
         spec.resident = "stacked"
         specs.append(spec)
 
-    # Head and LM-head fixtures. hc_head and the final norm are model weights, so
-    # one draw is replicated to every rank exactly as serving loads them; only the
-    # LM-head vocabulary shard differs inside a TP group.
+    # Head and LM-head fixtures: one replicated draw per model weight, per-rank
+    # LM-head vocabulary shards.
     def init_hc_head_fn():
         head_fn = torch.randn(HC_MULT, HC_DIM) * 0.0519
         return head_fn.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+    def init_hc_head_scale():
+        return torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32)
 
     def init_hc_head_base():
         base = torch.tensor([5.9166, -3.6223, -2.9324, -3.3124], dtype=torch.float32)
@@ -1732,29 +1725,25 @@ def build_tensor_specs(
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
         return torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0)
 
-    # Leader-owned rows: only the group leader publishes a live logit row (the
-    # last prompt token); peers keep every row at -1 but still join the TP
-    # collective. Serving reads logits and sampled ids from the leader only.
+    # Leader-owned rows: the group leader publishes the last prompt token as its
+    # single live logit row; peers keep every row at -1 and still join the TP
+    # collective.
     def init_logit_row_indices(tokens=num_tokens):
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[::TP_SIZE, 0] = tokens - 1
         return indices
 
+    def init_hidden_workspace():
+        return torch.zeros(N_RANKS, stage_tokens, D, dtype=torch.bfloat16)
+
     head_specs = [
         TensorSpec("hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
-        TensorSpec(
-            "hc_head_scale", [N_RANKS, 1], torch.float32,
-            init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32),
-        ),
+        TensorSpec("hc_head_scale", [N_RANKS, 1], torch.float32, init_value=init_hc_head_scale),
         TensorSpec("hc_head_base", [N_RANKS, HC_MULT], torch.float32, init_value=init_hc_head_base),
         TensorSpec("final_norm_w", [N_RANKS, D], torch.bfloat16, init_value=init_final_norm_w),
         TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight),
         TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices),
-        TensorSpec(
-            "hidden_workspace", [N_RANKS, stage_tokens, D], torch.bfloat16,
-            init_value=lambda: torch.zeros(N_RANKS, stage_tokens, D, dtype=torch.bfloat16),
-            is_output=False,
-        ),
+        TensorSpec("hidden_workspace", [N_RANKS, stage_tokens, D], torch.bfloat16, init_value=init_hidden_workspace),
         TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16, is_output=True),
         TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True),
         TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32, is_output=True),
@@ -1803,9 +1792,8 @@ def x_out_compare(actual, _expected, **kwargs):
         actual_rank = actual[rank].float()
         if not bool(torch.isfinite(actual_rank).all()):
             return False, f"    rank {rank} x_out contains NaN or Inf"
-        # bf16 point tolerance from the per-module gates, plus a per-token gate:
-        # a whole-row corruption is far below the tensor-wide 0.5% outlier
-        # budget, so bound the outlier ratio per token row as well.
+        # bf16 point tolerance plus a per-token outlier bound: a fully corrupted
+        # token row stays under the tensor-wide 0.5% budget.
         tolerance = 1e-4 + (1.0 / 128) * expected_rank.abs()
         bad = (actual_rank - expected_rank).abs() > tolerance
         ratio = float(bad.float().mean())
@@ -1814,9 +1802,7 @@ def x_out_compare(actual, _expected, **kwargs):
         row_bad = bad.float().mean(dim=1)
         worst_row = int(torch.argmax(row_bad))
         if float(row_bad[worst_row]) > 0.05:
-            return False, (
-                f"    rank {rank} token {worst_row}: {float(row_bad[worst_row]):.1%} points out of tolerance"
-            )
+            return False, f"    rank {rank} token {worst_row}: {float(row_bad[worst_row]):.1%} points out of tolerance"
     return True, ""
 
 
@@ -1840,15 +1826,11 @@ def logits_compare(actual, _expected, **kwargs):
                 continue
             hidden_row = device_x_out[rank][source].float()
             # Shard tp owns vocabulary rows [tp * VOCAB_PER_TP, (tp + 1) * VOCAB_PER_TP).
-            expected_row = torch.cat(
-                [weight[group_base + tp].float() @ hidden_row for tp in range(TP_SIZE)]
-            )
+            expected_row = torch.cat([weight[group_base + tp].float() @ hidden_row for tp in range(TP_SIZE)])
             actual_row = actual[rank, row].cpu()
             if not torch.allclose(actual_row, expected_row, rtol=1e-3, atol=1e-3):
                 worst = float((actual_row - expected_row).abs().max())
-                return False, (
-                    f"    rank {rank} row {row} (token {source}) logits mismatch, max |err|={worst:.3e}"
-                )
+                return False, f"    rank {rank} row {row} (token {source}) logits mismatch, max |err|={worst:.3e}"
     return True, ""
 
 
@@ -1872,9 +1854,7 @@ def sampled_ids_compare(actual, _expected, **kwargs):
             expected = int(torch.argmax(device_logits[rank][row]))
             # Both scans keep the first maximum, over identical fp32 data.
             if sampled != expected:
-                return False, (
-                    f"    rank {rank} row {row}: sampled id {sampled} != device logits argmax {expected}"
-                )
+                return False, f"    rank {rank} row {row}: sampled id {sampled} != device logits argmax {expected}"
     return True, ""
 
 
