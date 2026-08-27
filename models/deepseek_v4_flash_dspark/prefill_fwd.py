@@ -1002,7 +1002,7 @@ def prefill_fwd(
         )
         greedy_sample(logits, sampled_ids)
         mask_inactive_sample_rows(logit_row_indices, sampled_ids)
-    return x_hc
+    return x_out
 
 
 # DSA-CP layer-major multi-wave forward.
@@ -1219,6 +1219,7 @@ def l3_prefill_fwd(
             r,
             device=r,
         )
+    return x_out, logits, sampled_ids
 
 
 # Kernel-only smoke fixtures.
@@ -1712,25 +1713,31 @@ def build_tensor_specs(
         spec.resident = "stacked"
         specs.append(spec)
 
-    # Head and LM-head fixtures. Every rank of a TP group holds the same gathered
-    # group tokens, so all ranks share one live logit row: the last prompt token.
+    # Head and LM-head fixtures. hc_head and the final norm are model weights, so
+    # one draw is replicated to every rank exactly as serving loads them; only the
+    # LM-head vocabulary shard differs inside a TP group.
     def init_hc_head_fn():
-        return torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519
+        head_fn = torch.randn(HC_MULT, HC_DIM) * 0.0519
+        return head_fn.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
     def init_hc_head_base():
         base = torch.tensor([5.9166, -3.6223, -2.9324, -3.3124], dtype=torch.float32)
         return base.view(1, HC_MULT).expand(N_RANKS, -1).contiguous()
 
     def init_final_norm_w():
-        return (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16)
+        norm = (torch.randn(D) * 0.1 + 1.0).to(torch.bfloat16)
+        return norm.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_lm_head_weight():
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
         return torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0)
 
+    # Leader-owned rows: only the group leader publishes a live logit row (the
+    # last prompt token); peers keep every row at -1 but still join the TP
+    # collective. Serving reads logits and sampled ids from the leader only.
     def init_logit_row_indices(tokens=num_tokens):
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[:, 0] = tokens - 1
+        indices[::TP_SIZE, 0] = tokens - 1
         return indices
 
     head_specs = [
@@ -1773,32 +1780,115 @@ def finite_tensor_compare(actual, _expected, **_kwargs):
     return True, ""
 
 
+def x_out_compare(actual, _expected, **kwargs):
+    """Recompute hc_head plus the final norm from the device x_hc and compare."""
+    import torch
+    from hc_head import golden_hc_head
+    from rmsnorm import golden_rms_norm
+
+    inputs = kwargs.get("inputs", {})
+    device_x_hc = kwargs.get("actual_outputs", {}).get("x_hc")
+    if device_x_hc is None:
+        return False, "    missing device x_hc output"
+    for rank in range(actual.shape[0]):
+        head_out = torch.empty(device_x_hc.shape[1], D, dtype=torch.bfloat16)
+        golden_hc_head({
+            "x_hc": device_x_hc[rank].cpu(),
+            "hc_head_fn": inputs["hc_head_fn"][rank],
+            "hc_head_scale": inputs["hc_head_scale"][rank],
+            "hc_head_base": inputs["hc_head_base"][rank],
+            "y": head_out,
+        })
+        expected_rank = golden_rms_norm(head_out, inputs["final_norm_w"][rank]).float()
+        actual_rank = actual[rank].float()
+        if not bool(torch.isfinite(actual_rank).all()):
+            return False, f"    rank {rank} x_out contains NaN or Inf"
+        # bf16 point tolerance from the per-module gates, plus a per-token gate:
+        # a whole-row corruption is far below the tensor-wide 0.5% outlier
+        # budget, so bound the outlier ratio per token row as well.
+        tolerance = 1e-4 + (1.0 / 128) * expected_rank.abs()
+        bad = (actual_rank - expected_rank).abs() > tolerance
+        ratio = float(bad.float().mean())
+        if ratio > 0.005:
+            return False, f"    rank {rank} head oracle mismatch: {ratio:.2%} points out of tolerance"
+        row_bad = bad.float().mean(dim=1)
+        worst_row = int(torch.argmax(row_bad))
+        if float(row_bad[worst_row]) > 0.05:
+            return False, (
+                f"    rank {rank} token {worst_row}: {float(row_bad[worst_row]):.1%} points out of tolerance"
+            )
+    return True, ""
+
+
+def logits_compare(actual, _expected, **kwargs):
+    """Recompute every active logit row from the device x_out and the TP vocab shards."""
+    import torch
+
+    inputs = kwargs.get("inputs", {})
+    device_x_out = kwargs.get("actual_outputs", {}).get("x_out")
+    row_indices = inputs.get("logit_row_indices")
+    weight = inputs.get("lm_head_weight")
+    if device_x_out is None or row_indices is None or weight is None:
+        return False, "    missing device x_out or LM-head inputs"
+    if not bool(torch.isfinite(actual).all()):
+        return False, "    logits contain NaN or Inf"
+    for rank in range(actual.shape[0]):
+        group_base = rank // TP_SIZE * TP_SIZE
+        for row in range(MAX_LOGIT_ROWS):
+            source = int(row_indices[rank, row])
+            if source < 0:
+                continue
+            hidden_row = device_x_out[rank][source].float()
+            # Shard tp owns vocabulary rows [tp * VOCAB_PER_TP, (tp + 1) * VOCAB_PER_TP).
+            expected_row = torch.cat(
+                [weight[group_base + tp].float() @ hidden_row for tp in range(TP_SIZE)]
+            )
+            actual_row = actual[rank, row].cpu()
+            if not torch.allclose(actual_row, expected_row, rtol=1e-3, atol=1e-3):
+                worst = float((actual_row - expected_row).abs().max())
+                return False, (
+                    f"    rank {rank} row {row} (token {source}) logits mismatch, max |err|={worst:.3e}"
+                )
+    return True, ""
+
+
 def sampled_ids_compare(actual, _expected, **kwargs):
-    """Validate active greedy ids and the inactive-row -1 contract."""
+    """Validate greedy ids against the device logits and the inactive-row -1 contract."""
     import torch
 
     row_indices = kwargs.get("inputs", {}).get("logit_row_indices")
-    if row_indices is None:
-        return False, "    missing logit_row_indices input"
+    device_logits = kwargs.get("actual_outputs", {}).get("logits")
+    if row_indices is None or device_logits is None:
+        return False, "    missing logit_row_indices input or device logits output"
     active = row_indices >= 0
     inactive_values = actual.masked_select((~active).unsqueeze(-1).expand_as(actual))
     if inactive_values.numel() and not bool(torch.all(inactive_values == -1)):
         return False, "    inactive sampled-id rows are not -1"
-    active_ids = actual[..., 0].masked_select(active)
-    if active_ids.numel() and bool(((active_ids < 0) | (active_ids >= LM_HEAD_VOCAB)).any()):
-        return False, "    active sampled token id is outside the vocabulary"
+    for rank in range(actual.shape[0]):
+        for row in range(MAX_LOGIT_ROWS):
+            if int(row_indices[rank, row]) < 0:
+                continue
+            sampled = int(actual[rank, row, 0])
+            expected = int(torch.argmax(device_logits[rank][row]))
+            # Both scans keep the first maximum, over identical fp32 data.
+            if sampled != expected:
+                return False, (
+                    f"    rank {rank} row {row}: sampled id {sampled} != device logits argmax {expected}"
+                )
     return True, ""
 
 
 def compare_functions():
-    """Return finite-completion comparators for every backbone and head output."""
+    """Return the head oracles and finite-completion comparators for every output."""
     finite_names = {
-        "x_hc", "attn_stage", "x_out", "logits",
+        "x_hc", "attn_stage",
         "kv_cache", "hca_cmp_kv", "csa_cmp_kv",
         "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
         "idx_kv_cache", "idx_kv_scale",
     }
     compare = {name: finite_tensor_compare for name in finite_names}
+    compare["x_out"] = x_out_compare
+    compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
     return compare
 
