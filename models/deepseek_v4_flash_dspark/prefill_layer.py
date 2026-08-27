@@ -34,9 +34,10 @@ from moe import (
     T,
     TOPK,
     VOCAB,
+    clear_prefill_moe_signals,
     golden_moe,
+    prefill_moe,
 )
-from hc_pre import hc_pre
 from prefill_csa import (
     BLOCK_SIZE,
     CSA_CMP_BLOCK_NUM,
@@ -72,6 +73,9 @@ from prefill_fwd import (
     FWD_GROUP_TOKENS_DYN,
     FWD_TOKENS_DYN,
     HOST_TENSOR_ORDER,
+    build_single_layer_tensor_specs,
+)
+from prefill_o_proj import (
     O_PROJ_LOCAL_COLS,
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_COLS,
@@ -83,10 +87,6 @@ from prefill_fwd import (
     O_PROJ_WO_A_WINDOW_ROWS,
     O_PROJ_WO_B_WINDOW_COLS,
     O_PROJ_WO_B_WINDOW_ROWS,
-    build_single_layer_tensor_specs,
-    gather_o_proj_full_weights,
-    prefill_moe_post,
-    prefill_moe_wave,
 )
 from prefill_hca import (
     HCA_CMP_BLOCK_NUM,
@@ -108,36 +108,8 @@ GROUP_TOKENS = TP_SIZE * T
 # fixture
 SUPPORTED_LAYERS = (0, 2, 3)
 
-assert GROUP_TOKENS <= PREFILL_GROUP_CAP
-
-
-@pl.jit.inline(auto_scope=False)
-def _retire_o_proj_fixture_signals(
-    weight_ready: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    completion_tid: pl.Scalar[pl.TASK_ID],
-):
-    """Clear retained o-projection credits after one fixture invocation."""
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="o_proj_fixture_signal_retire",
-        deps=[completion_tid],
-    ) as retire_tid:
-        self_rank = group_base + tp_rank
-        reset_value = pl.cast(-1, pl.INT32)
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=weight_ready, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.notify(
-                    target=weight_consumed, peer=self_rank,
-                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
-                )
-    return retire_tid
+if GROUP_TOKENS > PREFILL_GROUP_CAP:
+    raise ValueError("single-layer TP group exceeds the prefill communication capacity")
 
 
 @pl.jit(auto_scope=False)
@@ -159,23 +131,13 @@ def prefill_layer_attention(
     hca_cmp_wgate: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[128, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[
-        pl.Tensor[
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM],
-            pl.FP32,
-        ]
-    ],
+    hca_compress_state: pl.InOut[pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[4, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[
-        pl.Tensor[
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM],
-            pl.FP32,
-        ]
-    ],
+    csa_compress_state: pl.InOut[pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -185,12 +147,7 @@ def prefill_layer_attention(
     csa_inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[4, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[
-        pl.Tensor[
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM],
-            pl.FP32,
-        ]
-    ],
+    csa_inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]],
     csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -250,14 +207,6 @@ def prefill_layer_attention(
     o_proj_order_fence = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_o_proj_order_init"):
         pl.write(o_proj_order_fence, [0], pl.cast(0, pl.INT32))
-    o_proj_weight_dep = gather_o_proj_full_weights(
-        wo_a, wo_b,
-        wo_a_full, wo_b_full,
-        o_proj_wo_a_window, o_proj_wo_b_window,
-        o_proj_weight_ready, o_proj_weight_consumed,
-        o_proj_order_fence,
-        group_base, tp_rank, pl.const(1, pl.INT32),
-    )
 
     with pl.scope():
         if layer_id == 0:
@@ -271,11 +220,14 @@ def prefill_layer_attention(
                 kv_cache, ori_block_table, ori_slot_mapping_full,
                 position_ids_local, position_ids_full,
                 attn_sink,
-                wo_a_full, wo_b_full, wo_b_scale,
+                wo_a, wo_b, wo_b_scale,
+                wo_a_full, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
-                group_base, tp_rank,
-                o_proj_weight_dep,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                o_proj_order_fence,
+                group_base, tp_rank, pl.const(1, pl.INT32),
             )
         elif layer_id == 2:
             attn_stage, gather_signal = prefill_attention_csa_cp(
@@ -300,11 +252,14 @@ def prefill_layer_attention(
                 csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full, csa_state_slot_mapping_full,
                 csa_inner_state_slot_mapping_full,
                 attn_sink,
-                wo_a_full, wo_b_full, wo_b_scale,
+                wo_a, wo_b, wo_b_scale,
+                wo_a_full, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
-                group_base, tp_rank,
-                o_proj_weight_dep,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                o_proj_order_fence,
+                group_base, tp_rank, pl.const(1, pl.INT32),
             )
         else:
             attn_stage, gather_signal = prefill_attention_hca_cp(
@@ -322,41 +277,17 @@ def prefill_layer_attention(
                 position_ids_local, position_ids_full,
                 hca_cmp_slot_mapping_full, hca_state_slot_mapping_full,
                 attn_sink,
-                wo_a_full, wo_b_full, wo_b_scale,
+                wo_a, wo_b, wo_b_scale,
+                wo_a_full, wo_b_full,
                 attn_stage,
                 gather_window, gather_signal,
-                group_base, tp_rank,
-                o_proj_weight_dep,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                o_proj_order_fence,
+                group_base, tp_rank, pl.const(1, pl.INT32),
             )
 
-    _retire_o_proj_fixture_signals(
-        o_proj_weight_ready, o_proj_weight_consumed,
-        group_base, tp_rank, o_proj_weight_dep,
-    )
     return attn_stage
-
-
-@pl.jit.inline
-def _clear_moe_fixture_signals(
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    completion_tid: pl.Scalar[pl.TASK_ID],
-):
-    """Clear retained MoE windows after the single-layer fixture retires."""
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="moe_fixture_signal_clear",
-        deps=[completion_tid],
-    ) as clear_tid:
-        zero = pl.cast(0, pl.INT32)
-        for src in pl.range(N_RANKS):
-            pl.write(arrived, [src, 0], zero)
-            pl.write(data_arrived, [src, 0], zero)
-            pl.write(combine_arrived, [src, 0], zero)
-            pl.write(stage_done, [src, 0], zero)
-    return clear_tid
 
 
 @pl.jit(auto_scope=False)
@@ -386,6 +317,7 @@ def prefill_layer_moe(
     post_ffn: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT], pl.FP32]],
     comb_ffn: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT * HC_MULT], pl.FP32]],
     ffn_out: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -395,60 +327,71 @@ def prefill_layer_moe(
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    epoch_init_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    """Run one canonical rank-local MoE wave from the full attention state."""
+    """Run the production prefill MoE path for one oracle layer."""
     attn_stage.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     x_mixed.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     post_ffn.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     comb_ffn.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     input_ids.bind_dynamic(0, FWD_TOKENS_DYN)
     ffn_out.bind_dynamic(0, FWD_TOKENS_DYN)
+    x_next.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
 
-    hc_pre(attn_stage, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
-    tp_rank = my_rank % TP_SIZE
-    x_mixed_local = x_mixed[tp_rank * T : tp_rank * T + T, 0:D]
     stage_token = pl.create_tensor([1], dtype=pl.INT32)
-    barrier_tid = prefill_moe_wave(
-        x_mixed_local,
+    layer_completion = pl.create_tensor([1], dtype=pl.INT32)
+    layer_i32 = pl.cast(layer_id, pl.INT32)
+    num_waves = pl.tensor.dim(ffn_out, 0) // T
+    epoch_base = layer_i32 * pl.cast(num_waves, pl.INT32)
+    expert_epoch_base = epoch_base * pl.const(N_LOCAL, pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_seed") as seed_tid:
+        for src in pl.range(N_RANKS):
+            pl.write(arrived, [src, 0], epoch_base)
+            pl.write(data_arrived, [src, 0], expert_epoch_base)
+            pl.write(combine_arrived, [src, 0], expert_epoch_base)
+            pl.write(stage_done, [src, 0], epoch_base)
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=epoch_init_done, peer=peer,
+                    offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_wait") as wait_tid:
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.defer_wait(
+                    signal=epoch_init_done, offsets=[src, 0],
+                    expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_order_init", deps=[seed_tid, wait_tid]):
+        pl.write(stage_token, [0], epoch_base)
+        pl.write(layer_completion, [0], layer_i32)
+
+    prefill_moe(
+        attn_stage,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        ffn_out,
+        x_next, x_mixed, post_ffn, comb_ffn, ffn_out,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        stage_done, stage_token,
-        layer_id, my_rank, pl.const(1, pl.INT32),
+        stage_done, stage_token, layer_completion,
+        gather_window, gather_signal,
+        group_base, tp_rank, layer_i32, my_rank,
     )
-    _clear_moe_fixture_signals(arrived, data_arrived, combine_arrived, stage_done, barrier_tid)
-    return ffn_out
-
-
-@pl.jit(auto_scope=False)
-def prefill_moe_post_fixture(
-    ffn_out_local: pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16],
-    residual_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
-    post_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT], pl.FP32],
-    comb_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT * HC_MULT], pl.FP32],
-    x_hc_full: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
-    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
-    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-):
-    """Gather rank-local MoE output and apply full-state HC post-mixing."""
-    ffn_out_local.bind_dynamic(0, FWD_TOKENS_DYN)
-    residual_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
-    post_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
-    comb_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
-    x_hc_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
-    return prefill_moe_post(
-        ffn_out_local, residual_full, post_full, comb_full,
-        x_hc_full, gather_window, gather_signal, group_base, tp_rank,
-    )
+    clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
+    return x_next
 
 
 @pl.jit.host
@@ -470,33 +413,13 @@ def l3_prefill_layer(
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, 128, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[
-        pl.Tensor[
-            [
-                N_RANKS,
-                HCA_STATE_BLOCK_NUM,
-                HCA_STATE_BLOCK_SIZE,
-                HCA_COMPRESS_STATE_DIM,
-            ],
-            pl.FP32,
-        ]
-    ],
+    hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, 4, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[
-        pl.Tensor[
-            [
-                N_RANKS,
-                CSA_STATE_BLOCK_NUM,
-                CSA_STATE_BLOCK_SIZE,
-                CSA_COMPRESS_STATE_DIM,
-            ],
-            pl.FP32,
-        ]
-    ],
+    csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -506,17 +429,7 @@ def l3_prefill_layer(
     csa_inner_wgate: pl.Tensor[[N_RANKS, INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, 4, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[
-        pl.Tensor[
-            [
-                N_RANKS,
-                INNER_STATE_BLOCK_NUM,
-                INNER_STATE_BLOCK_SIZE,
-                INNER_COMPRESS_STATE_DIM,
-            ],
-            pl.FP32,
-        ]
-    ],
+    csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -525,7 +438,7 @@ def l3_prefill_layer(
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8,]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids_local: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT32],
@@ -595,6 +508,7 @@ def l3_prefill_layer(
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    epoch_init_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_proj_wo_a_window_buf = pld.alloc_window_buffer([O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16)
@@ -606,14 +520,10 @@ def l3_prefill_layer(
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_proj_wo_a_window = pld.window(
-            o_proj_wo_a_window_buf,
-            [O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS],
-            dtype=pl.BF16,
+            o_proj_wo_a_window_buf, [O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16,
         )
         o_proj_wo_b_window = pld.window(
-            o_proj_wo_b_window_buf,
-            [O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS],
-            dtype=pl.INT8,
+            o_proj_wo_b_window_buf, [O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8,
         )
         o_proj_weight_ready = pld.window(o_proj_weight_ready_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_proj_weight_consumed = pld.window(o_proj_weight_consumed_buf, [TP_SIZE, 1], dtype=pl.INT32)
@@ -666,6 +576,11 @@ def l3_prefill_layer(
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        epoch_init_done = pld.window(epoch_init_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
+        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        group_base = rank // TP_SIZE * TP_SIZE
+        tp_rank = rank % TP_SIZE
         prefill_layer_moe(
             attn_stage[rank],
             hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
@@ -678,25 +593,13 @@ def l3_prefill_layer(
             shared_w1[rank], shared_w1_scale[rank],
             shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
-            x_mixed[rank], post_ffn[rank], comb_ffn[rank], ffn_out[rank],
+            x_mixed[rank], post_ffn[rank], comb_ffn[rank], ffn_out[rank], x_next[rank],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            stage_done,
-            layer_id, rank,
-            device=rank,
-        )
-
-    for rank in pl.range(pld.world_size()):
-        gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
-        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        group_base = rank // TP_SIZE * TP_SIZE
-        tp_rank = rank % TP_SIZE
-        prefill_moe_post_fixture(
-            ffn_out[rank],
-            attn_stage[rank], post_ffn[rank], comb_ffn[rank],
-            x_next[rank],
+            stage_done, epoch_init_done,
             gather_window, gather_signal,
             group_base, tp_rank,
+            layer_id, rank,
             device=rank,
         )
 
@@ -789,20 +692,6 @@ def build_tensor_specs(layer_id=0):
             continue
         source = base_specs[name]
 
-        if name in {"wo_a", "wo_b"}:
-            split_dim = 0 if name == "wo_a" else 1
-
-            def init_o_proj_shards(source=source, split_dim=split_dim):
-                full_weight = _materialize_spec(source, torch)[0]
-                tp_shards = torch.stack(torch.chunk(full_weight, TP_SIZE, dim=split_dim), dim=0)
-                repeats = [N_RANKS // TP_SIZE, *([1] * (tp_shards.ndim - 1))]
-                return tp_shards.repeat(*repeats).contiguous()
-
-            local_shape = list(source.shape[1:])
-            local_shape[split_dim] //= TP_SIZE
-            specs_by_name[name] = TensorSpec(name, [N_RANKS, *local_shape], source.dtype, init_value=init_o_proj_shards)
-            continue
-
         def init_ranked(source=source):
             return _expand_rank_axis(_materialize_spec(source, torch), torch)
 
@@ -823,14 +712,11 @@ def build_tensor_specs(layer_id=0):
         ),
         TensorSpec("x_mixed", [N_RANKS, GROUP_TOKENS, D], torch.bfloat16, is_output=True),
         TensorSpec("post_ffn", [N_RANKS, GROUP_TOKENS, HC_MULT], torch.float32, is_output=True),
-        TensorSpec(
-            "comb_ffn", [N_RANKS, GROUP_TOKENS, HC_MULT * HC_MULT], torch.float32,
-            is_output=True,
-        ),
+        TensorSpec("comb_ffn", [N_RANKS, GROUP_TOKENS, HC_MULT * HC_MULT], torch.float32, is_output=True),
         TensorSpec("ffn_out", [N_RANKS, T, D], torch.bfloat16, is_output=True),
     ]
     specs_by_name.update({spec.name: spec for spec in stage_specs})
-    specs_by_name["x_next"] = TensorSpec("x_next", [N_RANKS, GROUP_TOKENS, HC_MULT, D], torch.float32, is_output=True,)
+    specs_by_name["x_next"] = TensorSpec("x_next", [N_RANKS, GROUP_TOKENS, HC_MULT, D], torch.float32, is_output=True)
 
     for name in _RESIDENT_WEIGHT_NAMES:
         specs_by_name[name].resident = "stacked"

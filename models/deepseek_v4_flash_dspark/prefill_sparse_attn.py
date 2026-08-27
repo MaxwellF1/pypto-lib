@@ -613,11 +613,7 @@ def _sparse_attn_o_proj(
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.spmd(
-                    proj_a_rows,
-                    name_hint="proj_a_mm",
-                    deps=[heads_dep, weight_dep],
-                ) as pa_tid:
+                with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
@@ -711,8 +707,7 @@ def _sparse_attn_o_proj(
     act_t_blks = (tile_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
     act_blocks = (D // PROJ_B_ACT_N_TILE) * act_t_blks
     with pl.spmd(
-        act_blocks,
-        name_hint="proj_b_act",
+        act_blocks, name_hint="proj_b_act",
         deps=[proj_b_tids[i] for i in range(PB_DSLABS * O_GROUPS)],
     ) as _act_tid:
         act_idx = pl.tile.get_block_idx()

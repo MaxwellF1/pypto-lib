@@ -102,8 +102,6 @@ def _prefill_compressor_ratio4_tile(
         [state_block_num * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
-    pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
-    normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
     t_dim = pl.tensor.dim(x, 0)
     x_flat = pl.reshape(x, [t_dim, D])
@@ -265,6 +263,7 @@ def _prefill_compressor_ratio4_tile(
                         ],
                     )
 
+    pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     for write_i in pl.spmd(MAX_CMP_WRITES, name_hint="prefill_c4_softmax_pool"):
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
@@ -375,6 +374,7 @@ def _prefill_compressor_ratio4_tile(
         pl.write(state_order_fence, [0], fence_bit * fence_bit)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     for final_block in pl.spmd(
         MAX_CMP_WRITES // PACKED_RMS_TILE,
         name_hint="prefill_c4_rmsnorm_rope",

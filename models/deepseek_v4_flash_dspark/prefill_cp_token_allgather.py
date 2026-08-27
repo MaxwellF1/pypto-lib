@@ -29,10 +29,6 @@ TP_SIZE = _parse_int_argv("--tp", _TP_DEFAULT)
 if TP_SIZE not in _TP_CHOICES:
     raise ValueError(f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})")
 
-import config
-
-config.TP = TP_SIZE
-
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -52,9 +48,7 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 
 # tiling
 COMM_ROW_TILE = 8
-READBACK_ROW_TILE = _parse_int_argv("--readback-tile", 16)
-if READBACK_ROW_TILE < 1:
-    raise ValueError(f"--readback-tile must be >= 1 (got {READBACK_ROW_TILE})")
+READBACK_ROW_TILE = 16
 
 # fixture
 FIXTURE_ROUNDS = 2
@@ -77,9 +71,7 @@ def prefill_cp_token_allgather_step(
 
     # Publish the payload and first-phase arrival from one producer task.
     with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_cp_token_allgather_push",
-        allow_early_resolve=True,
+        level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_push", allow_early_resolve=True,
     ) as _push_tid:
         for peer_tp in pl.range(TP_SIZE):
             pld.tensor.put(
@@ -96,10 +88,7 @@ def prefill_cp_token_allgather_step(
                 )
 
     # Register the peer payload conditions as deferred completion.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_cp_token_allgather_payload_wait",
-    ) as _payload_wait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_payload_wait") as _payload_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
                 pld.system.defer_wait(
@@ -128,10 +117,7 @@ def prefill_cp_token_allgather_step(
                     offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                 )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_cp_token_allgather_readback_wait",
-    ) as _readback_wait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_readback_wait") as _readback_wait_tid:
         for source_tp in pl.range(TP_SIZE):
             if source_tp != tp_rank:
                 pld.system.defer_wait(
@@ -139,14 +125,13 @@ def prefill_cp_token_allgather_step(
                     expected=pl.cast(2, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
 
-    # Retire peer credits only after this rank's copy and every peer's copy have
-    # completed. The completion handle lets retained-window callers explicitly
-    # order the next collective epoch when tensor dependencies are insufficient.
+    # Retire peer credits and anchor output consumption to signal retirement.
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_retire",
         deps=[_readback_tid, _readback_wait_tid],
     ) as _completion_tid:
+        completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-2, pl.INT32)
         self_rank = group_base + tp_rank
         for source_tp in pl.range(TP_SIZE):
@@ -155,6 +140,7 @@ def prefill_cp_token_allgather_step(
                     target=gather_signal, peer=self_rank,
                     offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
                 )
+        pl.write(group_out, [0, 0], completion_anchor)
 
     return group_out, gather_signal, _completion_tid
 
@@ -163,15 +149,15 @@ def prefill_cp_token_allgather_step(
 def prefill_cp_token_allgather_fixture(
     hidden_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     group_out: pl.Out[pl.Tensor[[CP_KV_T_DYN, D], pl.BF16]],
-    gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
 ):
     """Run one rank of the prefill token-row all-gather."""
     hidden_local.bind_dynamic(0, CP_Q_T_DYN)
     group_out.bind_dynamic(0, CP_KV_T_DYN)
-    group_out, gather_signal, completion_tid = prefill_cp_token_allgather_step(
+    group_out, gather_signal, _completion_tid = prefill_cp_token_allgather_step(
         hidden_local, group_out,
         gather_window, gather_signal,
         group_base, tp_rank,
@@ -268,7 +254,6 @@ if __name__ == "__main__":
         "--local-t", type=int, default=FIXTURE_LOCAL_T,
         help=f"per-rank token count, 1..{PREFILL_LOCAL_CAP}",
     )
-    parser.add_argument("--readback-tile", type=int, default=READBACK_ROW_TILE)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)

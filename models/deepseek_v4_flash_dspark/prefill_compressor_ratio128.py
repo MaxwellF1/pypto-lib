@@ -103,8 +103,6 @@ def _prefill_compressor_ratio128_tile(
         [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
-    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
     t_dim = pl.tensor.dim(x, 0)
     x_flat = pl.reshape(x, [t_dim, D])
@@ -256,6 +254,7 @@ def _prefill_compressor_ratio128_tile(
                     OUT_DIM:COMPRESS_STATE_DIM,
                 ] = pl.add(scatter_score, scatter_ape)
 
+    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     for pool_idx in pl.spmd(
         MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool"
     ):
@@ -320,6 +319,7 @@ def _prefill_compressor_ratio128_tile(
         pl.write(state_order_fence, [0], fence_bit * fence_bit)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     for rms_blk in pl.spmd(
         HCA_C128_RMS_PAD_ROWS // HCA_C128_RMS_TILE, name_hint="prefill_hca_c128_rmsnorm_rope"
     ):
