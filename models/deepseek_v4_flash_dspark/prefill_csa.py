@@ -35,7 +35,7 @@ from prefill_compressor_ratio4 import (
     compressor_ratio4,
     golden_prefill_compressor_ratio4,
 )
-from hc_post import golden_hc_post, hc_post, hc_post_after
+from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,
@@ -1484,13 +1484,13 @@ def prefill_attention_csa_cp(
     )
 
     attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
-    attn_out_full, gather_signal, gather_completion_tid = prefill_cp_token_allgather_step(
+    attn_out_full, gather_signal = prefill_cp_token_allgather_step(
         attn_out_local, attn_out_full,
         gather_window, gather_signal,
         group_base, tp_rank,
     )
 
-    hc_post_after(attn_out_full, x_hc_full, post_full, comb_full, x_out_full, gather_completion_tid)
+    hc_post(attn_out_full, x_hc_full, post_full, comb_full, x_out_full)
     return x_out_full, gather_signal
 
 

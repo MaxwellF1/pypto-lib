@@ -130,7 +130,7 @@ def prefill_cp_token_allgather_step(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_retire",
         deps=[_readback_tid, _readback_wait_tid],
-    ) as _completion_tid:
+    ):
         completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-2, pl.INT32)
         self_rank = group_base + tp_rank
@@ -142,7 +142,7 @@ def prefill_cp_token_allgather_step(
                 )
         pl.write(group_out, [0, 0], completion_anchor)
 
-    return group_out, gather_signal, _completion_tid
+    return group_out, gather_signal
 
 
 @pl.jit
@@ -157,7 +157,7 @@ def prefill_cp_token_allgather_fixture(
     """Run one rank of the prefill token-row all-gather."""
     hidden_local.bind_dynamic(0, CP_Q_T_DYN)
     group_out.bind_dynamic(0, CP_KV_T_DYN)
-    group_out, gather_signal, _completion_tid = prefill_cp_token_allgather_step(
+    group_out, gather_signal = prefill_cp_token_allgather_step(
         hidden_local, group_out,
         gather_window, gather_signal,
         group_base, tp_rank,

@@ -43,7 +43,7 @@ from config import FLASH as M, MOE_TOKENS, RECV_MAX
 from expert_routed import expert_routed
 from expert_shared import expert_shared
 from gate import gate
-from hc_post import hc_post, hc_post_after
+from hc_post import hc_post
 from hc_pre import hc_pre
 from prefill_cp_token_allgather import (
     CP_KV_T_DYN as PREFILL_GROUP_T_DYN,
@@ -749,12 +749,12 @@ def prefill_moe(
     with pl.scope():
         group_rows = pl.tensor.dim(attn_out, 0)
         ffn_out_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
-        ffn_out_full, _gather_signal, gather_completion_tid = prefill_cp_token_allgather_step(
+        ffn_out_full, _gather_signal = prefill_cp_token_allgather_step(
             ffn_out, ffn_out_full,
             gather_window, gather_signal,
             group_base, tp_rank,
         )
-        hc_post_after(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc, gather_completion_tid)
+        hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
     return x_hc
 
 

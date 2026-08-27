@@ -70,40 +70,6 @@ def hc_post(
 
 
 @pl.jit.inline
-def hc_post_after(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    completion_tid: pl.Scalar[pl.TASK_ID],
-):
-    """Run HC post-mixing after an external producer fully retires."""
-    t_dim = pl.tensor.dim(x, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    y_flat = pl.reshape(y, [t_dim, HC_DIM])
-    token_tiles = (t_dim + T_TILE - 1) // T_TILE
-    with pl.spmd(token_tiles, name_hint="hc_post_after", deps=[completion_tid]) as _hc_post_tid:
-        token_block = pl.tile.get_block_idx()
-        t0 = token_block * T_TILE
-        for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
-            if t < t_dim:
-                x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
-                for out_h in pl.unroll(HC_MULT):
-                    post_w = pl.read(post, [t, out_h])
-                    y_row = pl.mul(x_row, post_w)
-                    for in_h in pl.pipeline(HC_MULT, stage=4):
-                        comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
-                        residual_d = in_h * D
-                        residual_row = residual_flat[t : t + 1, residual_d : residual_d + D]
-                        residual_weighted = pl.mul(residual_row, comb_w)
-                        y_row = pl.add(y_row, residual_weighted)
-                    output_d = out_h * D
-                    y_flat[t : t + 1, output_d : output_d + D] = y_row
-    return y
-
-
-@pl.jit.inline
 def hc_post_prefill(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
