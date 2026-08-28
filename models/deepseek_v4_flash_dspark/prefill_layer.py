@@ -347,7 +347,8 @@ def prefill_layer_moe(
     stage_token = pl.create_tensor([1], dtype=pl.INT32)
     layer_completion = pl.create_tensor([1], dtype=pl.INT32)
     layer_i32 = pl.cast(layer_id, pl.INT32)
-    num_waves = pl.tensor.dim(ffn_out, 0) // T
+    local_rows = pl.tensor.dim(ffn_out, 0)
+    num_waves = (local_rows + T - 1) // T
     epoch_base = layer_i32 * pl.cast(num_waves, pl.INT32)
     expert_epoch_base = epoch_base * pl.const(N_LOCAL, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_seed") as seed_tid:

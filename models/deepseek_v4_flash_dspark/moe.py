@@ -635,22 +635,41 @@ def _prefill_moe_wave(
     """Stage and execute one fixed-capacity prefill-MoE wave."""
     local_rows = pl.tensor.dim(ffn_out, 0)
     local_wave_base = wave_id * T
+    # Active rows in the fixed-capacity wave.
+    wave_rows = pl.min(T, local_rows - local_wave_base)
+    wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
     full_wave_base = tp_rank * local_rows + local_wave_base
 
     x_mixed_wave = pl.create_tensor([T, D], dtype=pl.BF16)
     for token in pl.spmd(T, name_hint="prefill_moe_hidden_stage"):
         completed_epoch = pl.read(stage_token, [0])
         if completed_epoch >= 0:
-            full_token = full_wave_base + token
-            x_mixed_wave[token : token + 1, :] = x_mixed_full[full_token : full_token + 1, :]
+            if token < wave_rows:
+                full_token = full_wave_base + token
+                x_mixed_row = x_mixed_full[full_token : full_token + 1, :]
+                x_mixed_wave[token : token + 1, :] = x_mixed_row
+            else:
+                x_mixed_zero = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                x_mixed_wave[token : token + 1, :] = x_mixed_zero
 
     input_id_count = pl.tensor.dim(input_ids, 0)
     input_ids_rows = pl.reshape(input_ids, [input_id_count, 1])
     input_ids_wave_rows = pl.create_tensor([T, 1], dtype=pl.INT64)
-    for token_block in pl.spmd(T // PREFILL_INPUT_ID_TILE, name_hint="prefill_moe_ids_stage"):
-        token0 = token_block * PREFILL_INPUT_ID_TILE
-        local_token = local_wave_base + token0
-        input_ids_wave_rows[token0 : token0 + PREFILL_INPUT_ID_TILE, 0:1] = input_ids_rows[local_token : local_token + PREFILL_INPUT_ID_TILE, 0:1]
+    if wave_rows == T:
+        for token_block in pl.spmd(T // PREFILL_INPUT_ID_TILE, name_hint="prefill_moe_ids_stage"):
+            token0 = token_block * PREFILL_INPUT_ID_TILE
+            local_token = local_wave_base + token0
+            input_id_tile = input_ids_rows[local_token : local_token + PREFILL_INPUT_ID_TILE, 0:1]
+            input_ids_wave_rows[token0 : token0 + PREFILL_INPUT_ID_TILE, 0:1] = input_id_tile
+    else:
+        for token in pl.spmd(T, name_hint="prefill_moe_ids_stage_tail"):
+            if token < wave_rows:
+                local_token = local_wave_base + token
+                input_id = pl.read(input_ids_rows, [local_token, 0])
+                pl.write(input_ids_wave_rows, [token, 0], input_id)
+            else:
+                input_id_zero = pl.cast(0, pl.INT64)
+                pl.write(input_ids_wave_rows, [token, 0], input_id_zero)
     input_ids_wave = pl.reshape(input_ids_wave_rows, [T])
 
     ffn_wave = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -664,10 +683,13 @@ def _prefill_moe_wave(
         ffn_wave,
         recv_meta, recv_x, recv_aux, recv_route,
         arrived, data_arrived, routed_y_buf, combine_arrived,
-        layer_id, pl.const(T, pl.INT32), my_rank, moe_epoch,
+        layer_id, wave_rows_i32, my_rank, moe_epoch,
     )
     barrier_tid = _complete_prefill_moe_wave(stage_done, stage_token, my_rank, moe_epoch, completion_tid)
-    ffn_out[local_wave_base : local_wave_base + T, :] = ffn_wave
+    for token in pl.spmd(T, name_hint="prefill_moe_output_store"):
+        if token < wave_rows:
+            local_token = local_wave_base + token
+            ffn_out[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
     return barrier_tid
 
 
@@ -721,7 +743,8 @@ def prefill_moe(
     with pl.scope():
         hc_pre(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
 
-    num_waves = pl.tensor.dim(ffn_out, 0) // T
+    local_rows = pl.tensor.dim(ffn_out, 0)
+    num_waves = (local_rows + T - 1) // T
     num_waves_i32 = pl.cast(num_waves, pl.INT32)
     for wave in pl.range(num_waves):
         wave_i32 = pl.cast(wave, pl.INT32)

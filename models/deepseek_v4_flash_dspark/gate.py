@@ -151,12 +151,13 @@ def gate(
                 x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
                     pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
-    # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
-    # columns so the sort ranks pad experts last. Route write-backs are guarded to
-    # active tokens, so the inactive-zero can run here rather than post-route.
+    # Zero inactive fixed-tile inputs/outputs and mask padded expert scores.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
         for zt in pl.range(T):
             if zt >= active_tokens:
+                inactive_x_norm_f16 = pl.full([1, D], dtype=pl.FP16, value=0.0)
+                inactive_x_norm_i8 = pl.cast(inactive_x_norm_f16, target_type=pl.INT8, mode="trunc")
+                x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                 for zk in pl.range(TOPK):
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
@@ -358,6 +359,7 @@ def golden_gate_core(tensors):
     denom = topk_vals.sum(dim=-1, keepdim=True)
     weights = (topk_vals / denom) * ROUTE_SCALE
     if num_tokens < T:
+        x_norm_i8[num_tokens:] = 0
         x_norm_scale[num_tokens:] = 0
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0

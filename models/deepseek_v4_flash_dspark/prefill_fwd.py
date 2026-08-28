@@ -143,6 +143,8 @@ LM_HEAD_COMM_EPOCH = 1
 
 if MODEL_NUM_LAYERS != FWD_NUM_LAYERS:
     raise ValueError("DeepSeek-V4 Flash hidden layer count changed")
+if N_RANKS % TP_SIZE:
+    raise ValueError(f"EP world size {N_RANKS} must be divisible by CP group size {TP_SIZE}")
 if LM_HEAD_TP_SIZE != TP_SIZE:
     raise ValueError(f"LM-head TP={LM_HEAD_TP_SIZE} does not match prefill TP={TP_SIZE}")
 if LM_HEAD_VOCAB != MODEL_CONFIG.vocab_size:
@@ -1319,11 +1321,16 @@ def _make_shared_spec(name, base_specs):
     return TensorSpec(name, [N_RANKS, *spec.shape[1:]], spec.dtype, init_value=init_value, is_output=False)
 
 
-def _global_token_index_map(num_tiles, torch):
+def _align_up(value, alignment):
+    """Round a positive host-side extent up to the CP alignment."""
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _global_token_index_map(local_tokens, torch):
     """Map each rank-local row to its TP-group prompt token."""
-    local_tokens = num_tiles * T
     local_row = torch.arange(local_tokens, dtype=torch.int64)
-    return torch.stack([(rank % TP_SIZE) * local_tokens + local_row for rank in range(N_RANKS)], dim=0).contiguous()
+    rank_rows = [(rank % TP_SIZE) * local_tokens + local_row for rank in range(N_RANKS)]
+    return torch.stack(rank_rows, dim=0).contiguous()
 
 
 # Canonical host-tensor order for a single unified prefill layer.
@@ -1515,6 +1522,7 @@ def build_tensor_specs(
     csa_state_block_num=CSA_STATE_BLOCK_NUM,
     inner_state_block_num=INNER_STATE_BLOCK_NUM,
 ):
+    """Build CP-padded full-forward fixtures from a logical prompt length."""
     import torch
     from golden import TensorSpec
 
@@ -1538,30 +1546,24 @@ def build_tensor_specs(
             "custom cache/state pools cannot be smaller than the canonical "
             f"physical layout: {', '.join(undersized)}"
         )
-    tokens_per_wave = TP_SIZE * T
-    if num_tokens < tokens_per_wave or num_tokens % tokens_per_wave != 0:
-        raise ValueError(
-            "layer-major DSA-CP requires full 128-row MoE waves: "
-            f"num_tokens must be a positive multiple of TP_SIZE * {T} == {tokens_per_wave}, "
-            f"got num_tokens={num_tokens}"
-        )
-    if num_tokens > PREFILL_GROUP_CAP:
-        raise ValueError(f"TP-group tokens {num_tokens} exceed prefill capacity {PREFILL_GROUP_CAP}")
+    if num_tokens < 1 or num_tokens > PREFILL_GROUP_CAP:
+        raise ValueError(f"num_tokens must be in [1, {PREFILL_GROUP_CAP}], got {num_tokens}")
 
-    num_tiles = num_tokens // tokens_per_wave
-    global_token_indices = _global_token_index_map(num_tiles, torch)
-    expected_global_indices = torch.arange(num_tokens, dtype=torch.int64)
+    physical_tokens = _align_up(num_tokens, TP_SIZE)
+    local_tokens = physical_tokens // TP_SIZE
+    global_token_indices = _global_token_index_map(local_tokens, torch)
+    expected_global_indices = torch.arange(physical_tokens, dtype=torch.int64)
     for group_base in range(0, N_RANKS, TP_SIZE):
         group_indices = global_token_indices[group_base : group_base + TP_SIZE]
         flat_group_indices = group_indices.reshape(-1)
         sorted_group_indices = torch.sort(flat_group_indices).values
         if not torch.equal(sorted_group_indices, expected_global_indices):
-            raise ValueError(f"TP group at rank {group_base} is not a permutation " f"of 0..{num_tokens - 1}")
+            raise ValueError(f"TP group at rank {group_base} is not a permutation of 0..{physical_tokens - 1}")
     fixture_seed = torch.initial_seed()
 
     base_specs = {
         spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, token_count=num_tokens, layer_id=0)
+        for spec in build_single_layer_tensor_specs(start_pos=start_pos, token_count=physical_tokens, layer_id=0)
         if isinstance(spec, TensorSpec)
     }
 
@@ -1604,24 +1606,30 @@ def build_tensor_specs(
         "csa_compress_state": csa_state_block_num,
         "csa_inner_compress_state": inner_state_block_num,
     }
+    padded_mapping_names = {
+        "ori_slot_mapping_full",
+        "hca_cmp_slot_mapping_full", "hca_state_slot_mapping_full",
+        "csa_cmp_slot_mapping_full", "csa_idx_slot_mapping_full",
+        "csa_state_slot_mapping_full", "csa_inner_state_slot_mapping_full",
+    }
     specs = []
     for name in ordered_names:
         if name == "x_hc":
             base = base_specs[name]
             x_hc_shape = list(base.shape)
             x_hc_shape[0] = N_RANKS
-            x_hc_shape[1] = num_tokens
+            x_hc_shape[1] = physical_tokens
 
-            def init_x_hc(tokens=num_tokens, dtype=base.dtype, seed=fixture_seed):
+            def init_x_hc(tokens=physical_tokens, active_tokens=num_tokens, dtype=base.dtype, seed=fixture_seed):
                 generator = torch.Generator(device="cpu")
                 generator.manual_seed(seed)
                 global_x = torch.randn(N_RANKS // TP_SIZE, tokens, HC_MULT, D, generator=generator, dtype=torch.float32)
+                global_x[:, active_tokens:] = 0
                 group_ids = torch.arange(N_RANKS, dtype=torch.int64) // TP_SIZE
                 return (global_x[group_ids] * 0.05).to(dtype).contiguous()
 
             specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc, is_output=True))
         elif name == "position_ids_local":
-            local_tokens = num_tiles * T
             dtype = base_specs[name].dtype
 
             def init_position_ids_local(indices=global_token_indices, dtype=dtype):
@@ -1629,17 +1637,26 @@ def build_tensor_specs(
 
             specs.append(TensorSpec(name, [N_RANKS, local_tokens], dtype, init_value=init_position_ids_local))
         elif name == "input_ids":
-            local_tokens = num_tiles * T
             dtype = base_specs[name].dtype
 
-            def init_input_ids(indices=global_token_indices, dtype=dtype):
+            def init_input_ids(indices=global_token_indices, active_tokens=num_tokens, dtype=dtype):
                 group_ids = torch.arange(N_RANKS, dtype=torch.int64) // TP_SIZE
-                token_ids = group_ids[:, None] * num_tokens + indices
-                return (token_ids % VOCAB).to(dtype).contiguous()
+                token_ids = group_ids[:, None] * physical_tokens + indices
+                active_rows = indices < active_tokens
+                return torch.where(active_rows, token_ids % VOCAB, 0).to(dtype).contiguous()
 
             specs.append(TensorSpec(name, [N_RANKS, local_tokens], dtype, init_value=init_input_ids))
         elif name in {"wo_a", "wo_b"}:
             specs.append(_make_o_proj_tp_stacked_spec(name, base_specs))
+        elif name in padded_mapping_names:
+            base_spec = _make_shared_spec(name, base_specs)
+
+            def init_padded_mapping(spec=base_spec, active_tokens=num_tokens):
+                value = _spec_value(spec, torch)
+                value[:, active_tokens:] = -1
+                return value.contiguous()
+
+            specs.append(TensorSpec(name, list(base_spec.shape), base_spec.dtype, init_value=init_padded_mapping))
         elif name in SHARED_NAMES:
             specs.append(_make_shared_spec(name, base_specs))
         else:
@@ -1650,8 +1667,7 @@ def build_tensor_specs(
         if spec.name == "x_hc" or spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    local_tokens = num_tiles * T
-    stage_tokens = num_tokens
+    stage_tokens = physical_tokens
     o_proj_scratch_specs = [
         TensorSpec(
             "o_proj_wo_a_full", [N_RANKS, O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT],
@@ -1728,9 +1744,9 @@ def build_tensor_specs(
     # Leader-owned rows: the group leader publishes the last prompt token as its
     # single live logit row; peers keep every row at -1 and still join the TP
     # collective.
-    def init_logit_row_indices(tokens=num_tokens):
+    def init_logit_row_indices(active_tokens=num_tokens):
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[::TP_SIZE, 0] = tokens - 1
+        indices[::TP_SIZE, 0] = active_tokens - 1
         return indices
 
     def init_hidden_workspace():
@@ -1918,12 +1934,8 @@ def main():
         parser.error(f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}")
     if args.ep % args.tp != 0:
         parser.error(f"EP must be divisible by TP/CP, got --ep {args.ep} and --tp {args.tp}")
-    tokens_per_wave = TP_SIZE * T
-    if args.num_tokens < tokens_per_wave or args.num_tokens % tokens_per_wave != 0:
-        parser.error(
-            "layer-major DSA-CP requires full 128-row MoE waves: "
-            f"--num-tokens must be a positive multiple of {tokens_per_wave}"
-        )
+    if args.num_tokens < 1 or args.num_tokens > PREFILL_GROUP_CAP:
+        parser.error(f"--num-tokens must be in [1, {PREFILL_GROUP_CAP}]")
 
     import torch
 
