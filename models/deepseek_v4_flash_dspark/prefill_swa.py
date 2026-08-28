@@ -18,8 +18,10 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     KV_CMP_BLOCK_NUM,
-    KV_CMP_MAX_BLOCKS,
     KV_ORI_BLOCK_NUM,
+    PREFILL_HCA_CMP_MAX_BLOCKS,
+    PREFILL_KV_ORI_MAX_BLOCKS,
+    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -56,7 +58,6 @@ from prefill_sparse_attn import (
 from qkv_proj_rope import (
     golden_qkv_proj_rope,
     kv_proj_rope,
-    materialize_rope_rows_dynamic,
     q_proj_rope,
     qkv_proj_rope,
     rope_prepare,
@@ -79,7 +80,7 @@ HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HEAD_DIM = ROPE_DIM
 Q_LORA = M.q_lora_rank
-MAX_SEQ_LEN = M.max_position_embeddings
+MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
 WIN = M.sliding_window
 IDX_TOPK = M.index_topk
 HC_MULT = M.hc_mult
@@ -92,8 +93,9 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # paged KV cache. The ratio-0 path carries only the sliding-window cache.
 BLOCK_NUM = KV_ORI_BLOCK_NUM
+BLOCK_TABLE_BLOCKS = PREFILL_KV_ORI_MAX_BLOCKS
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+SPARSE_CMP_MAX_BLOCKS = PREFILL_HCA_CMP_MAX_BLOCKS
 START_POS = 0
 
 
@@ -110,10 +112,10 @@ def prefill_attention_swa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -134,17 +136,13 @@ def prefill_attention_swa(
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
 
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t)
-
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     qkv_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
 
@@ -197,7 +195,7 @@ def prefill_attention_swa(
         cmp_indices_dummy,
         valid_block_mask,
         attn_sink,
-        rope_cos_t, rope_sin_t,
+        freqs_cos, freqs_sin,
         wo_a, wo_b, wo_b_scale, attn_out, o_proj_weight_dep,
     )
 
@@ -218,10 +216,10 @@ def prefill_attention_swa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -231,6 +229,8 @@ def prefill_attention_swa_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
     x_hc.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
     kv_cache.bind_dynamic(0, BLOCK_NUM_DYN)
     ori_slot_mapping.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
@@ -259,10 +259,12 @@ def prefill_attention_swa_cp_core(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -278,26 +280,20 @@ def prefill_attention_swa_cp_core(
     q_dim = pl.tensor.dim(x_normed_local, 0)
     kv_dim = pl.tensor.dim(x_normed_full, 0)
 
-    rope_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids_local, rope_cos_local, rope_sin_local)
     q_cos_il = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_local, rope_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
+    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([q_dim, 1], dtype=pl.FP32)
     q_proj_rope(x_normed_local, wq_a, wq_b, wq_b_scale, gamma_cq, q_cos_il, q_sin_signed, q_swap_idx, q, qr, qr_scale)
 
-    rope_cos_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids_full, rope_cos_full, rope_sin_full)
     kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_full, rope_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
@@ -348,7 +344,7 @@ def prefill_attention_swa_cp_core(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy, cmp_indices_dummy,
         valid_block_mask, attn_sink,
-        rope_cos_local, rope_sin_local,
+        freqs_cos_local, freqs_sin_local,
         wo_a, wo_b, wo_b_scale,
         attn_out_local, o_proj_weight_dep,
     )
@@ -368,10 +364,10 @@ def prefill_attention_swa_cp(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -415,16 +411,23 @@ def prefill_attention_swa_cp(
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     local_base = tp_rank * q_dim
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
+    freqs_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
+    freqs_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
     for local_row in pl.spmd(q_dim, name_hint="prefill_swa_cp_query_slice"):
         full_row = local_base + local_row
         query_row = pl.load(x_normed_full, [full_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
         pl.store(query_row, [local_row, 0], x_normed_local)
+        cos_row = pl.load(freqs_cos, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        sin_row = pl.load(freqs_sin, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        pl.store(cos_row, [local_row, 0], freqs_cos_local)
+        pl.store(sin_row, [local_row, 0], freqs_sin_local)
 
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     kv_cache, attn_out_local = prefill_attention_swa_cp_core(
         x_normed_local, x_normed_full,
         wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
+        freqs_cos_local, freqs_sin_local,
         freqs_cos, freqs_sin,
         kv_cache, block_table,
         ori_slot_mapping_full,
@@ -459,10 +462,10 @@ def prefill_attention_swa_cp_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
@@ -482,6 +485,8 @@ def prefill_attention_swa_cp_test(
 ):
     """Run one DSA-CP rank's SWA block with replicated layer-boundary state."""
     x_hc_full.bind_dynamic(0, CP_KV_T_DYN)
+    freqs_cos.bind_dynamic(0, CP_KV_T_DYN)
+    freqs_sin.bind_dynamic(0, CP_KV_T_DYN)
     kv_cache.bind_dynamic(0, BLOCK_NUM_DYN)
     ori_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
     position_ids_local.bind_dynamic(0, CP_Q_T_DYN)
@@ -525,10 +530,10 @@ def l3_prefill_attention_swa_cp(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[TP_SIZE, BLOCK_NUM], pl.INT32],
+    block_table: pl.Tensor[[TP_SIZE, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT32],
@@ -540,6 +545,8 @@ def l3_prefill_attention_swa_cp(
 ):
     """Launch one CP group's SWA block, one child per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
+    freqs_cos.bind_dynamic(1, CP_KV_T_DYN)
+    freqs_sin.bind_dynamic(1, CP_KV_T_DYN)
     kv_cache.bind_dynamic(1, BLOCK_NUM_DYN)
     ori_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
     position_ids_local.bind_dynamic(1, CP_Q_T_DYN)
@@ -621,9 +628,8 @@ def golden_prefill_attention_swa(tensors):
     qr = torch.zeros(token_count, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(token_count, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
-    positions = tensors["position_ids"].to(torch.long)
-    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
-    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
+    rope_cos_t = tensors["freqs_cos"].contiguous()
+    rope_sin_t = tensors["freqs_sin"].contiguous()
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -697,9 +703,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import TensorSpec
-    from utils import build_rope_tables, cache_row_from_table, quant_w_per_channel
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
+    from utils import cache_row_from_table, quant_w_per_channel, token_local_rope
 
     # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
@@ -715,6 +719,11 @@ def build_tensor_specs(
 
     def token_pos():
         return torch.arange(context_len, context_len + q_len, dtype=torch.int32)
+
+    shared_freqs_cos, shared_freqs_sin = token_local_rope(
+        M, 0, token_pos(),
+        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+    )
 
     def init_x_hc():
         return torch.empty(token_count, HC_MULT, D).uniform_(-1, 1)
@@ -751,9 +760,9 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_freqs_sin.clone()
     def init_block_table():
-        tbl = torch.full((BLOCK_NUM,), -1, dtype=torch.int32)
-        for block in range(BLOCK_NUM):
-            tbl[block] = block
+        tbl = torch.full((BLOCK_TABLE_BLOCKS,), -1, dtype=torch.int32)
+        for block in range(BLOCK_TABLE_BLOCKS):
+            tbl[block] = block % BLOCK_NUM
         return tbl
     def init_kv_cache():
         cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -799,11 +808,11 @@ def build_tensor_specs(
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
-        TensorSpec("block_table", [BLOCK_NUM], torch.int32, init_value=init_block_table),
+        TensorSpec("block_table", [BLOCK_TABLE_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [token_count], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),

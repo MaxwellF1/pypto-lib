@@ -685,12 +685,12 @@ def _prefill_moe_wave(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         layer_id, wave_rows_i32, my_rank, moe_epoch,
     )
-    barrier_tid = _complete_prefill_moe_wave(stage_done, stage_token, my_rank, moe_epoch, completion_tid)
-    for token in pl.spmd(T, name_hint="prefill_moe_output_store"):
+    with pl.spmd(T, name_hint="prefill_moe_output_store", deps=[completion_tid]) as output_store_tid:
+        token = pl.tile.get_block_idx()
         if token < wave_rows:
             local_token = local_wave_base + token
             ffn_out[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
-    return barrier_tid
+    return _complete_prefill_moe_wave(stage_done, stage_token, my_rank, moe_epoch, output_store_tid)
 
 
 @pl.jit.inline(auto_scope=False)

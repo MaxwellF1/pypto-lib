@@ -16,7 +16,8 @@ from config import (
     CSA_STATE_PHYSICAL_BLOCKS,
     FLASH as M,
     FP32_NEG_INF,
-    KV_CMP_BLOCK_NUM,
+    PREFILL_CSA_CMP_MAX_BLOCKS,
+    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -37,7 +38,7 @@ HEAD_DIM = M.head_dim
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.nope_head_dim
-MAX_SEQ_LEN = M.max_position_embeddings
+MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
 START_POS = 0
 COMPRESS_RATIO = 4
 OVERLAP = COMPRESS_RATIO == 4
@@ -79,8 +80,8 @@ def _prefill_compressor_ratio4_tile(
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -214,9 +215,11 @@ def _prefill_compressor_ratio4_tile(
 
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    write_src_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_write_map"):
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
+        write_src_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
         for map_local in pl.range(tile_rows):
             map_global = tile_base + map_local
@@ -224,6 +227,7 @@ def _prefill_compressor_ratio4_tile(
             if map_slot_raw >= 0:
                 pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_global]))
                 pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                pl.write(write_src_map, [0, map_seen], pl.cast(map_global, pl.INT32))
                 map_seen = map_seen + 1
 
     # Scatter the whole tile before pooling. The production state ring has 520
@@ -394,14 +398,13 @@ def _prefill_compressor_ratio4_tile(
             final_i = final_base + final_dt
             write_slot_raw = pl.read(write_dst_map, [0, final_i])
             if write_slot_raw >= 0:
-                write_pos = pl.read(write_pos_map, [0, final_i])
-                cmp_pos = pl.cast(write_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+                write_src = pl.cast(pl.read(write_src_map, [0, final_i]), pl.INDEX)
                 cos_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
-                    freqs_cos[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
+                    cmp_freqs_cos[write_src : write_src + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
                 sin_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
-                    freqs_sin[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
+                    cmp_freqs_sin[write_src : write_src + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
 
@@ -489,8 +492,8 @@ def compressor_ratio4(
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -535,8 +538,8 @@ def compressor_ratio4(
                 wgate,
                 ape,
                 norm_w,
-                freqs_cos,
-                freqs_sin,
+                cmp_freqs_cos,
+                cmp_freqs_sin,
                 cmp_kv,
                 position_ids,
                 cmp_slot_mapping,
@@ -648,9 +651,8 @@ def golden_prefill_compressor_ratio4(tensors):
             rope_pair = normed[..., NOPE_HEAD_DIM:HEAD_DIM].unflatten(-1, (-1, 2))
             rope_even = rope_pair[..., 0]
             rope_odd = rope_pair[..., 1]
-            cmp_pos = write_pos + 1 - COMPRESS_RATIO
-            cos = tensors["freqs_cos"][cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2].float()
-            sin = tensors["freqs_sin"][cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2].float()
+            cos = tensors["cmp_freqs_cos"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
+            sin = tensors["cmp_freqs_sin"][token_id : token_id + 1, 0 : ROPE_HEAD_DIM // 2].float()
             rot_even = rope_even * cos - rope_odd * sin
             rot_odd = rope_even * sin + rope_odd * cos
             normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
@@ -668,8 +670,8 @@ def prefill_compressor_ratio4_test(
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
@@ -678,6 +680,8 @@ def prefill_compressor_ratio4_test(
     x.bind_dynamic(0, T_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
     cmp_slot_mapping.bind_dynamic(0, T_DYN)
     state_slot_mapping.bind_dynamic(0, T_DYN)
@@ -690,8 +694,8 @@ def prefill_compressor_ratio4_test(
         wgate,
         ape,
         norm_w,
-        freqs_cos,
-        freqs_sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
         cmp_kv,
         position_ids,
         cmp_slot_mapping,
@@ -702,9 +706,7 @@ def prefill_compressor_ratio4_test(
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
     import torch
     from golden import TensorSpec
-    from utils import build_rope_tables
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    from utils import token_local_rope
 
     if token_count <= 0 or token_count > MAX_SEQ_LEN:
         raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
@@ -751,17 +753,30 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     def init_norm_w():
         return 0.9569 + 0.1916 * torch.randn(HEAD_DIM)
 
-    def init_freqs_cos():
-        return shared_freqs_cos.clone()
-
-    def init_freqs_sin():
-        return shared_freqs_sin.clone()
-
     def init_cmp_kv():
-        return torch.zeros(KV_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+        return torch.zeros(PREFILL_CSA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     def init_position_ids():
         return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
+
+    def init_cmp_rope_positions():
+        positions = init_position_ids().to(torch.int64)
+        boundary = (positions + 1) % COMPRESS_RATIO == 0
+        return torch.where(boundary, positions - (COMPRESS_RATIO - 1), torch.zeros_like(positions))
+
+    def init_cmp_freqs_cos():
+        cos, _ = token_local_rope(
+            M, COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return cos.contiguous()
+
+    def init_cmp_freqs_sin():
+        _, sin = token_local_rope(
+            M, COMPRESS_RATIO, init_cmp_rope_positions(),
+            max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+        )
+        return sin.contiguous()
 
     def init_cmp_slot_mapping():
         mapping = torch.full((token_count,), -1, dtype=torch.int64)
@@ -769,7 +784,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             pos = start_pos + t
             if pos + 1 >= COMPRESS_RATIO and (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = (pos + 1) // COMPRESS_RATIO - 1
-                if dst_row >= KV_CMP_BLOCK_NUM * BLOCK_SIZE:
+                if dst_row >= PREFILL_CSA_CMP_MAX_BLOCKS * BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone cmp_kv capacity")
                 mapping[t] = dst_row
         return mapping
@@ -799,11 +814,11 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
+        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
         TensorSpec(
             "cmp_kv",
-            [KV_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [PREFILL_CSA_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
             is_output=True,

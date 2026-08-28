@@ -64,7 +64,7 @@ from prefill_csa import (
     O_LORA,
     Q_LORA,
     ROPE_HEAD_DIM,
-    SPARSE_CMP_MAX_BLOCKS,
+    SPARSE_CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
     SPARSE_ORI_MAX_BLOCKS,
     golden_prefill_attention_csa,
     prefill_attention_csa_cp,
@@ -95,6 +95,7 @@ from prefill_hca import (
     HCA_STATE_MAX_BLOCKS,
     MAIN_COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
+    SPARSE_CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     golden_prefill_attention_hca,
     prefill_attention_hca_cp,
 )
@@ -125,8 +126,14 @@ def prefill_layer_attention(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    swa_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    swa_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     hca_cmp_wkv: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[128, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -154,8 +161,8 @@ def prefill_layer_attention(
     ori_slot_mapping_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN], pl.INT64],
     hca_cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    hca_cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -184,6 +191,14 @@ def prefill_layer_attention(
 ):
     """Run one selected DSA-CP attention kind."""
     x_hc.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    swa_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    swa_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     ori_slot_mapping_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     position_ids_local.bind_dynamic(0, FWD_TOKENS_DYN)
     position_ids_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
@@ -194,14 +209,6 @@ def prefill_layer_attention(
     csa_state_slot_mapping_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     csa_inner_state_slot_mapping_full.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     attn_stage.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
-    swa_profile = freqs_cos[0:1, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
-    swa_cos = pl.reshape(swa_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
-    swa_profile = freqs_sin[0:1, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
-    swa_sin = pl.reshape(swa_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
-    compressed_profile = freqs_cos[1:2, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
-    compressed_cos = pl.reshape(compressed_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
-    compressed_profile = freqs_sin[1:2, 0:MAX_SEQ_LEN, 0:ROPE_HEAD_DIM]
-    compressed_sin = pl.reshape(compressed_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM])
     wo_a_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16)
     wo_b_full = pl.create_tensor([O_PROJ_SCRATCH_D, O_PROJ_SCRATCH_COLS], dtype=pl.INT8)
     o_proj_order_fence = pl.create_tensor([1], dtype=pl.INT32)
@@ -216,7 +223,7 @@ def prefill_layer_attention(
                 attn_norm_w,
                 wq_a, wq_b, wq_b_scale,
                 wkv, gamma_cq, gamma_ckv,
-                swa_cos, swa_sin,
+                swa_freqs_cos, swa_freqs_sin,
                 kv_cache, ori_block_table, ori_slot_mapping_full,
                 position_ids_local, position_ids_full,
                 attn_sink,
@@ -236,7 +243,8 @@ def prefill_layer_attention(
                 attn_norm_w,
                 wq_a, wq_b, wq_b_scale,
                 wkv, gamma_cq, gamma_ckv,
-                compressed_cos, compressed_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
+                csa_cmp_freqs_cos, csa_cmp_freqs_sin,
                 csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape,
                 csa_cmp_norm_w,
                 csa_compress_state, csa_compress_state_block_table,
@@ -268,7 +276,8 @@ def prefill_layer_attention(
                 attn_norm_w,
                 wq_a, wq_b, wq_b_scale,
                 wkv, gamma_cq, gamma_ckv,
-                compressed_cos, compressed_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
+                hca_cmp_freqs_cos, hca_cmp_freqs_sin,
                 hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape,
                 hca_cmp_norm_w,
                 hca_compress_state, hca_compress_state_block_table,
@@ -408,8 +417,14 @@ def l3_prefill_layer(
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    swa_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    swa_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    compressed_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    hca_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
+    csa_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, 128, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -437,8 +452,8 @@ def l3_prefill_layer(
     ori_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
     hca_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     csa_cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    hca_cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[N_RANKS, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[N_RANKS, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -484,6 +499,14 @@ def l3_prefill_layer(
 ):
     """Run one DSA-CP layer across all ranks."""
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    swa_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    swa_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    compressed_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    hca_cmp_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_cos.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    csa_cmp_freqs_sin.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     ori_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     position_ids_local.bind_dynamic(1, FWD_TOKENS_DYN)
     position_ids_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
@@ -536,7 +559,10 @@ def l3_prefill_layer(
             attn_norm_w[rank],
             wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            freqs_cos[rank], freqs_sin[rank],
+            swa_freqs_cos[rank], swa_freqs_sin[rank],
+            compressed_freqs_cos[rank], compressed_freqs_sin[rank],
+            hca_cmp_freqs_cos[rank], hca_cmp_freqs_sin[rank],
+            csa_cmp_freqs_cos[rank], csa_cmp_freqs_sin[rank],
             hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank],
             hca_cmp_norm_w[rank],
             hca_compress_state[rank], hca_compress_state_block_table[rank],
@@ -611,7 +637,6 @@ _RESIDENT_WEIGHT_NAMES = frozenset(
         "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale",
         "wkv", "gamma_cq", "gamma_ckv",
-        "freqs_cos", "freqs_sin",
         "hca_cmp_wkv", "hca_cmp_wgate", "hca_cmp_ape",
         "hca_cmp_norm_w",
         "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape",
@@ -667,34 +692,70 @@ def _materialize_spec(spec, torch):
     return torch.zeros(spec.shape, dtype=spec.dtype)
 
 
-def build_tensor_specs(layer_id=0):
-    """Build one full DSA-CP layer boundary from the canonical leaf fixtures."""
+def build_tensor_specs(layer_id=0, start_pos=0, token_count=GROUP_TOKENS):
+    """Build one CP-padded DSA-CP layer boundary from the canonical leaf fixtures."""
     import torch
 
     if layer_id not in SUPPORTED_LAYERS:
         raise ValueError(f"layer_id must be one of {SUPPORTED_LAYERS}, got {layer_id}")
-    single_layer_specs = build_single_layer_tensor_specs(start_pos=0, token_count=GROUP_TOKENS, layer_id=layer_id)
+    if start_pos < 0:
+        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
+    if token_count < 1 or token_count > PREFILL_GROUP_CAP:
+        raise ValueError(f"token_count must be in [1, {PREFILL_GROUP_CAP}], got {token_count}")
+    physical_tokens = (token_count + TP_SIZE - 1) // TP_SIZE * TP_SIZE
+    if start_pos + physical_tokens > MAX_SEQ_LEN:
+        raise ValueError(
+            "start_pos plus the CP-padded current chunk must fit the model context: "
+            f"{start_pos} + {physical_tokens} > {MAX_SEQ_LEN}"
+        )
+    local_tokens = physical_tokens // TP_SIZE
+    single_layer_specs = build_single_layer_tensor_specs(
+        start_pos=start_pos, token_count=physical_tokens, layer_id=layer_id,
+    )
     base_specs = {spec.name: spec for spec in single_layer_specs if isinstance(spec, TensorSpec)}
 
     def init_full_x():
-        full = _materialize_spec(base_specs["x_hc"], torch)[0]
+        full = _materialize_spec(base_specs["x_hc"], torch)[0].clone()
+        full[token_count:] = 0
         groups = []
         for group_id in range(N_RANKS // TP_SIZE):
-            group_full = torch.roll(full, shifts=group_id, dims=0)
+            group_full = full.clone()
+            group_full[:token_count] = torch.roll(full[:token_count], shifts=group_id, dims=0)
             group_ranked = group_full.unsqueeze(0).expand(TP_SIZE, -1, -1, -1).contiguous()
             groups.append(group_ranked)
         return torch.cat(groups, dim=0)
 
     specs_by_name = {
-        "x_hc": TensorSpec("x_hc", [N_RANKS, GROUP_TOKENS, HC_MULT, D], torch.float32, init_value=init_full_x)
+        "x_hc": TensorSpec("x_hc", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32, init_value=init_full_x)
+    }
+    padded_mapping_names = {
+        "ori_slot_mapping_full",
+        "hca_cmp_slot_mapping_full", "hca_state_slot_mapping_full",
+        "csa_cmp_slot_mapping_full", "csa_idx_slot_mapping_full",
+        "csa_state_slot_mapping_full", "csa_inner_state_slot_mapping_full",
     }
     for name in HOST_TENSOR_ORDER:
         if name in {"x_hc", "x_next"}:
             continue
         source = base_specs[name]
 
-        def init_ranked(source=source):
-            return _expand_rank_axis(_materialize_spec(source, torch), torch)
+        if name == "input_ids":
+            def init_input_ids():
+                local_row = torch.arange(local_tokens, dtype=torch.int64)
+                global_row = (torch.arange(N_RANKS, dtype=torch.int64) % TP_SIZE).unsqueeze(1) * local_tokens
+                global_row = global_row + local_row
+                group_id = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1) // TP_SIZE
+                token_ids = group_id * physical_tokens + global_row
+                return torch.where(global_row < token_count, token_ids % VOCAB, 0).contiguous()
+
+            specs_by_name[name] = TensorSpec(name, [N_RANKS, local_tokens], source.dtype, init_value=init_input_ids)
+            continue
+
+        def init_ranked(source=source, name=name):
+            value = _expand_rank_axis(_materialize_spec(source, torch), torch)
+            if name in padded_mapping_names:
+                value[:, token_count:] = -1
+            return value.contiguous()
 
         shape = list(source.shape)
         shape[0] = N_RANKS
@@ -704,20 +765,22 @@ def build_tensor_specs(layer_id=0):
         )
 
     def init_attn_stage():
-        return torch.zeros(N_RANKS, GROUP_TOKENS, HC_MULT, D, dtype=torch.float32)
+        return torch.zeros(N_RANKS, physical_tokens, HC_MULT, D, dtype=torch.float32)
 
     stage_specs = [
         TensorSpec(
-            "attn_stage", [N_RANKS, GROUP_TOKENS, HC_MULT, D], torch.float32,
+            "attn_stage", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32,
             init_value=init_attn_stage, is_output=True,
         ),
-        TensorSpec("x_mixed", [N_RANKS, GROUP_TOKENS, D], torch.bfloat16, is_output=True),
-        TensorSpec("post_ffn", [N_RANKS, GROUP_TOKENS, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb_ffn", [N_RANKS, GROUP_TOKENS, HC_MULT * HC_MULT], torch.float32, is_output=True),
-        TensorSpec("ffn_out", [N_RANKS, T, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_mixed", [N_RANKS, physical_tokens, D], torch.bfloat16, is_output=True),
+        TensorSpec("post_ffn", [N_RANKS, physical_tokens, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("comb_ffn", [N_RANKS, physical_tokens, HC_MULT * HC_MULT], torch.float32, is_output=True),
+        TensorSpec("ffn_out", [N_RANKS, local_tokens, D], torch.bfloat16, is_output=True),
     ]
     specs_by_name.update({spec.name: spec for spec in stage_specs})
-    specs_by_name["x_next"] = TensorSpec("x_next", [N_RANKS, GROUP_TOKENS, HC_MULT, D], torch.float32, is_output=True)
+    specs_by_name["x_next"] = TensorSpec(
+        "x_next", [N_RANKS, physical_tokens, HC_MULT, D], torch.float32, is_output=True
+    )
 
     for name in _RESIDENT_WEIGHT_NAMES:
         specs_by_name[name].resident = "stacked"
@@ -741,8 +804,8 @@ def _attention_golden_tensors(tensors, rank, layer_id, x_out):
         "wkv": tensors["wkv"][rank],
         "gamma_cq": tensors["gamma_cq"][rank],
         "gamma_ckv": tensors["gamma_ckv"][rank],
-        "freqs_cos": tensors["freqs_cos"][rank, 1 if layer_id in (2, 3) else 0],
-        "freqs_sin": tensors["freqs_sin"][rank, 1 if layer_id in (2, 3) else 0],
+        "freqs_cos": tensors["compressed_freqs_cos" if layer_id in (2, 3) else "swa_freqs_cos"][rank],
+        "freqs_sin": tensors["compressed_freqs_sin" if layer_id in (2, 3) else "swa_freqs_sin"][rank],
         "kv_cache": tensors["kv_cache"][rank],
         "ori_block_table": tensors["ori_block_table"][rank],
         "ori_slot_mapping": tensors["ori_slot_mapping_full"][rank],
@@ -752,7 +815,7 @@ def _attention_golden_tensors(tensors, rank, layer_id, x_out):
         "wo_b": wo_b_full,
         "wo_b_scale": tensors["wo_b_scale"][rank],
         "x_out": x_out,
-        "num_tokens": GROUP_TOKENS,
+        "num_tokens": tensors["x_hc"].shape[1],
     }
     if layer_id == 0:
         common["block_table"] = common.pop("ori_block_table")
@@ -766,6 +829,8 @@ def _attention_golden_tensors(tensors, rank, layer_id, x_out):
                 "cmp_norm_w": tensors["hca_cmp_norm_w"][rank],
                 "compress_state": tensors["hca_compress_state"][rank],
                 "compress_state_block_table": tensors["hca_compress_state_block_table"][rank],
+                "cmp_freqs_cos": tensors["hca_cmp_freqs_cos"][rank],
+                "cmp_freqs_sin": tensors["hca_cmp_freqs_sin"][rank],
                 "cmp_kv": tensors["hca_cmp_kv"][rank],
                 "cmp_block_table": tensors["hca_cmp_block_table"][rank],
                 "cmp_slot_mapping": tensors["hca_cmp_slot_mapping_full"][rank],
@@ -781,6 +846,8 @@ def _attention_golden_tensors(tensors, rank, layer_id, x_out):
             "cmp_norm_w": tensors["csa_cmp_norm_w"][rank],
             "compress_state": tensors["csa_compress_state"][rank],
             "compress_state_block_table": tensors["csa_compress_state_block_table"][rank],
+            "cmp_freqs_cos": tensors["csa_cmp_freqs_cos"][rank],
+            "cmp_freqs_sin": tensors["csa_cmp_freqs_sin"][rank],
             "hadamard_idx": tensors["csa_hadamard_idx"][rank],
             "idx_wq_b": tensors["csa_idx_wq_b"][rank],
             "idx_wq_b_scale": tensors["csa_idx_wq_b_scale"][rank],
@@ -818,9 +885,11 @@ def golden_prefill_layer(tensors):
         3: golden_prefill_attention_hca,
     }[layer_id]
     cache_outputs = _CACHE_OUTPUTS[layer_id]
+    group_tokens = tensors["x_hc"].shape[1]
+    local_tokens = tensors["position_ids_local"].shape[1]
 
     for group_base in range(0, N_RANKS, TP_SIZE):
-        full_attn = torch.zeros(GROUP_TOKENS, HC_MULT, D, dtype=torch.float32)
+        full_attn = torch.zeros(group_tokens, HC_MULT, D, dtype=torch.float32)
         attention_tensors = _attention_golden_tensors(tensors, group_base, layer_id, full_attn)
         attention_golden(attention_tensors)
         full_attn = attention_tensors["x_out"]
@@ -829,7 +898,7 @@ def golden_prefill_layer(tensors):
             for name in cache_outputs:
                 tensors[name][rank].copy_(tensors[name][group_base])
 
-    local_attn = torch.empty(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
+    local_attn = torch.empty(N_RANKS, local_tokens, HC_MULT, D, dtype=torch.float32)
     for rank in range(N_RANKS):
         golden_hc_pre({
             "x": tensors["attn_stage"][rank],
@@ -841,15 +910,35 @@ def golden_prefill_layer(tensors):
             "comb": tensors["comb_ffn"][rank],
         })
         tp_rank = rank % TP_SIZE
-        local_attn[rank].copy_(tensors["attn_stage"][rank, tp_rank * T : (tp_rank + 1) * T])
+        local_start = tp_rank * local_tokens
+        local_attn[rank].copy_(tensors["attn_stage"][rank, local_start : local_start + local_tokens])
 
     local_next = torch.zeros_like(local_attn)
-    moe_tensors = dict(tensors)
-    moe_tensors.update({"x_hc": local_attn, "x_next": local_next, "num_tokens": T, "layer_id": layer_id})
-    golden_moe(moe_tensors)
+    for wave_start in range(0, local_tokens, T):
+        wave_rows = min(T, local_tokens - wave_start)
+        wave_x = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
+        wave_x[:, :wave_rows].copy_(local_attn[:, wave_start : wave_start + wave_rows])
+        wave_input_ids = torch.zeros(N_RANKS, T, dtype=tensors["input_ids"].dtype)
+        wave_input_ids[:, :wave_rows].copy_(tensors["input_ids"][:, wave_start : wave_start + wave_rows])
+        wave_next = torch.zeros_like(wave_x)
+        wave_ffn = torch.zeros(N_RANKS, T, D, dtype=torch.bfloat16)
+        moe_tensors = dict(tensors)
+        moe_tensors.update(
+            {
+                "x_hc": wave_x,
+                "input_ids": wave_input_ids,
+                "ffn_out": wave_ffn,
+                "x_next": wave_next,
+                "num_tokens": wave_rows,
+                "layer_id": layer_id,
+            }
+        )
+        golden_moe(moe_tensors)
+        tensors["ffn_out"][:, wave_start : wave_start + wave_rows].copy_(wave_ffn[:, :wave_rows])
+        local_next[:, wave_start : wave_start + wave_rows].copy_(wave_next[:, :wave_rows])
 
     for group_base in range(0, N_RANKS, TP_SIZE):
-        full_next = local_next[group_base : group_base + TP_SIZE].reshape(GROUP_TOKENS, HC_MULT, D)
+        full_next = local_next[group_base : group_base + TP_SIZE].reshape(group_tokens, HC_MULT, D)
         for rank in range(group_base, group_base + TP_SIZE):
             tensors["x_next"][rank].copy_(full_next)
 
@@ -891,6 +980,11 @@ def main():
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8, 16])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--layer-id", type=int, default=0, choices=list(SUPPORTED_LAYERS))
+    parser.add_argument("--start-pos", type=int, default=0)
+    parser.add_argument(
+        "--token-count", type=int, default=GROUP_TOKENS,
+        help=f"logical current-chunk rows before CP padding; must be at most {PREFILL_GROUP_CAP}",
+    )
     parser.add_argument(
         "-d", "--device",
         default=os.environ.get("TASK_DEVICE", ",".join(str(index) for index in range(N_RANKS))),
@@ -910,13 +1004,15 @@ def main():
         parser.error(f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}")
     if args.ep % args.tp != 0:
         parser.error(f"EP must be divisible by TP/CP, got --ep {args.ep} and --tp {args.tp}")
+    if args.token_count < 1 or args.token_count > PREFILL_GROUP_CAP:
+        parser.error(f"--token-count must be in [1, {PREFILL_GROUP_CAP}]")
 
     import torch
 
     torch.manual_seed(args.seed)
     result = run_jit(
         fn=l3_prefill_layer,
-        specs=build_tensor_specs(args.layer_id),
+        specs=build_tensor_specs(args.layer_id, start_pos=args.start_pos, token_count=args.token_count),
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,

@@ -20,11 +20,10 @@ from config import (
     CSA_STATE_PHYSICAL_BLOCKS,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    KV_CMP_BLOCK_NUM,
-    KV_CMP_MAX_BLOCKS,
-    IDX_CACHE_BLOCK_NUM,
     KV_ORI_BLOCK_NUM,
-    KV_ORI_MAX_BLOCKS,
+    PREFILL_CSA_CMP_MAX_BLOCKS,
+    PREFILL_KV_ORI_MAX_BLOCKS,
+    PREFILL_MAX_CONTEXT_TOKENS,
     PREFILL_SEQ,
 )
 
@@ -39,8 +38,8 @@ from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,
+    IDX_CACHE_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
-    INDEXER_SCORE_CAP,
     INDEXER_TOPK_CAP,
     gen_shared_weight,
     golden_prefill_indexer_core,
@@ -54,11 +53,12 @@ from prefill_indexer_compressor import (
     INNER_STATE_MAX_BLOCKS,
     prefill_indexer_compressor,
 )
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows_dynamic, qkv_proj_rope
+from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     PREFILL_ATTN_BLOCKS,
     PREFILL_ATTN_TILE,
+    PREFILL_RING_HEAP,
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     SPARSE_CMP_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
@@ -98,7 +98,7 @@ T_DYN = pl.dynamic("PREFILL_CSA_T_DYN")
 CP_Q_T_DYN = pl.dynamic("PREFILL_CSA_CP_Q_T_DYN")
 CP_KV_T_DYN = pl.dynamic("PREFILL_CSA_CP_KV_T_DYN")
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_CMP_BLOCK_NUM_DYN")
 IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
@@ -110,7 +110,7 @@ HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 Q_LORA = M.q_lora_rank
-MAX_SEQ_LEN = M.max_position_embeddings
+MAX_SEQ_LEN = PREFILL_MAX_CONTEXT_TOKENS
 WIN = M.sliding_window
 COMPRESS_RATIO = 4
 START_POS = 0
@@ -134,11 +134,11 @@ MAX_CMP_WRITES = max(1, PREFILL_MAX_TOKENS // COMPRESS_RATIO)
 
 # paged KV cache
 ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
-SPARSE_ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+CMP_MAX_BLOCKS = PREFILL_CSA_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = CMP_MAX_BLOCKS
+SPARSE_ORI_MAX_BLOCKS = PREFILL_KV_ORI_MAX_BLOCKS
 SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
-CSA_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
+CSA_ORI_BLOCK_NUM = ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 
 # tiling
@@ -162,8 +162,10 @@ def prefill_attention_csa(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -215,9 +217,6 @@ def prefill_attention_csa(
     # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
 
-    rope_cos_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t)
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([t_dim, Q_LORA], dtype=pl.INT8)
@@ -228,8 +227,8 @@ def prefill_attention_csa(
         wq_b,
         wq_b_scale,
         wkv,
-        rope_cos_t,
-        rope_sin_t,
+        freqs_cos,
+        freqs_sin,
         gamma_cq,
         gamma_ckv,
         q,
@@ -257,30 +256,27 @@ def prefill_attention_csa(
         cmp_wgate,
         cmp_ape,
         cmp_norm_w,
-        freqs_cos,
-        freqs_sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
         cmp_kv,
         position_ids,
         cmp_slot_mapping,
         state_slot_mapping,
     )
-    # Half-width FP32 cos/sin rows for the indexer Q-RoPE: gather freqs at each token's position
-    # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
+    # Half-width FP32 current-token rows for the indexer Q-RoPE.
     idx_cos = pl.create_tensor([t_dim, HALF_ROPE], dtype=pl.FP32)
     idx_sin = pl.create_tensor([t_dim, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
         for idx_t in pl.range(t_dim):
-            idx_pos = pl.cast(pl.read(position_ids, [idx_t]), pl.INDEX)
             idx_cos[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(
-                freqs_cos[idx_pos : idx_pos + 1, 0:HALF_ROPE], target_type=pl.FP32
+                freqs_cos[idx_t : idx_t + 1, 0:HALF_ROPE], target_type=pl.FP32
             )
             idx_sin[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(
-                freqs_sin[idx_pos : idx_pos + 1, 0:HALF_ROPE], target_type=pl.FP32
+                freqs_sin[idx_t : idx_t + 1, 0:HALF_ROPE], target_type=pl.FP32
             )
 
     cmp_topk_indices = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
-    idx_score_unused = pl.create_tensor([t_dim, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    idx_kv_cache_out, idx_kv_scale_out, idx_score_unused, cmp_topk_indices = prefill_indexer(
+    idx_kv_cache_out, idx_kv_scale_out, cmp_topk_indices = prefill_indexer(
         x_normed,
         qr,
         qr_scale,
@@ -289,8 +285,8 @@ def prefill_attention_csa(
         idx_weights_proj,
         idx_cos,
         idx_sin,
-        freqs_cos,
-        freqs_sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
         hadamard_idx,
         inner_compress_state,
         inner_compress_state_block_table,
@@ -301,7 +297,6 @@ def prefill_attention_csa(
         idx_kv_cache,
         idx_kv_scale,
         idx_block_table,
-        idx_score_unused,
         cmp_topk_indices,
         position_ids,
         idx_slot_mapping,
@@ -319,7 +314,7 @@ def prefill_attention_csa(
             mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if t_idx < t_dim:
                 abs_pos = pl.read(position_ids, [t_idx])
-                # Derive block liveness from the dense top-k prefix and -1 padding.
+                # Sparse-block liveness from the dense TopK prefix.
                 visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(INDEXER_TOPK_CAP, pl.INT32))
                 for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
                     cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
@@ -351,7 +346,7 @@ def prefill_attention_csa(
         kv_cache, swa_indices,
         cmp_kv, cmp_block_table, cmp_topk_indices,
         valid_block_mask, attn_sink,
-        rope_cos_t, rope_sin_t,
+        freqs_cos, freqs_sin,
         wo_a, wo_b, wo_b_scale,
         attn_out,
         o_proj_weight_dep,
@@ -382,8 +377,10 @@ def prefill_attention_csa_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -424,6 +421,10 @@ def prefill_attention_csa_test(
     x_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
     x_hc.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, T_DYN)
+    freqs_sin.bind_dynamic(0, T_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
     compress_state.bind_dynamic(0, MAIN_STATE_BLOCK_NUM_DYN)
     inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
@@ -452,6 +453,8 @@ def prefill_attention_csa_test(
         gamma_ckv,
         freqs_cos,
         freqs_sin,
+        cmp_freqs_cos,
+        cmp_freqs_sin,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -526,9 +529,8 @@ def golden_prefill_attention_csa(tensors):
     qr = torch.zeros(token_count, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(token_count, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
-    positions = tensors["position_ids"].to(torch.long)
-    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
-    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
+    rope_cos_t = tensors["freqs_cos"].contiguous()
+    rope_sin_t = tensors["freqs_sin"].contiguous()
     golden_qkv_proj_rope(
         {
             "x": x_normed.view(token_count, D),
@@ -556,8 +558,8 @@ def golden_prefill_attention_csa(tensors):
             "wgate": tensors["cmp_wgate"],
             "ape": tensors["cmp_ape"],
             "norm_w": tensors["cmp_norm_w"],
-            "freqs_cos": tensors["freqs_cos"],
-            "freqs_sin": tensors["freqs_sin"],
+            "cmp_freqs_cos": tensors["cmp_freqs_cos"],
+            "cmp_freqs_sin": tensors["cmp_freqs_sin"],
             "cmp_kv": tensors["cmp_kv"],
             "position_ids": tensors["position_ids"],
             "cmp_slot_mapping": tensors["cmp_slot_mapping"],
@@ -566,7 +568,7 @@ def golden_prefill_attention_csa(tensors):
     )
     idx_cos = rope_cos_t[:, :HALF_ROPE].float().contiguous()
     idx_sin = rope_sin_t[:, :HALF_ROPE].float().contiguous()
-    cmp_topk_indices, _idx_score = golden_prefill_indexer_core(
+    cmp_topk_indices = golden_prefill_indexer_core(
         {
             "x": x_normed.view(token_count, D),
             "qr": qr,
@@ -576,8 +578,8 @@ def golden_prefill_attention_csa(tensors):
             "weights_proj": tensors["idx_weights_proj"],
             "cos": idx_cos,
             "sin": idx_sin,
-            "freqs_cos": tensors["freqs_cos"],
-            "freqs_sin": tensors["freqs_sin"],
+            "cmp_freqs_cos": tensors["cmp_freqs_cos"],
+            "cmp_freqs_sin": tensors["cmp_freqs_sin"],
             "hadamard": tensors["hadamard_idx"],
             "inner_compress_state": tensors["inner_compress_state"],
             "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
@@ -673,13 +675,10 @@ def build_tensor_specs(
     import torch
     from golden import TensorSpec
     from utils import (
-        build_rope_tables,
-        cache_row_from_table,
         int8_quant_per_row,
         quant_w_per_channel,
+        token_local_rope,
     )
-
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
@@ -688,21 +687,10 @@ def build_tensor_specs(
         raise ValueError(f"token_count must be in [1, {PREFILL_MAX_TOKENS}], got {token_count}")
     if context_len < 0:
         raise ValueError(f"context length must be non-negative, got {context_len}")
-    if context_len + q_len > PREFILL_MAX_TOKENS:
-        raise ValueError(
-            f"context_len + token_count must be <= {PREFILL_MAX_TOKENS}, got {context_len + q_len}"
-        )
     max_position = context_len + q_len - 1
     if max_position >= MAX_SEQ_LEN:
         raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
     max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
-    # The indexer clamps past its score cap and drops the tail without a runtime
-    # diagnostic, so refuse the run rather than return plausible wrong values.
-    if max_visible_cmp > INDEXER_SCORE_CAP:
-        raise ValueError(
-            f"needs {max_visible_cmp} scored compressed positions; the indexer score "
-            f"cap is {INDEXER_SCORE_CAP} and the tail past it is silently dropped"
-        )
     # The sparse rows are the window plus what the indexer actually emits, which
     # is its top-k, not every visible compressed position.
     max_sparse_rows = WIN + min(max_visible_cmp, INDEXER_TOPK_CAP)
@@ -716,23 +704,64 @@ def build_tensor_specs(
             f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
         )
 
+    history_chunk_rows = 4096
+    ori_block_table = (torch.arange(SPARSE_ORI_MAX_BLOCKS, dtype=torch.int64) % CSA_ORI_BLOCK_NUM).to(torch.int32)
+    cmp_block_table = torch.arange(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32)
+    idx_block_table = torch.arange(IDX_CACHE_MAX_BLOCKS, dtype=torch.int32)
+    if torch.unique(ori_block_table).numel() != CSA_ORI_BLOCK_NUM:
+        raise ValueError("raw fixture block table does not cover the physical pool")
+    if (
+        CSA_CMP_BLOCK_NUM != SPARSE_CMP_MAX_BLOCKS
+        or torch.unique(cmp_block_table).numel() != SPARSE_CMP_MAX_BLOCKS
+    ):
+        raise ValueError("CSA fixture block table must map every logical page injectively")
+    if (
+        IDX_CACHE_BLOCK_NUM != IDX_CACHE_MAX_BLOCKS
+        or torch.unique(idx_block_table).numel() != IDX_CACHE_MAX_BLOCKS
+    ):
+        raise ValueError("index fixture block table must map every logical page injectively")
+
+    def paged_rows(block_table, logical_slots, block_size=BLOCK_SIZE):
+        slots = logical_slots.to(torch.int64)
+        logical_blocks = torch.div(slots, block_size, rounding_mode="floor")
+        physical_blocks = block_table.index_select(0, logical_blocks).to(torch.int64)
+        if torch.any(physical_blocks < 0):
+            raise ValueError("fixture history references an unmapped logical page")
+        return physical_blocks * block_size + slots.remainder(block_size)
+
+    def scatter_bf16_history(cache_flat, block_table, slot_start, slot_end, value_scale):
+        for chunk_start in range(slot_start, slot_end, history_chunk_rows):
+            chunk_end = min(chunk_start + history_chunk_rows, slot_end)
+            logical_slots = torch.arange(chunk_start, chunk_end, dtype=torch.int64)
+            physical_rows = paged_rows(block_table, logical_slots)
+            values = (torch.rand(chunk_end - chunk_start, cache_flat.shape[1]) - 0.5) * value_scale
+            cache_flat.index_copy_(0, physical_rows, values.to(cache_flat.dtype))
+
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
         return torch.arange(context_len, context_len + q_len, dtype=torch.int32)
 
+    rope_positions = token_pos()
+    shared_freqs_cos, shared_freqs_sin = token_local_rope(
+        M, COMPRESS_RATIO, rope_positions,
+        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+    )
+    cmp_positions = torch.where(
+        (rope_positions + 1) % COMPRESS_RATIO == 0,
+        rope_positions - (COMPRESS_RATIO - 1), torch.zeros_like(rope_positions),
+    )
+    shared_cmp_freqs_cos, shared_cmp_freqs_sin = token_local_rope(
+        M, COMPRESS_RATIO, cmp_positions,
+        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+    )
+
     def cmp_write_records():
-        pos = token_pos()
-        records = []
-        for t in range(token_count):
-            abs_pos = int(pos[t].item())
-            if (abs_pos + 1) % COMPRESS_RATIO == 0:
-                cmp_slot = (abs_pos + 1) // COMPRESS_RATIO - 1
-                records.append((t, cmp_slot))
-        if len(records) > MAX_CMP_WRITES:
-            raise ValueError(
-                f"CSA fixture generated {len(records)} compressed writes, cap is {MAX_CMP_WRITES}"
-            )
-        return records
+        positions = token_pos().to(torch.int64)
+        token_ids = torch.nonzero((positions + 1) % COMPRESS_RATIO == 0, as_tuple=False).flatten()
+        cmp_slots = (positions.index_select(0, token_ids) + 1) // COMPRESS_RATIO - 1
+        if token_ids.numel() > MAX_CMP_WRITES:
+            raise ValueError(f"CSA fixture generated {token_ids.numel()} compressed writes, cap is {MAX_CMP_WRITES}")
+        return token_ids, cmp_slots
 
     def init_x_hc():
         return torch.empty(token_count, HC_MULT, D).uniform_(-1, 1)
@@ -801,6 +830,12 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_freqs_sin.clone()
 
+    def init_cmp_freqs_cos():
+        return shared_cmp_freqs_cos.clone()
+
+    def init_cmp_freqs_sin():
+        return shared_cmp_freqs_sin.clone()
+
     # Quant-faithful CSA (ratio-4) main compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_csa / decode_compressor_ratio4.
@@ -827,25 +862,13 @@ def build_tensor_specs(
     def init_compress_state_block_table():
         return state_table.clone()
 
-    def state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        block = abs_pos // CSA_STATE_BLOCK_SIZE
-        intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        return int(state_table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
-
     def init_compress_state():
         state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
         flat = state.view(-1, MAIN_COMPRESS_STATE_DIM)
-        for abs_pos in range(max(0, context_len - MAIN_STATE_LEN), context_len):
-            row = state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (
-                    torch.rand(
-                        MAIN_COMPRESS_STATE_DIM,
-                    )
-                    - 0.5
-                ) * 0.05
+        history_positions = torch.arange(max(0, context_len - MAIN_STATE_LEN), context_len, dtype=torch.int64)
+        history_rows = paged_rows(state_table, history_positions, CSA_STATE_BLOCK_SIZE)
+        history = (torch.rand(history_rows.numel(), MAIN_COMPRESS_STATE_DIM) - 0.5) * 0.05
+        flat.index_copy_(0, history_rows, history)
         return state
 
     def init_hadamard_idx():
@@ -883,25 +906,13 @@ def build_tensor_specs(
     def init_inner_compress_state_block_table():
         return inner_state_table.clone()
 
-    def inner_state_row(abs_pos):
-        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
-            return -1
-        block = abs_pos // INNER_STATE_BLOCK_SIZE
-        intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        return int(inner_state_table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
-
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM)
         flat = state.view(-1, INNER_COMPRESS_STATE_DIM)
-        for abs_pos in range(max(0, context_len - INNER_STATE_LEN), context_len):
-            row = inner_state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (
-                    torch.rand(
-                        INNER_COMPRESS_STATE_DIM,
-                    )
-                    - 0.5
-                ) * 0.05
+        history_positions = torch.arange(max(0, context_len - INNER_STATE_LEN), context_len, dtype=torch.int64)
+        history_rows = paged_rows(inner_state_table, history_positions, INNER_STATE_BLOCK_SIZE)
+        history = (torch.rand(history_rows.numel(), INNER_COMPRESS_STATE_DIM) - 0.5) * 0.05
+        flat.index_copy_(0, history_rows, history)
         return state
 
     # C8 historical index cache: completed compressed slots hold INT8 + a per-position dequant scale.
@@ -915,25 +926,15 @@ def build_tensor_specs(
         scale = torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
         c_flat = cache_i8.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
         s_flat = scale.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1)
-        table = init_idx_block_table()
         completed = context_len // COMPRESS_RATIO
-        for cmp_slot in range(completed):
-            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
-                break
-            row = cache_row_from_table(table, cmp_slot)
-            if row >= 0:
-                hist_bf16 = (
-                    (
-                        torch.rand(
-                            IDX_HEAD_DIM,
-                        )
-                        - 0.5
-                    )
-                    * 0.05
-                ).to(torch.bfloat16)
-                hi8, hsc = int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
-                c_flat[row] = hi8.view(IDX_HEAD_DIM)
-                s_flat[row] = hsc.view(1)
+        for chunk_start in range(0, completed, history_chunk_rows):
+            chunk_end = min(chunk_start + history_chunk_rows, completed)
+            logical_slots = torch.arange(chunk_start, chunk_end, dtype=torch.int64)
+            physical_rows = paged_rows(idx_block_table, logical_slots)
+            history = ((torch.rand(chunk_end - chunk_start, IDX_HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+            history_i8, history_scale = int8_quant_per_row(history)
+            c_flat.index_copy_(0, physical_rows, history_i8)
+            s_flat.index_copy_(0, physical_rows, history_scale)
         _idx_hist["cache"] = cache_i8
         _idx_hist["scale"] = scale
 
@@ -946,99 +947,51 @@ def build_tensor_specs(
         return _idx_hist["scale"].clone()
 
     def init_kv_cache():
-        cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
         cache_flat = cache.view(CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-        table = init_ori_block_table()
         start = max(0, context_len - WIN)
-        for abs_pos in range(start, context_len):
-            row = cache_row_from_table(table, abs_pos)
-            value = (
-                torch.rand(
-                    HEAD_DIM,
-                )
-                - 0.5
-            ) * 0.1
-            if row >= 0:
-                cache_flat[row] = value.to(torch.bfloat16)
+        scatter_bf16_history(cache_flat, ori_block_table, start, context_len, 0.1)
         return cache
 
     def init_ori_block_table():
-        table = torch.full((SPARSE_ORI_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(SPARSE_ORI_MAX_BLOCKS):
-            table[block] = block
-        return table
+        return ori_block_table.clone()
 
     def init_ori_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        pos = token_pos()
-        table = init_ori_block_table()
-        for t in range(token_count):
-            mapping[t] = cache_row_from_table(table, int(pos[t].item()))
-        return mapping
+        return paged_rows(ori_block_table, token_pos().to(torch.int64))
 
     def init_cmp_kv():
-        cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
         cache_flat = cache.view(CSA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-        table = init_cmp_block_table()
         completed = context_len // COMPRESS_RATIO
-        for cmp_slot in range(completed):
-            if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
-                break
-            row = cache_row_from_table(table, cmp_slot)
-            value = (
-                torch.rand(
-                    HEAD_DIM,
-                )
-                - 0.5
-            ) * 0.1
-            if row >= 0:
-                cache_flat[row] = value.to(torch.bfloat16)
+        scatter_bf16_history(cache_flat, cmp_block_table, 0, completed, 0.1)
         return cache
 
     def init_cmp_block_table():
-        table = torch.full((SPARSE_CMP_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(SPARSE_CMP_MAX_BLOCKS):
-            table[block] = block
-        return table
+        return cmp_block_table.clone()
 
     def init_idx_block_table():
-        table = torch.full((IDX_CACHE_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(IDX_CACHE_MAX_BLOCKS):
-            table[block] = block
-        return table
+        return idx_block_table.clone()
 
     def init_position_ids():
         return token_pos()
 
     def init_cmp_slot_mapping():
         mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        table = init_cmp_block_table()
-        records = cmp_write_records()
-        for token_id, cmp_slot in records:
-            mapping[token_id] = cache_row_from_table(table, cmp_slot)
+        token_ids, cmp_slots = cmp_write_records()
+        mapping.index_copy_(0, token_ids, paged_rows(cmp_block_table, cmp_slots))
         return mapping
 
     def init_idx_slot_mapping():
         mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        table = init_idx_block_table()
-        records = cmp_write_records()
-        for token_id, cmp_slot in records:
-            mapping[token_id] = cache_row_from_table(table, cmp_slot)
+        token_ids, cmp_slots = cmp_write_records()
+        mapping.index_copy_(0, token_ids, paged_rows(idx_block_table, cmp_slots))
         return mapping
 
     def init_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        pos = token_pos()
-        for t in range(token_count):
-            mapping[t] = state_row(int(pos[t].item()))
-        return mapping
+        return paged_rows(state_table, token_pos().to(torch.int64), CSA_STATE_BLOCK_SIZE)
 
     def init_inner_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        pos = token_pos()
-        for t in range(token_count):
-            mapping[t] = inner_state_row(int(pos[t].item()))
-        return mapping
+        return paged_rows(inner_state_table, token_pos().to(torch.int64), INNER_STATE_BLOCK_SIZE)
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -1071,8 +1024,10 @@ def build_tensor_specs(
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("cmp_freqs_cos", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_cos),
+        TensorSpec("cmp_freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cmp_freqs_sin),
         TensorSpec("cmp_wkv", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
@@ -1193,8 +1148,12 @@ def prefill_attention_csa_cp_core(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_local: pl.Tensor[[CP_Q_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -1241,26 +1200,20 @@ def prefill_attention_csa_cp_core(
     q_dim = pl.tensor.dim(x_normed_local, 0)
     kv_dim = pl.tensor.dim(x_normed_full, 0)
 
-    rope_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids_local, rope_cos_local, rope_sin_local)
     q_cos_il = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_sin_signed = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_local, rope_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
+    rope_prepare(freqs_cos_local, freqs_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
 
     q = pl.create_tensor([q_dim, H, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([q_dim, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([q_dim, 1], dtype=pl.FP32)
     q_proj_rope(x_normed_local, wq_a, wq_b, wq_b_scale, gamma_cq, q_cos_il, q_sin_signed, q_swap_idx, q, qr, qr_scale)
 
-    rope_cos_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_full = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows_dynamic(freqs_cos, freqs_sin, position_ids_full, rope_cos_full, rope_sin_full)
     kv_cos_il = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_sin_signed = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     kv_swap_idx = pl.create_tensor([kv_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
-    rope_prepare(rope_cos_full, rope_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
+    rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
@@ -1279,20 +1232,22 @@ def prefill_attention_csa_cp_core(
         x_normed_full,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        freqs_cos, freqs_sin,
+        cmp_freqs_cos_full, cmp_freqs_sin_full,
         cmp_kv,
         position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
     )
 
     # Gathered-stream indexer cache with global positions and mappings.
+    indexer_cache_ready = pl.array.create(1, pl.TASK_ID)
     prefill_indexer_compressor(
         x_normed_full,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        freqs_cos, freqs_sin,
+        cmp_freqs_cos_full, cmp_freqs_sin_full,
         hadamard_idx,
-        idx_kv_cache, idx_kv_scale, idx_block_table,
+        idx_kv_cache, idx_kv_scale,
         position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
+        indexer_cache_ready,
     )
 
     # Local indexer queries with half-width FP32 RoPE.
@@ -1300,24 +1255,23 @@ def prefill_attention_csa_cp_core(
     idx_sin = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cp_idx_halfrope"):
         for idx_t in pl.range(q_dim):
-            idx_pos = pl.cast(pl.read(position_ids_local, [idx_t]), pl.INDEX)
-            idx_cos_bf16 = freqs_cos[idx_pos : idx_pos + 1, 0:HALF_ROPE]
+            idx_cos_bf16 = freqs_cos_local[idx_t : idx_t + 1, 0:HALF_ROPE]
             idx_cos_fp32 = pl.cast(idx_cos_bf16, target_type=pl.FP32)
             idx_cos[idx_t : idx_t + 1, 0:HALF_ROPE] = idx_cos_fp32
-            idx_sin_bf16 = freqs_sin[idx_pos : idx_pos + 1, 0:HALF_ROPE]
+            idx_sin_bf16 = freqs_sin_local[idx_t : idx_t + 1, 0:HALF_ROPE]
             idx_sin_fp32 = pl.cast(idx_sin_bf16, target_type=pl.FP32)
             idx_sin[idx_t : idx_t + 1, 0:HALF_ROPE] = idx_sin_fp32
 
     cmp_topk_indices = pl.create_tensor([q_dim, IDX_TOPK], dtype=pl.INT32)
-    idx_score_unused = pl.create_tensor([q_dim, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    idx_score_unused, cmp_topk_indices = prefill_indexer_query(
+    cmp_topk_indices = prefill_indexer_query(
         x_normed_local, qr, qr_scale,
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         idx_cos, idx_sin,
         hadamard_idx,
         idx_kv_cache, idx_kv_scale, idx_block_table,
-        idx_score_unused, cmp_topk_indices,
+        cmp_topk_indices,
         position_ids_local,
+        indexer_cache_ready,
     )
 
     swa_indices = pl.create_tensor([q_dim, WIN], dtype=pl.INT32)
@@ -1360,7 +1314,7 @@ def prefill_attention_csa_cp_core(
         kv_cache, swa_indices,
         cmp_kv, cmp_block_table, cmp_topk_indices,
         valid_block_mask, attn_sink,
-        rope_cos_local, rope_sin_local,
+        freqs_cos_local, freqs_sin_local,
         wo_a, wo_b, wo_b_scale,
         attn_out_local,
         o_proj_weight_dep,
@@ -1381,8 +1335,10 @@ def prefill_attention_csa_cp(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -1455,16 +1411,25 @@ def prefill_attention_csa_cp(
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     local_base = tp_rank * q_dim
     x_normed_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
+    freqs_cos_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
+    freqs_sin_local = pl.create_tensor([q_dim, ROPE_HEAD_DIM], dtype=pl.BF16)
     for local_row in pl.spmd(q_dim, name_hint="prefill_csa_cp_query_slice"):
-        query_row = pl.load(x_normed_full, [local_base + local_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+        full_row = local_base + local_row
+        query_row = pl.load(x_normed_full, [full_row, 0], [1, D], target_memory=pl.MemorySpace.Vec)
         pl.store(query_row, [local_row, 0], x_normed_local)
+        cos_row = pl.load(freqs_cos, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        sin_row = pl.load(freqs_sin, [full_row, 0], [1, ROPE_HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+        pl.store(cos_row, [local_row, 0], freqs_cos_local)
+        pl.store(sin_row, [local_row, 0], freqs_sin_local)
 
     attn_out_local = pl.create_tensor([q_dim, D], dtype=pl.BF16)
     attn_out_local = prefill_attention_csa_cp_core(
         x_normed_local, x_normed_full,
         wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
+        freqs_cos_local, freqs_sin_local,
         freqs_cos, freqs_sin,
+        cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         hadamard_idx,
@@ -1507,8 +1472,10 @@ def prefill_attention_csa_cp_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -1559,6 +1526,10 @@ def prefill_attention_csa_cp_test(
 ):
     """Run one CP rank's query share with replicated CSA layer boundaries."""
     x_hc_full.bind_dynamic(0, CP_KV_T_DYN)
+    freqs_cos.bind_dynamic(0, CP_KV_T_DYN)
+    freqs_sin.bind_dynamic(0, CP_KV_T_DYN)
+    cmp_freqs_cos.bind_dynamic(0, CP_KV_T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, CP_KV_T_DYN)
     compress_state.bind_dynamic(0, MAIN_STATE_BLOCK_NUM_DYN)
     inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
     kv_cache.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
@@ -1585,6 +1556,7 @@ def prefill_attention_csa_cp_test(
         wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
+        cmp_freqs_cos, cmp_freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         hadamard_idx,
@@ -1624,8 +1596,10 @@ def l3_prefill_attention_csa_cp(
     wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     cmp_wkv: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[TP_SIZE, MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[TP_SIZE, COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -1670,6 +1644,10 @@ def l3_prefill_attention_csa_cp(
 ):
     """Launch one CP group's CSA block, one child per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
+    freqs_cos.bind_dynamic(1, CP_KV_T_DYN)
+    freqs_sin.bind_dynamic(1, CP_KV_T_DYN)
+    cmp_freqs_cos.bind_dynamic(1, CP_KV_T_DYN)
+    cmp_freqs_sin.bind_dynamic(1, CP_KV_T_DYN)
     compress_state.bind_dynamic(1, MAIN_STATE_BLOCK_NUM_DYN)
     inner_compress_state.bind_dynamic(1, INNER_STATE_BLOCK_NUM_DYN)
     kv_cache.bind_dynamic(1, ORI_BLOCK_NUM_DYN)
@@ -1709,6 +1687,7 @@ def l3_prefill_attention_csa_cp(
             wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             freqs_cos[rank], freqs_sin[rank],
+            cmp_freqs_cos[rank], cmp_freqs_sin[rank],
             cmp_wkv[rank], cmp_wgate[rank], cmp_ape[rank], cmp_norm_w[rank],
             compress_state[rank], compress_state_block_table[rank],
             hadamard_idx[rank],
@@ -1812,7 +1791,8 @@ def golden_prefill_attention_csa_cp(tensors):
     shared = (
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-        "freqs_cos", "freqs_sin", "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
+        "freqs_cos", "freqs_sin", "cmp_freqs_cos", "cmp_freqs_sin",
+        "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
         "compress_state_block_table", "hadamard_idx", "idx_wq_b", "idx_wq_b_scale",
         "idx_weights_proj", "inner_wkv", "inner_wgate", "inner_ape", "inner_norm_w",
         "inner_compress_state_block_table", "ori_block_table", "cmp_block_table",
@@ -1868,9 +1848,7 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    # A start_pos suffix attends WIN + up-to-INDEXER_SCORE_CAP compressed rows, so the BF16 PV
-    # accumulation drifts by ~1 extra ULP; bump the per-point bar and the single-point cap but
-    # keep the 0.5% fraction bar identical to full prefill.
+    # High-prefix sparse-attention tolerance.
     x_out_diff_thd, x_out_max_diff = (8e-3, 2) if args.start_pos else (5e-3, 1)
     cache_compare = {
         "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
@@ -1927,7 +1905,7 @@ if __name__ == "__main__":
                 dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             ),
-            runtime_cfg=dict(platform=args.platform),
+            runtime_cfg=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP),
             compile_only=args.compile_only,
             rtol=1e-2,
             atol=1e-2,
