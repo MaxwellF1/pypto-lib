@@ -1096,7 +1096,15 @@ def l3_prefill_fwd(
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
-    """Run layer-major DSA-CP with replicated boundaries, token-local compute, and a TP LM head."""
+    """Run layer-major DSA-CP over a caller-padded physical token extent.
+
+    For logical length ``N``, each TP group supplies
+    ``P = align_up(N, TP_SIZE)`` full rows and each rank supplies
+    ``L = P // TP_SIZE`` local rows. Callers zero padded ``x_hc`` and
+    ``input_ids``, use non-aliasing synthetic positions and ``-1`` cache/state
+    mappings for padding, and restrict live ``logit_row_indices`` to ``[0, N)``.
+    The device schedule, including MoE collectives, runs over physical P/L.
+    """
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     hidden_workspace.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)

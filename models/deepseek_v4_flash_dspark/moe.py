@@ -635,7 +635,7 @@ def _prefill_moe_wave(
     """Stage and execute one fixed-capacity prefill-MoE wave."""
     local_rows = pl.tensor.dim(ffn_out, 0)
     local_wave_base = wave_id * T
-    # Active rows in the fixed-capacity wave.
+    # Physical rows in the fixed-capacity wave.
     wave_rows = pl.min(T, local_rows - local_wave_base)
     wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
     full_wave_base = tp_rank * local_rows + local_wave_base
