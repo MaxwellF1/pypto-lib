@@ -40,7 +40,6 @@ from prefill_indexer import (
     COMPRESS_RATIO as INDEXER_COMPRESS_RATIO,
     IDX_CACHE_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
-    INDEXER_TOPK_CAP,
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
@@ -146,7 +145,7 @@ CSA_TOPK_TOKEN_TILE = 2
 
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
-assert INDEXER_TOPK_CAP <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+assert IDX_TOPK <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
 
 
 @pl.jit.inline
@@ -315,7 +314,7 @@ def prefill_attention_csa(
             if t_idx < t_dim:
                 abs_pos = pl.read(position_ids, [t_idx])
                 # Sparse-block liveness from the dense TopK prefix.
-                visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(INDEXER_TOPK_CAP, pl.INT32))
+                visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
                 for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
                     cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
                     cmp_hi = pl.min(
@@ -693,7 +692,7 @@ def build_tensor_specs(
     max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
     # The sparse rows are the window plus what the indexer actually emits, which
     # is its top-k, not every visible compressed position.
-    max_sparse_rows = WIN + min(max_visible_cmp, INDEXER_TOPK_CAP)
+    max_sparse_rows = WIN + min(max_visible_cmp, IDX_TOPK)
     if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
         raise ValueError(
             f"needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is {SPARSE_PREFILL_SPARSE_PAD}"
@@ -1285,7 +1284,7 @@ def prefill_attention_csa_cp_core(
             mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if t_idx < q_dim:
                 abs_pos = pl.read(position_ids_local, [t_idx])
-                visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(INDEXER_TOPK_CAP, pl.INT32))
+                visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(IDX_TOPK, pl.INT32))
                 for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
                     cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
                     cmp_hi_unclamped = (mask_sb + 1) * PREFILL_ATTN_TILE - WIN
