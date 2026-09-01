@@ -29,6 +29,7 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
+from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
 
 
 PREFILL_MAX_TOKENS = 8192
@@ -163,6 +164,7 @@ def _topk_leaf(
 @pl.jit.incore
 def _topk_group_wave(
     position_ids: pl.Tensor,
+    local_request_ids: pl.Tensor,
     score_arena: pl.Tensor,
     pair_arena: pl.Tensor,
     tile_base: pl.Scalar[pl.INDEX],
@@ -173,7 +175,10 @@ def _topk_group_wave(
     global_group_base = 0
     for query in pl.range(tile_rows):
         position = pl.read(position_ids, [tile_base + query])
-        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
+        request_id = pl.read(local_request_ids, [tile_base + query])
+        visible_count = 0
+        if request_id >= 0:
+            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
         leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
         group_count = (leaf_count + TOPK_GROUP_TILE - 1) // TOPK_GROUP_TILE
         base_mod = global_group_base % TOPK_GROUP_WORKERS
@@ -208,6 +213,7 @@ def _topk_group_wave(
 @pl.jit.incore
 def _topk_query_merge(
     position_ids: pl.Tensor,
+    local_request_ids: pl.Tensor,
     pair_arena: pl.Tensor,
     topk_indices: pl.Tensor,
     tile_base: pl.Scalar[pl.INDEX],
@@ -216,7 +222,10 @@ def _topk_query_merge(
     query = pl.tile.get_block_idx()
     output_query = tile_base + query
     position = pl.read(position_ids, [output_query])
-    visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
+    request_id = pl.read(local_request_ids, [output_query])
+    visible_count = 0
+    if request_id >= 0:
+        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
     empty_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
     pl.store(empty_indices, [output_query, 0], topk_indices)
 
@@ -254,6 +263,7 @@ def _prefill_indexer_score_topk(
     idx_kv_cache: pl.Tensor,
     idx_kv_scale: pl.Tensor,
     idx_block_table: pl.Tensor,
+    local_request_ids: pl.Tensor,
     position_ids: pl.Tensor,
     topk_indices: pl.Tensor,
     score_arena: pl.Tensor,
@@ -276,7 +286,10 @@ def _prefill_indexer_score_topk(
         for query in pl.range(tile_rows):
             output_query = tile_base + query
             position = pl.read(position_ids, [output_query])
-            visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
+            request_id = pl.read(local_request_ids, [output_query])
+            visible_count = 0
+            if request_id >= 0:
+                visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, INDEXER_MAX_CANDIDATES), 0)
             leaf_count = (visible_count + TOPK_LEAF_TILE - 1) // TOPK_LEAF_TILE
             base_mod = global_leaf_base % TOPK_SCORE_WORKERS
             first_leaf = (worker + base_mod) % TOPK_SCORE_WORKERS
@@ -292,7 +305,9 @@ def _prefill_indexer_score_topk(
                     page_begin = page * BLOCK_SIZE
                     logical_row = logical_begin + page_begin
                     logical_page = logical_row // BLOCK_SIZE
-                    physical_block_raw = pl.read(idx_block_table, [logical_page])
+                    physical_block_raw = pl.cast(-1, pl.INT32)
+                    if request_id >= 0:
+                        physical_block_raw = pl.read(idx_block_table, [request_id, logical_page])
                     score_valid = pl.full([1, BLOCK_SIZE], dtype=pl.FP32, value=FP32_NEG_INF)
                     if physical_block_raw >= 0 and physical_block_raw < idx_block_num:
                         physical_block = pl.cast(physical_block_raw, pl.INDEX)
@@ -316,10 +331,10 @@ def _prefill_indexer_score_topk(
             global_leaf_base = global_leaf_base + leaf_count
 
     with pl.spmd(TOPK_GROUP_WORKERS, name_hint="prefill_idx_topk_group_wave", deps=[score_tid]) as topk_tid:
-        _topk_group_wave(position_ids, score_arena, pair_arena, tile_base, tile_rows)
+        _topk_group_wave(position_ids, local_request_ids, score_arena, pair_arena, tile_base, tile_rows)
 
     with pl.spmd(tile_rows, name_hint="prefill_idx_topk_query_merge", deps=[topk_tid]) as merge_tid:
-        _topk_query_merge(position_ids, pair_arena, topk_indices, tile_base)
+        _topk_query_merge(position_ids, local_request_ids, pair_arena, topk_indices, tile_base)
 
     completion[0] = merge_tid
     return topk_indices
@@ -338,7 +353,8 @@ def _prefill_indexer_dense_tile(
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_topk_indices: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     rope_dup_idx_template: pl.Tensor[[1, ROPE_HEAD_DIM], pl.INT32],
@@ -603,6 +619,7 @@ def _prefill_indexer_dense_tile(
     _prefill_indexer_score_topk(
         qr_hadamard_i8, qr_hadamard_scale_dq, weights,
         idx_kv_cache, idx_kv_scale, idx_block_table,
+        local_request_ids,
         position_ids,
         cmp_topk_indices,
         score_arena, pair_arena, selection_completion,
@@ -613,6 +630,7 @@ def _prefill_indexer_dense_tile(
 @pl.jit.inline(auto_scope=False)
 def prefill_indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -626,23 +644,25 @@ def prefill_indexer(
     inner_compress_state: pl.InOut[
         pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]
     ],
-    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     cmp_topk_indices: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
-    """Compress and score one contiguous position-monotonic token run."""
+    """Compress and score one packed ragged prefill stream."""
     compressor_completion = pl.array.create(1, pl.TASK_ID)
     prefill_indexer_compressor(
         x,
+        query_start_loc,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cmp_freqs_cos, cmp_freqs_sin,
@@ -659,7 +679,7 @@ def prefill_indexer(
         hadamard,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         cmp_topk_indices,
-        position_ids,
+        position_ids, local_request_ids,
         compressor_completion,
     )
     return idx_kv_cache, idx_kv_scale, cmp_topk_indices
@@ -678,9 +698,10 @@ def prefill_indexer_query(
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     cmp_topk_indices: pl.Out[pl.Tensor[[Q_T_DYN, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[Q_T_DYN], pl.INT32],
     completion: pl.Array[1, pl.TASK_ID],
 ):
     """Score local queries against the published indexer cache."""
@@ -717,6 +738,7 @@ def prefill_indexer_query(
                 cos, sin,
                 hadamard,
                 idx_kv_cache, idx_kv_scale, idx_block_table,
+                local_request_ids,
                 cmp_topk_indices, position_ids,
                 rope_dup_idx_template, rope_swap_idx_template, rope_sign_template,
                 score_arena, pair_arena, selection_completion,
@@ -770,32 +792,33 @@ def golden_prefill_indexer_core(tensors):
     import torch
 
     token_count = int(tensors["x"].shape[0])
-    compressor_tensors = {
-        "x": tensors["x"],
-        "kv": torch.zeros(
-            max(1, (token_count + COMPRESS_RATIO - 1) // COMPRESS_RATIO),
-            IDX_HEAD_DIM,
-            dtype=torch.int8,
-        ),
-        "compress_state": tensors["inner_compress_state"],
-        "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
-        "wkv": tensors["inner_wkv"],
-        "wgate": tensors["inner_wgate"],
-        "ape": tensors["inner_ape"],
-        "norm_w": tensors["inner_norm_w"],
-        "cmp_freqs_cos": tensors["cmp_freqs_cos"],
-        "cmp_freqs_sin": tensors["cmp_freqs_sin"],
-        "hadamard": tensors["hadamard"],
-        "idx_kv_cache": tensors["idx_kv_cache"],
-        "idx_kv_scale": tensors["idx_kv_scale"],
-        "idx_block_table": tensors["idx_block_table"],
-        "position_ids": tensors["position_ids"],
-        "idx_slot_mapping": tensors["idx_slot_mapping"],
-        "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
-    }
-    golden_prefill_indexer_compressor(compressor_tensors)
-    tensors["idx_kv_cache"][:] = compressor_tensors["idx_kv_cache"]
-    tensors["idx_kv_scale"][:] = compressor_tensors["idx_kv_scale"]
+    query_start_loc = tensors["query_start_loc"]
+    for request in range(query_start_loc.numel() - 1):
+        request_start = int(query_start_loc[request].item())
+        request_end = int(query_start_loc[request + 1].item())
+        if request_end <= request_start:
+            continue
+        request_rows = slice(request_start, request_end)
+        golden_prefill_indexer_compressor(
+            {
+                "x": tensors["x"][request_rows],
+                "compress_state": tensors["inner_compress_state"],
+                "inner_compress_state_block_table": tensors["inner_compress_state_block_table"][request : request + 1],
+                "wkv": tensors["inner_wkv"],
+                "wgate": tensors["inner_wgate"],
+                "ape": tensors["inner_ape"],
+                "norm_w": tensors["inner_norm_w"],
+                "cmp_freqs_cos": tensors["cmp_freqs_cos"][request_rows],
+                "cmp_freqs_sin": tensors["cmp_freqs_sin"][request_rows],
+                "hadamard": tensors["hadamard"],
+                "idx_kv_cache": tensors["idx_kv_cache"],
+                "idx_kv_scale": tensors["idx_kv_scale"],
+                "idx_block_table": tensors["idx_block_table"][request : request + 1],
+                "position_ids": tensors["position_ids"][request_rows],
+                "idx_slot_mapping": tensors["idx_slot_mapping"][request_rows],
+                "inner_state_slot_mapping": tensors["inner_state_slot_mapping"][request_rows],
+            }
+        )
 
     # Lightning-indexer scores with per-token causal top-k.
     position_ids = tensors["position_ids"].long()
@@ -815,13 +838,7 @@ def golden_prefill_indexer_core(tensors):
     cache_flat_i8 = tensors["idx_kv_cache"].reshape(-1, IDX_HEAD_DIM)
     scale_flat = tensors["idx_kv_scale"].float().reshape(-1, 1)
     idx_block_table = tensors["idx_block_table"]
-    logical_rows = torch.arange(max_visible, dtype=torch.int64)
-    physical_pages = idx_block_table[logical_rows // BLOCK_SIZE].to(torch.int64)
-    valid_pages = (physical_pages >= 0) & (physical_pages < tensors["idx_kv_cache"].shape[0])
-    safe_pages = physical_pages.clamp(min=0, max=tensors["idx_kv_cache"].shape[0] - 1)
-    physical_rows = safe_pages * BLOCK_SIZE + logical_rows % BLOCK_SIZE
-    kv_i8 = cache_flat_i8[physical_rows]
-    kv_sc = scale_flat[physical_rows, 0]
+    local_request_ids = tensors["local_request_ids"]
 
     # Query tiles and 8192-candidate score leaves.
     for tile_base in range(0, token_count, PREFILL_DENSE_TILE):
@@ -852,9 +869,19 @@ def golden_prefill_indexer_core(tensors):
         q_sc = q_sc.view(tile_rows, IDX_N_HEADS, 1)
         for local_t in range(tile_rows):
             global_t = tile_base + local_t
+            request_id = int(local_request_ids[global_t].item())
+            if request_id < 0:
+                continue
             visible_t = int(visible[global_t].item())
             if visible_t <= 0:
                 continue
+            logical_rows = torch.arange(visible_t, dtype=torch.int64)
+            physical_pages = idx_block_table[request_id, logical_rows // BLOCK_SIZE].to(torch.int64)
+            valid_pages = (physical_pages >= 0) & (physical_pages < tensors["idx_kv_cache"].shape[0])
+            safe_pages = physical_pages.clamp(min=0, max=tensors["idx_kv_cache"].shape[0] - 1)
+            physical_rows = safe_pages * BLOCK_SIZE + logical_rows % BLOCK_SIZE
+            kv_i8 = cache_flat_i8[physical_rows]
+            kv_sc = scale_flat[physical_rows, 0]
             running_scores = torch.empty(0, dtype=torch.float32)
             running_indices = torch.empty(0, dtype=torch.int64)
             for begin in range(0, visible_t, 8192):
@@ -885,6 +912,7 @@ def golden_prefill_indexer(tensors):
 @pl.jit
 def prefill_indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -898,20 +926,22 @@ def prefill_indexer_test(
     inner_compress_state: pl.InOut[
         pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]
     ],
-    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     topk_idxs: pl.Out[pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
     x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
     cos.bind_dynamic(0, T_DYN)
@@ -919,15 +949,18 @@ def prefill_indexer_test(
     cmp_freqs_cos.bind_dynamic(0, T_DYN)
     cmp_freqs_sin.bind_dynamic(0, T_DYN)
     inner_compress_state.bind_dynamic(0, INNER_STATE_BLOCK_NUM_DYN)
+    inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     idx_kv_cache.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
     idx_kv_scale.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
     topk_idxs.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
+    local_request_ids.bind_dynamic(0, T_DYN)
     idx_slot_mapping.bind_dynamic(0, T_DYN)
     inner_state_slot_mapping.bind_dynamic(0, T_DYN)
 
     prefill_indexer(
         x,
+        query_start_loc,
         qr,
         qr_scale,
         wq_b,
@@ -949,6 +982,7 @@ def prefill_indexer_test(
         idx_block_table,
         topk_idxs,
         position_ids,
+        local_request_ids,
         idx_slot_mapping,
         inner_state_slot_mapping,
     )
@@ -1007,7 +1041,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_inner_compress_state_block_table():
         blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((blocks * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS).to(torch.int32)
+        return ((blocks * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS).to(torch.int32).unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -1059,7 +1093,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         c_flat = cache_i8.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
         s_flat = scale.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1)
         completed = start_pos // COMPRESS_RATIO
-        table = init_idx_block_table().to(torch.int64)
+        table = init_idx_block_table()[0].to(torch.int64)
         if completed > table.numel() * BLOCK_SIZE:
             raise ValueError("fixture historical compressed slots exceed the standalone idx block table")
         history_chunk = 16 * 1024
@@ -1089,7 +1123,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return _idx_hist["scale"].clone()
 
     def init_idx_block_table():
-        return torch.arange(IDX_CACHE_MAX_BLOCKS, dtype=torch.int32)
+        return torch.arange(IDX_CACHE_MAX_BLOCKS, dtype=torch.int32).unsqueeze(0)
+
+    def init_local_request_ids():
+        return torch.zeros(token_count, dtype=torch.int32)
 
     def init_position_ids():
         return torch.arange(start_pos, start_pos + token_count, dtype=torch.int32)
@@ -1119,7 +1156,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         write_mask = (positions + 1) % COMPRESS_RATIO == 0
         if write_mask.any():
             compressed_slots = (positions[write_mask] + 1) // COMPRESS_RATIO - 1
-            table = init_idx_block_table().to(torch.int64)
+            table = init_idx_block_table()[0].to(torch.int64)
             physical_pages = table[compressed_slots // BLOCK_SIZE]
             rows = physical_pages * BLOCK_SIZE + compressed_slots % BLOCK_SIZE
             if (physical_pages < 0).any():
@@ -1163,6 +1200,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
         TensorSpec("qr", [token_count, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [token_count, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
@@ -1182,7 +1220,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         ),
         TensorSpec(
             "inner_compress_state_block_table",
-            [INNER_STATE_MAX_BLOCKS],
+            [1, INNER_STATE_MAX_BLOCKS],
             torch.int32,
             init_value=init_inner_compress_state_block_table,
         ),
@@ -1204,9 +1242,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
             init_value=init_idx_kv_scale,
             is_output=True,
         ),
-        TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
+        TensorSpec("idx_block_table", [1, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("topk_idxs", [token_count, IDX_TOPK], torch.int32, is_output=True),
         TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
+        TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec(
             "idx_slot_mapping",
             [token_count],
@@ -1278,7 +1317,8 @@ if __name__ == "__main__":
         weights = (inputs["x"][token_id].float() @ inputs["weights_proj"].float()) * WEIGHTS_SCALE
 
         logical_rows = indices.to(torch.int64)
-        physical_pages = inputs["idx_block_table"][logical_rows // BLOCK_SIZE].to(torch.int64)
+        request_id = int(inputs["local_request_ids"][token_id].item())
+        physical_pages = inputs["idx_block_table"][request_id, logical_rows // BLOCK_SIZE].to(torch.int64)
         physical_rows = physical_pages * BLOCK_SIZE + logical_rows % BLOCK_SIZE
         cache = expected_outputs["idx_kv_cache"].reshape(-1, IDX_HEAD_DIM)
         scales = expected_outputs["idx_kv_scale"].float().reshape(-1, 1)

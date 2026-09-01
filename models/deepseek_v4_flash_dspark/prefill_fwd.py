@@ -41,6 +41,7 @@ from moe import (
 from config import FLASH as MODEL_CONFIG
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
+    build_ragged2_cp_tensor_specs as build_swa_ragged2_tensor_specs,
     prefill_attention_swa_cp,
 )
 from prefill_hca import (
@@ -52,6 +53,7 @@ from prefill_hca import (
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
     SPARSE_CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     build_cp_tensor_specs as build_hca_attention_tensor_specs,
+    build_ragged2_cp_tensor_specs as build_hca_ragged2_tensor_specs,
     prefill_attention_hca_cp,
 )
 from prefill_csa import (
@@ -82,12 +84,14 @@ from prefill_csa import (
     SPARSE_ORI_MAX_BLOCKS,
     START_POS,
     build_cp_tensor_specs as build_csa_attention_tensor_specs,
+    build_ragged2_cp_tensor_specs as build_csa_ragged2_tensor_specs,
     prefill_attention_csa_cp,
 )
 from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
 )
+from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids
 from prefill_o_proj import (
     O_PROJ_LOCAL_COLS,
     O_PROJ_LOCAL_GROUPS,
@@ -246,6 +250,7 @@ def mask_inactive_sample_rows(
 @pl.jit(auto_scope=False)
 def prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -284,9 +289,9 @@ def prefill_fwd(
     csa_inner_compress_state: pl.InOut[pl.Tensor[[FWD_INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
     idx_kv_cache: pl.InOut[pl.Tensor[[FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_compress_state_block_table: pl.Tensor[[REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     swa_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     compressed_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -295,10 +300,10 @@ def prefill_fwd(
     hca_cmp_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_freqs_cos: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_freqs_sin: pl.Tensor[[FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    hca_cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[CSA_CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[REQUESTS_DYN, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[REQUESTS_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[FWD_TOKENS_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[FWD_GROUP_TOKENS_DYN], pl.INT32],
@@ -367,6 +372,14 @@ def prefill_fwd(
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run the DeepSeek-V4 prefill backbone, LM head, and sampling."""
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    csa_inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    ori_block_table.bind_dynamic(0, REQUESTS_DYN)
+    hca_cmp_block_table.bind_dynamic(0, REQUESTS_DYN)
+    csa_cmp_block_table.bind_dynamic(0, REQUESTS_DYN)
+    idx_block_table.bind_dynamic(0, REQUESTS_DYN)
     swa_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     swa_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     compressed_freqs_cos.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
@@ -377,7 +390,9 @@ def prefill_fwd(
     csa_cmp_freqs_sin.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     group_base = my_rank // TP_SIZE * TP_SIZE
     tp_rank = my_rank % TP_SIZE
-
+    local_tokens = pl.tensor.dim(position_ids_local, 0)
+    local_request_ids = pl.create_tensor([local_tokens], dtype=pl.INT32)
+    lower_local_request_ids(query_start_loc, local_request_ids, tp_rank * local_tokens)
     ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
     hca_cmp_block_num = pl.tensor.dim(hca_cmp_kv, 0) // HCA_NUM_LAYERS
     csa_cmp_block_num = pl.tensor.dim(csa_cmp_kv, 0) // CSA_NUM_LAYERS
@@ -452,7 +467,7 @@ def prefill_fwd(
                 wkv_l0, gamma_cq_l0, gamma_ckv_l0,
                 swa_freqs_cos, swa_freqs_sin,
                 kv_cache_l0, ori_block_table, ori_slot_mapping_full,
-                position_ids_local, position_ids_full,
+                position_ids_local, position_ids_full, local_request_ids,
                 attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
                 o_proj_wo_a_full, o_proj_wo_b_full,
                 attn_stage,
@@ -540,7 +555,7 @@ def prefill_fwd(
                 wkv_l1, gamma_cq_l1, gamma_ckv_l1,
                 swa_freqs_cos, swa_freqs_sin,
                 kv_cache_l1, ori_block_table, ori_slot_mapping_full,
-                position_ids_local, position_ids_full,
+                position_ids_local, position_ids_full, local_request_ids,
                 attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
                 o_proj_wo_a_full, o_proj_wo_b_full,
                 attn_stage,
@@ -677,6 +692,7 @@ def prefill_fwd(
             with pl.scope():
                 attn_stage, gather_signal = prefill_attention_csa_cp(
                     x_hc,
+                    query_start_loc,
                     hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                     attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                     wkv_csa, gamma_cq_csa, gamma_ckv_csa,
@@ -691,7 +707,7 @@ def prefill_fwd(
                     kv_cache_csa, ori_block_table, ori_slot_mapping_full,
                     csa_cmp_kv_csa, csa_cmp_block_table,
                     idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
-                    position_ids_local, position_ids_full,
+                    position_ids_local, position_ids_full, local_request_ids,
                     csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full,
                     csa_state_slot_mapping_full, csa_inner_state_slot_mapping_full,
                     attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
@@ -795,6 +811,7 @@ def prefill_fwd(
             with pl.scope():
                 attn_stage, gather_signal = prefill_attention_hca_cp(
                     x_hc,
+                    query_start_loc, local_request_ids,
                     hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                     attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                     wkv_hca, gamma_cq_hca, gamma_ckv_hca,
@@ -940,6 +957,7 @@ def prefill_fwd(
         with pl.scope():
             attn_stage, gather_signal = prefill_attention_csa_cp(
                 x_hc,
+                query_start_loc,
                 hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
                 attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
                 wkv_last, gamma_cq_last, gamma_ckv_last,
@@ -954,7 +972,7 @@ def prefill_fwd(
                 kv_cache_last, ori_block_table, ori_slot_mapping_full,
                 csa_cmp_kv_last, csa_cmp_block_table,
                 idx_kv_cache_last, idx_kv_scale_last, idx_block_table,
-                position_ids_local, position_ids_full,
+                position_ids_local, position_ids_full, local_request_ids,
                 csa_cmp_slot_mapping_full, csa_idx_slot_mapping_full,
                 csa_state_slot_mapping_full, csa_inner_state_slot_mapping_full,
                 attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
@@ -1014,6 +1032,7 @@ def prefill_fwd(
 @pl.jit.host
 def l3_prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1052,9 +1071,9 @@ def l3_prefill_fwd(
     csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
     idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
     swa_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     swa_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     compressed_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -1063,10 +1082,10 @@ def l3_prefill_fwd(
     hca_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_freqs_cos: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
     csa_cmp_freqs_sin: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    hca_cmp_block_table: pl.Tensor[[N_RANKS, HCA_CMP_MAX_BLOCKS], pl.INT32],
-    csa_cmp_block_table: pl.Tensor[[N_RANKS, CSA_CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, CSA_CMP_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[N_RANKS, REQUESTS_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN], pl.INT32],
@@ -1116,7 +1135,10 @@ def l3_prefill_fwd(
 ):
     """Run layer-major DSA-CP over a caller-padded physical token extent.
 
-    For logical length ``N``, each TP group supplies
+    Packed request boundaries are provided by a monotonic ``query_start_loc``
+    that starts at zero and ends at total logical length ``N``. Its request
+    count must match the leading dimension of every request-indexed block table,
+    and metadata must be identical within a TP group. Each TP group supplies
     ``P = align_up(N, TP_SIZE)`` full rows and each rank supplies
     ``L = P // TP_SIZE`` local rows. Callers zero padded ``x_hc`` and
     ``input_ids``, use non-aliasing synthetic positions and ``-1`` cache/state
@@ -1124,6 +1146,14 @@ def l3_prefill_fwd(
     The device schedule, including MoE collectives, runs over physical P/L.
     """
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
+    query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
+    hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
+    ori_block_table.bind_dynamic(1, REQUESTS_DYN)
+    hca_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
+    csa_cmp_block_table.bind_dynamic(1, REQUESTS_DYN)
+    idx_block_table.bind_dynamic(1, REQUESTS_DYN)
     hidden_workspace.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     x_out.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     attn_stage.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
@@ -1196,6 +1226,7 @@ def l3_prefill_fwd(
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         prefill_fwd(
             x_hc[r],
+            query_start_loc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
             wkv[r], gamma_cq[r], gamma_ckv[r],
@@ -1372,7 +1403,7 @@ def _global_token_index_map(local_tokens, torch):
 
 # Canonical host-tensor order for a single unified prefill layer.
 HOST_TENSOR_ORDER = (
-    "x_hc",
+    "x_hc", "query_start_loc",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "swa_freqs_cos", "swa_freqs_sin",
@@ -1425,21 +1456,36 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
 
 
-def build_single_layer_tensor_specs(start_pos=START_POS, token_count=TP_SIZE * T, layer_id=2):
+def build_single_layer_tensor_specs(
+    start_pos=START_POS,
+    token_count=TP_SIZE * T,
+    layer_id=2,
+    fixture_case="b1",
+):
     """Build the single-layer tensor specs used by the stacked forward fixtures."""
     import torch
     from golden import ScalarSpec, TensorSpec
 
-    def kind_specs(build_fn):
+    if fixture_case not in {"b1", "ragged2"}:
+        raise ValueError(f"unsupported full-forward fixture case {fixture_case!r}")
+    if fixture_case == "ragged2" and (TP_SIZE != 2 or token_count != 8):
+        raise ValueError(f"ragged2 requires TP=2 and physical token_count=8, got TP={TP_SIZE}, tokens={token_count}")
+
+    def kind_specs(build_fn, build_ragged_fn):
+        source_specs = (
+            build_ragged_fn(tp_size=TP_SIZE)
+            if fixture_case == "ragged2"
+            else build_fn(start_pos=start_pos, token_count=token_count, tp_size=TP_SIZE)
+        )
         return {
             s.name: s
-            for s in build_fn(start_pos=start_pos, token_count=token_count, tp_size=TP_SIZE)
+            for s in source_specs
             if isinstance(s, TensorSpec)
         }
 
-    swa = kind_specs(build_swa_attention_tensor_specs)
-    hca = kind_specs(build_hca_attention_tensor_specs)
-    csa = kind_specs(build_csa_attention_tensor_specs)
+    swa = kind_specs(build_swa_attention_tensor_specs, build_swa_ragged2_tensor_specs)
+    hca = kind_specs(build_hca_attention_tensor_specs, build_hca_ragged2_tensor_specs)
+    csa = kind_specs(build_csa_attention_tensor_specs, build_csa_ragged2_tensor_specs)
     active_kind = _attention_kind_for_layer(layer_id)
     active = {"swa": swa, "hca": hca, "csa": csa}[active_kind]
     active_tokens = token_count // TP_SIZE
@@ -1447,6 +1493,7 @@ def build_single_layer_tensor_specs(start_pos=START_POS, token_count=TP_SIZE * T
     # Unified names and source specs for the selected attention kind.
     attention_specs = [
         ("x_hc", active["x_hc_full"]),
+        ("query_start_loc", csa["query_start_loc"]),
         ("hc_attn_fn", active["hc_attn_fn"]), ("hc_attn_scale", active["hc_attn_scale"]),
         ("hc_attn_base", active["hc_attn_base"]),
         ("attn_norm_w", active["attn_norm_w"]),
@@ -1546,11 +1593,18 @@ def build_tensor_specs(
     hca_state_block_num=HCA_STATE_BLOCK_NUM,
     csa_state_block_num=CSA_STATE_BLOCK_NUM,
     inner_state_block_num=INNER_STATE_BLOCK_NUM,
+    fixture_case="b1",
 ):
     """Build CP-padded full-forward fixtures from a logical prompt length."""
     import torch
     from golden import TensorSpec
 
+    if fixture_case not in {"b1", "ragged2"}:
+        raise ValueError(f"unsupported full-forward fixture case {fixture_case!r}")
+    if fixture_case == "ragged2" and TP_SIZE != 2:
+        raise ValueError(f"ragged2 requires TP=2, got TP={TP_SIZE}")
+    if fixture_case == "ragged2" and (start_pos != 0 or num_tokens != 7):
+        raise ValueError(f"ragged2 uses fixed start_pos=0 and logical num_tokens=7, got {start_pos} and {num_tokens}")
     if start_pos < 0:
         raise ValueError(f"start_pos must be non-negative, got {start_pos}")
     capacities = {
@@ -1594,12 +1648,17 @@ def build_tensor_specs(
 
     base_specs = {
         spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, token_count=physical_tokens, layer_id=0)
+        for spec in build_single_layer_tensor_specs(
+            start_pos=start_pos,
+            token_count=physical_tokens,
+            layer_id=0,
+            fixture_case=fixture_case,
+        )
         if isinstance(spec, TensorSpec)
     }
 
     ordered_names = [
-        "x_hc",
+        "x_hc", "query_start_loc",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
         "kv_cache", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
@@ -1648,7 +1707,21 @@ def build_tensor_specs(
     }
     specs = []
     for name in ordered_names:
-        if name == "x_hc":
+        if name == "query_start_loc":
+            base = base_specs[name]
+            if fixture_case == "ragged2":
+                def init_query_start_loc(spec=base):
+                    return _expand_rank_axis(_spec_value(spec, torch), torch)
+
+                query_start_loc_shape = [N_RANKS, *base.shape[1:]]
+            else:
+                def init_query_start_loc(active_tokens=num_tokens, dtype=base.dtype):
+                    boundaries = torch.tensor([0, active_tokens], dtype=dtype)
+                    return boundaries.view(1, 2).expand(N_RANKS, -1).contiguous()
+
+                query_start_loc_shape = [N_RANKS, 2]
+            specs.append(TensorSpec(name, query_start_loc_shape, base.dtype, init_value=init_query_start_loc))
+        elif name == "x_hc":
             base = base_specs[name]
             x_hc_shape = list(base.shape)
             x_hc_shape[0] = N_RANKS
@@ -1664,12 +1737,15 @@ def build_tensor_specs(
 
             specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc, is_output=True))
         elif name == "position_ids_local":
-            dtype = base_specs[name].dtype
+            if fixture_case == "ragged2":
+                specs.append(_make_shared_spec(name, base_specs))
+            else:
+                dtype = base_specs[name].dtype
 
-            def init_position_ids_local(indices=global_token_indices, dtype=dtype):
-                return (start_pos + indices).to(dtype).contiguous()
+                def init_position_ids_local(indices=global_token_indices, dtype=dtype):
+                    return (start_pos + indices).to(dtype).contiguous()
 
-            specs.append(TensorSpec(name, [N_RANKS, local_tokens], dtype, init_value=init_position_ids_local))
+                specs.append(TensorSpec(name, [N_RANKS, local_tokens], dtype, init_value=init_position_ids_local))
         elif name == "input_ids":
             dtype = base_specs[name].dtype
 
@@ -1775,12 +1851,12 @@ def build_tensor_specs(
         shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D**0.5).to(torch.bfloat16)
         return torch.stack([shards[rank % TP_SIZE] for rank in range(N_RANKS)], dim=0)
 
-    # Leader-owned rows: the group leader publishes the last prompt token as its
-    # single live logit row; peers keep every row at -1 and still join the TP
-    # collective.
-    def init_logit_row_indices(active_tokens=num_tokens):
+    # Group leaders publish one last-token row per packed request.
+    request_last_rows = (2, 6) if fixture_case == "ragged2" else (num_tokens - 1,)
+
+    def init_logit_row_indices(last_rows=request_last_rows):
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[::TP_SIZE, 0] = active_tokens - 1
+        indices[::TP_SIZE, : len(last_rows)] = torch.tensor(last_rows, dtype=torch.int32)
         return indices
 
     def init_hidden_workspace():
@@ -1801,6 +1877,24 @@ def build_tensor_specs(
     for spec in head_specs:
         spec.resident = "stacked"
         specs.append(spec)
+
+    spec_by_name = {spec.name: spec for spec in specs}
+    request_count = spec_by_name["query_start_loc"].shape[1] - 1
+    request_table_names = (
+        "ori_block_table", "hca_cmp_block_table", "csa_cmp_block_table", "idx_block_table",
+        "hca_compress_state_block_table", "csa_compress_state_block_table",
+        "csa_inner_compress_state_block_table",
+    )
+    mismatched = [
+        f"{name}={spec_by_name[name].shape[1]}"
+        for name in request_table_names
+        if spec_by_name[name].shape[1] != request_count
+    ]
+    if mismatched:
+        raise ValueError(
+            f"request-indexed table rows must match query_start_loc request count {request_count}: "
+            f"{', '.join(mismatched)}"
+        )
     return specs
 
 
@@ -1941,8 +2035,12 @@ def main():
     )
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument(
-        "--num-tokens", type=int, default=TP_SIZE * T,
-        help="Prompt tokens per TP/CP group; must be at most 8192.",
+        "--num-tokens", type=int, default=None,
+        help=f"B1 prompt tokens per TP/CP group; defaults to {TP_SIZE * T}. ragged2 is fixed at 7.",
+    )
+    parser.add_argument(
+        "--case", choices=["b1", "ragged2"], default="b1",
+        help="Fixture case; ragged2 is the fixed two-request TP2 boundary case.",
     )
     parser.add_argument("--ori-block-num", type=int, default=CSA_ORI_BLOCK_NUM)
     parser.add_argument("--hca-cmp-block-num", type=int, default=HCA_CMP_BLOCK_NUM)
@@ -1969,6 +2067,14 @@ def main():
         parser.error(f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}")
     if args.ep % args.tp != 0:
         parser.error(f"EP must be divisible by TP/CP, got --ep {args.ep} and --tp {args.tp}")
+    if args.case == "ragged2" and TP_SIZE != 2:
+        parser.error("--case ragged2 requires --tp 2")
+    if args.case == "ragged2" and args.start_pos != 0:
+        parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
+    if args.num_tokens is None:
+        args.num_tokens = 7 if args.case == "ragged2" else TP_SIZE * T
+    if args.case == "ragged2" and args.num_tokens != 7:
+        parser.error("--case ragged2 has a fixed logical extent and requires --num-tokens 7")
     if args.num_tokens < 1 or args.num_tokens > PREFILL_GROUP_CAP:
         parser.error(f"--num-tokens must be in [1, {PREFILL_GROUP_CAP}]")
 
@@ -1982,6 +2088,7 @@ def main():
         idx_block_num=args.idx_block_num,
         hca_state_block_num=args.hca_state_block_num, csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
+        fixture_case=args.case,
     )
 
     result = run_jit(

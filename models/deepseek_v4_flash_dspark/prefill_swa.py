@@ -31,6 +31,7 @@ from prefill_cp_token_allgather import (
     materialize_spec,
     prefill_cp_token_allgather_step,
 )
+from prefill_metadata import REQUESTS_DYN
 from prefill_o_proj import (
     O_PROJ_LOCAL_COLS,
     O_PROJ_LOCAL_GROUPS,
@@ -112,9 +113,10 @@ def prefill_attention_swa(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -158,37 +160,39 @@ def prefill_attention_swa(
         for idx_t in pl.range(t_dim):
             idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            abs_pos = pl.read(position_ids, [idx_t])
-            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for win_col in pl.range(WIN):
-                win_col_i32 = pl.cast(win_col, pl.INT32)
-                if win_col_i32 < window_valid:
-                    key_abs = key_start_abs + win_col_i32
-                    blk_slot = key_abs // BLOCK_SIZE
-                    blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
-                    if blk >= 0:
-                        row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
-                        pl.write(idx_row, [0, win_col], row)
-                        if win_col < SPARSE_BIAS_COLS:
-                            block_col = win_col // PREFILL_ATTN_TILE
-                            pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
+            request_id = pl.read(local_request_ids, [idx_t])
+            if request_id >= 0:
+                abs_pos = pl.read(position_ids, [idx_t])
+                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                for win_col in pl.range(WIN):
+                    win_col_i32 = pl.cast(win_col, pl.INT32)
+                    if win_col_i32 < window_valid:
+                        key_abs = key_start_abs + win_col_i32
+                        blk_slot = key_abs // BLOCK_SIZE
+                        blk = pl.read(block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                        if blk >= 0:
+                            row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                            pl.write(idx_row, [0, win_col], row)
+                            if win_col < SPARSE_BIAS_COLS:
+                                block_col = win_col // PREFILL_ATTN_TILE
+                                pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
             swa_indices[idx_t : idx_t + 1, 0:WIN] = idx_row
             valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    request_count = pl.tensor.dim(block_table, 0)
+    cmp_block_table_dummy = pl.create_tensor([request_count, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
-    cmp_block_table_dummy_2d = pl.reshape(cmp_block_table_dummy, [1, SPARSE_CMP_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cmp_dummy_init"):
-        cmp_block_table_dummy_2d[:, :] = pl.full([1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0)
+    for request in pl.spmd(request_count, name_hint="prefill_swa_cmp_dummy_init"):
+        cmp_block_table_dummy[request : request + 1, :] = pl.full([1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0)
     for dummy_t in pl.spmd(t_dim, name_hint="prefill_swa_cmp_indices_dummy_init"):
         cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     o_proj_weight_dep = pl.system.task_dummy(deps=[])
     attn_out = sparse_attn_physical(
         q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy,
+        cmp_kv_dummy, cmp_block_table_dummy, local_request_ids,
         cmp_indices_dummy,
         valid_block_mask,
         attn_sink,
@@ -216,9 +220,10 @@ def prefill_attention_swa_test(
     freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -229,8 +234,10 @@ def prefill_attention_swa_test(
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
     kv_cache.bind_dynamic(0, BLOCK_NUM_DYN)
+    block_table.bind_dynamic(0, REQUESTS_DYN)
     ori_slot_mapping.bind_dynamic(0, T_DYN)
     position_ids.bind_dynamic(0, T_DYN)
+    local_request_ids.bind_dynamic(0, T_DYN)
     x_out.bind_dynamic(0, T_DYN)
 
     prefill_attention_swa(
@@ -239,7 +246,7 @@ def prefill_attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, block_table, ori_slot_mapping,
-        position_ids,
+        position_ids, local_request_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
     )
@@ -261,10 +268,11 @@ def prefill_attention_swa_cp_core(
     freqs_cos_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin_full: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -310,36 +318,38 @@ def prefill_attention_swa_cp_core(
         for idx_t in pl.range(q_dim):
             idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-            abs_pos = pl.read(position_ids_local, [idx_t])
-            window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for win_col in pl.range(WIN):
-                win_col_i32 = pl.cast(win_col, pl.INT32)
-                if win_col_i32 < window_valid:
-                    key_abs = key_start_abs + win_col_i32
-                    blk_slot = key_abs // BLOCK_SIZE
-                    blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
-                    if blk >= 0:
-                        block_row = key_abs - blk_slot * BLOCK_SIZE
-                        row = pl.cast(blk * BLOCK_SIZE + block_row, pl.INT32)
-                        pl.write(idx_row, [0, win_col], row)
-                        if win_col < SPARSE_BIAS_COLS:
-                            block_col = win_col // PREFILL_ATTN_TILE
-                            pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
+            request_id = pl.read(local_request_ids, [idx_t])
+            if request_id >= 0:
+                abs_pos = pl.read(position_ids_local, [idx_t])
+                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                for win_col in pl.range(WIN):
+                    win_col_i32 = pl.cast(win_col, pl.INT32)
+                    if win_col_i32 < window_valid:
+                        key_abs = key_start_abs + win_col_i32
+                        blk_slot = key_abs // BLOCK_SIZE
+                        blk = pl.read(block_table, [request_id, pl.cast(blk_slot, pl.INDEX)])
+                        if blk >= 0:
+                            block_row = key_abs - blk_slot * BLOCK_SIZE
+                            row = pl.cast(blk * BLOCK_SIZE + block_row, pl.INT32)
+                            pl.write(idx_row, [0, win_col], row)
+                            if win_col < SPARSE_BIAS_COLS:
+                                block_col = win_col // PREFILL_ATTN_TILE
+                                pl.write(mask_row, [0, block_col], pl.cast(1, pl.INT32))
             swa_indices[idx_t : idx_t + 1, 0:WIN] = idx_row
             valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    request_count = pl.tensor.dim(block_table, 0)
+    cmp_block_table_dummy = pl.create_tensor([request_count, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([q_dim, IDX_TOPK], dtype=pl.INT32)
-    cmp_block_table_dummy_2d = pl.reshape(cmp_block_table_dummy, [1, SPARSE_CMP_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cp_cmp_dummy_init"):
-        cmp_block_table_dummy_2d[:, :] = pl.full([1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0)
+    for request in pl.spmd(request_count, name_hint="prefill_swa_cp_cmp_dummy_init"):
+        cmp_block_table_dummy[request : request + 1, :] = pl.full([1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0)
     for dummy_t in pl.spmd(q_dim, name_hint="prefill_swa_cp_cmp_indices_dummy_init"):
         cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
     attn_out_local = sparse_attn_physical(
         q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy, cmp_indices_dummy,
+        cmp_kv_dummy, cmp_block_table_dummy, local_request_ids, cmp_indices_dummy,
         valid_block_mask, attn_sink,
         freqs_cos_local, freqs_sin_local,
         wo_a, wo_b, wo_b_scale,
@@ -364,10 +374,11 @@ def prefill_attention_swa_cp(
     freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a_local: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_local: pl.Tensor[[D, O_PROJ_LOCAL_COLS], pl.INT8],
@@ -428,7 +439,7 @@ def prefill_attention_swa_cp(
         freqs_cos, freqs_sin,
         kv_cache, block_table,
         ori_slot_mapping_full,
-        position_ids_local, position_ids_full,
+        position_ids_local, position_ids_full, local_request_ids,
         attn_sink,
         wo_a_full, wo_b_full, wo_b_scale,
         attn_out_local,
@@ -462,10 +473,11 @@ def prefill_attention_swa_cp_test(
     freqs_cos: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[CP_KV_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_PROJ_LOCAL_COLS], pl.INT8],
@@ -485,9 +497,11 @@ def prefill_attention_swa_cp_test(
     freqs_cos.bind_dynamic(0, CP_KV_T_DYN)
     freqs_sin.bind_dynamic(0, CP_KV_T_DYN)
     kv_cache.bind_dynamic(0, BLOCK_NUM_DYN)
+    block_table.bind_dynamic(0, REQUESTS_DYN)
     ori_slot_mapping_full.bind_dynamic(0, CP_KV_T_DYN)
     position_ids_local.bind_dynamic(0, CP_Q_T_DYN)
     position_ids_full.bind_dynamic(0, CP_KV_T_DYN)
+    local_request_ids.bind_dynamic(0, CP_Q_T_DYN)
     x_out_full.bind_dynamic(0, CP_KV_T_DYN)
 
     wo_a_full = pl.create_tensor([O_PROJ_SCRATCH_GROUPS, O_PROJ_SCRATCH_RANK, O_PROJ_SCRATCH_INPUT], dtype=pl.BF16)
@@ -501,7 +515,7 @@ def prefill_attention_swa_cp_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, block_table, ori_slot_mapping_full,
-        position_ids_local, position_ids_full,
+        position_ids_local, position_ids_full, local_request_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
         wo_a_full, wo_b_full,
         x_out_full,
@@ -530,10 +544,11 @@ def l3_prefill_attention_swa_cp(
     freqs_cos: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[pl.Tensor[[TP_SIZE, BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[TP_SIZE, BLOCK_TABLE_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[TP_SIZE, REQUESTS_DYN, BLOCK_TABLE_BLOCKS], pl.INT32],
     ori_slot_mapping_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT64],
     position_ids_local: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     position_ids_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN], pl.INT32],
+    local_request_ids: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
     wo_a: pl.Tensor[[TP_SIZE, O_PROJ_LOCAL_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[TP_SIZE, D, O_PROJ_LOCAL_COLS], pl.INT8],
@@ -545,9 +560,11 @@ def l3_prefill_attention_swa_cp(
     freqs_cos.bind_dynamic(1, CP_KV_T_DYN)
     freqs_sin.bind_dynamic(1, CP_KV_T_DYN)
     kv_cache.bind_dynamic(1, BLOCK_NUM_DYN)
+    block_table.bind_dynamic(1, REQUESTS_DYN)
     ori_slot_mapping_full.bind_dynamic(1, CP_KV_T_DYN)
     position_ids_local.bind_dynamic(1, CP_Q_T_DYN)
     position_ids_full.bind_dynamic(1, CP_KV_T_DYN)
+    local_request_ids.bind_dynamic(1, CP_Q_T_DYN)
     x_out_full.bind_dynamic(1, CP_KV_T_DYN)
 
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -575,7 +592,7 @@ def l3_prefill_attention_swa_cp(
             wkv[rank], gamma_cq[rank], gamma_ckv[rank],
             freqs_cos[rank], freqs_sin[rank],
             kv_cache[rank], block_table[rank], ori_slot_mapping_full[rank],
-            position_ids_local[rank], position_ids_full[rank],
+            position_ids_local[rank], position_ids_full[rank], local_request_ids[rank],
             attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
             x_out_full[rank],
             gather_window, gather_signal,
@@ -654,12 +671,16 @@ def golden_prefill_attention_swa(tensors):
         idx = torch.full((token_count, WIN), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
         table = tensors["block_table"]
+        request_ids = tensors["local_request_ids"]
         for t in range(token_count):
+            request_id = int(request_ids[t].item())
+            if request_id < 0:
+                continue
             abs_pos = int(pos[t].item())
             window_valid = min(WIN, abs_pos + 1)
             key_start_abs = abs_pos + 1 - window_valid
             for k, key_abs in enumerate(range(key_start_abs, abs_pos + 1)):
-                row = cache_row_from_table(table, key_abs)
+                row = cache_row_from_table(table[request_id], key_abs)
                 if row >= 0:
                     idx[t, k] = row
         return idx
@@ -670,7 +691,10 @@ def golden_prefill_attention_swa(tensors):
         "ori_kv": kv_cache_in,
         "swa_indices": build_swa_metadata(),
         "cmp_kv": torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
-        "cmp_block_table": torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
+        "cmp_block_table": torch.zeros(
+            tensors["block_table"].shape[0], SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32
+        ),
+        "local_request_ids": tensors["local_request_ids"],
         "cmp_indices": torch.full((token_count, IDX_TOPK), -1, dtype=torch.int32),
         "attn_sink": tensors["attn_sink"],
         "freqs_cos": rope_cos_t,
@@ -757,9 +781,9 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_freqs_sin.clone()
     def init_block_table():
-        tbl = torch.full((BLOCK_TABLE_BLOCKS,), -1, dtype=torch.int32)
+        tbl = torch.full((1, BLOCK_TABLE_BLOCKS), -1, dtype=torch.int32)
         for block in range(BLOCK_TABLE_BLOCKS):
-            tbl[block] = block % BLOCK_NUM
+            tbl[0, block] = block % BLOCK_NUM
         return tbl
     def init_kv_cache():
         cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -767,7 +791,7 @@ def build_tensor_specs(
         table = init_block_table()
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
-            row = cache_row_from_table(table, abs_pos)
+            row = cache_row_from_table(table[0], abs_pos)
             value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
@@ -777,10 +801,12 @@ def build_tensor_specs(
         pos = token_pos()
         table = init_block_table()
         for t in range(token_count):
-            mapping[t] = cache_row_from_table(table, int(pos[t].item()))
+            mapping[t] = cache_row_from_table(table[0], int(pos[t].item()))
         return mapping
     def init_position_ids():
         return token_pos()
+    def init_local_request_ids():
+        return torch.zeros(token_count, dtype=torch.int32)
     def init_attn_sink():
         return torch.zeros(H)
     def init_wo_a():
@@ -809,9 +835,10 @@ def build_tensor_specs(
         TensorSpec("freqs_sin", [token_count, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
-        TensorSpec("block_table", [BLOCK_TABLE_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("block_table", [1, BLOCK_TABLE_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [token_count], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [token_count], torch.int32, init_value=init_position_ids),
+        TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
@@ -859,6 +886,11 @@ def build_cp_tensor_specs(
             specs.append(TensorSpec(
                 "position_ids_full", [tp_size, token_count], spec.dtype, init_value=cp_stack(value, tp_size),
             ))
+        elif spec.name == "local_request_ids":
+            specs.append(TensorSpec(
+                "local_request_ids", [tp_size, local_t], spec.dtype,
+                init_value=torch.zeros(tp_size, local_t, dtype=spec.dtype),
+            ))
         elif spec.name == "wo_a":
             shards = [value[rank * O_PROJ_LOCAL_GROUPS : (rank + 1) * O_PROJ_LOCAL_GROUPS] for rank in range(tp_size)]
             specs.append(TensorSpec(
@@ -878,6 +910,70 @@ def build_cp_tensor_specs(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, tp_size), is_output=spec.is_output,
             ))
+    return specs
+
+
+def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
+    """Build the two-request rank-crossing CP fixture from the B1 specs."""
+    import torch
+
+    from golden import TensorSpec
+    from utils import (
+        block_table as make_block_table,
+        cache_row_from_table,
+        ori_slot_mapping as make_ori_slot_mapping,
+        token_local_rope,
+    )
+
+    if tp_size != 2:
+        raise ValueError(f"ragged2 requires tp_size=2, got {tp_size}")
+
+    token_count = 8
+    request_positions = (
+        torch.tensor([126, 127, 128], dtype=torch.int32),
+        torch.tensor([30, 31, 32, 33], dtype=torch.int32),
+    )
+    position_ids = torch.cat((*request_positions, torch.zeros(1, dtype=torch.int32)))
+    request_ids = torch.tensor([0, 0, 0, 1, 1, 1, 1, -1], dtype=torch.int32)
+    table = make_block_table(batch=2, table_blocks=BLOCK_TABLE_BLOCKS, physical_blocks=BLOCK_NUM)
+
+    active_slot_mapping = []
+    for request, positions in enumerate(request_positions):
+        request_table = table[request : request + 1]
+        request_mapping = make_ori_slot_mapping(positions.unsqueeze(0), request_table)
+        active_slot_mapping.append(request_mapping.reshape(-1))
+    ori_slot_mapping = torch.cat((*active_slot_mapping, torch.full((1,), -1, dtype=torch.int64)))
+
+    kv_cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    kv_cache_flat = kv_cache.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    for request, start_pos in enumerate((126, 30)):
+        for position in range(max(0, start_pos - WIN), start_pos):
+            row = cache_row_from_table(table[request], position)
+            kv_cache_flat[row] = ((torch.rand(HEAD_DIM) - 0.5) * 0.1).to(torch.bfloat16)
+
+    freqs_cos, freqs_sin = token_local_rope(M, 0, position_ids, max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16)
+    replacements = {
+        "freqs_cos": cp_stack(freqs_cos, tp_size),
+        "freqs_sin": cp_stack(freqs_sin, tp_size),
+        "kv_cache": cp_stack(kv_cache, tp_size),
+        "block_table": cp_stack(table, tp_size),
+        "ori_slot_mapping_full": cp_stack(ori_slot_mapping, tp_size),
+        "position_ids_local": position_ids.reshape(tp_size, token_count // tp_size).contiguous(),
+        "position_ids_full": cp_stack(position_ids, tp_size),
+        "local_request_ids": request_ids.reshape(tp_size, token_count // tp_size).contiguous(),
+    }
+
+    specs = []
+    for spec in build_cp_tensor_specs(start_pos=0, token_count=token_count, tp_size=tp_size):
+        value = replacements.get(spec.name)
+        if value is None:
+            specs.append(spec)
+            continue
+        replacement_spec = TensorSpec(
+            spec.name, list(value.shape), spec.dtype, init_value=value,
+            is_output=spec.is_output, resident=spec.resident,
+        )
+        specs.append(replacement_spec)
     return specs
 
 
@@ -904,6 +1000,9 @@ def golden_prefill_attention_swa_cp(tensors):
         "kv_cache": tensors["kv_cache"][0].clone(),
         "block_table": tensors["block_table"][0],
         "ori_slot_mapping": tensors["ori_slot_mapping_full"][0],
+        "local_request_ids": torch.cat(
+            [tensors["local_request_ids"][rank] for rank in range(tp_size)]
+        ),
         "position_ids": tensors["position_ids_full"][0],
         "attn_sink": tensors["attn_sink"][0],
         "wo_a": torch.cat([tensors["wo_a"][rank] for rank in range(tp_size)], dim=0),
@@ -933,8 +1032,14 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Absolute position of the first physical query token.")
-    parser.add_argument("--token-count", "--num-tokens", dest="token_count", type=int, default=PREFILL_SEQ,
-                        help="Physical query-token extent across the group; must divide by --tp.")
+    parser.add_argument(
+        "--token-count", "--num-tokens", dest="token_count", type=int, default=None,
+        help=f"B1 physical query-token extent across the group; defaults to {PREFILL_SEQ}. ragged2 is fixed at 8.",
+    )
+    parser.add_argument(
+        "--case", choices=["b1", "ragged2"], default="b1",
+        help="Fixture case; ragged2 is the fixed two-request TP2 boundary case.",
+    )
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -945,7 +1050,15 @@ if __name__ == "__main__":
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {device_ids}")
-    if args.token_count % TP_SIZE != 0:
+    if args.case == "ragged2" and TP_SIZE != 2:
+        parser.error("--case ragged2 requires --tp 2")
+    if args.case == "ragged2" and args.start_pos != 0:
+        parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
+    if args.token_count is None:
+        args.token_count = 8 if args.case == "ragged2" else PREFILL_SEQ
+    if args.case == "ragged2" and args.token_count != 8:
+        parser.error("--case ragged2 has a fixed physical extent and requires --token-count 8")
+    if args.case == "b1" and args.token_count % TP_SIZE != 0:
         parser.error(f"--token-count must be a multiple of --tp={TP_SIZE}, got {args.token_count}")
 
     if TP_SIZE == 1:
@@ -971,9 +1084,14 @@ if __name__ == "__main__":
     else:
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
+        specs = (
+            build_ragged2_cp_tensor_specs(TP_SIZE)
+            if args.case == "ragged2"
+            else build_cp_tensor_specs(args.start_pos, args.token_count, TP_SIZE)
+        )
         result = run_jit(
             fn=l3_prefill_attention_swa_cp,
-            specs=build_cp_tensor_specs(args.start_pos, args.token_count, TP_SIZE),
+            specs=specs,
             golden_fn=golden_prefill_attention_swa_cp,
             compile_cfg=dict(
                 dump_passes=args.dump_passes,

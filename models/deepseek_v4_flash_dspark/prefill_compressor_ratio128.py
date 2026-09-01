@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 token-major prefill compressor, ratio=128, single request of <=T tokens."""
+"""DeepSeek-V4 packed prefill compressor for the ratio-128 state cache."""
 
 import pypto.language as pl
 
@@ -17,6 +17,7 @@ from config import (
     HCA_STATE_PHYSICAL_BLOCKS,
     PREFILL_SEQ,
 )
+from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
 
 
 
@@ -394,10 +395,11 @@ def _prefill_compressor_ratio128_tile(
 @pl.jit.inline(auto_scope=False)
 def prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
-    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -409,8 +411,8 @@ def prefill_compressor_ratio128(
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
-    """Compress one physical dynamic token run through ordered 512-row state tiles."""
-    t_dim = pl.tensor.dim(x, 0)
+    """Compress packed requests independently through ordered 512-row state tiles."""
+    request_count = pl.tensor.dim(query_start_loc, 0) - 1
     rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_sign_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -443,40 +445,46 @@ def prefill_compressor_ratio128(
     state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
         pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
-    for tile_base in pl.range(0, t_dim, PREFILL_STATE_TILE):
-        tile_rows = pl.min(PREFILL_STATE_TILE, t_dim - tile_base)
-        with pl.scope():
-            _prefill_compressor_ratio128_tile(
-                x,
-                compress_state,
-                compress_state_block_table,
-                wkv,
-                wgate,
-                ape,
-                norm_w,
-                cmp_freqs_cos,
-                cmp_freqs_sin,
-                cmp_kv,
-                position_ids,
-                cmp_slot_mapping,
-                state_slot_mapping,
-                rope_dup_idx_template,
-                rope_swap_idx_template,
-                rope_sign_template,
-                state_order_fence,
-                tile_base,
-                tile_rows,
-            )
+    for request in pl.range(request_count):
+        request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        request_table = compress_state_block_table[request]
+        for request_offset in pl.range(0, request_end - request_start, PREFILL_STATE_TILE):
+            tile_base = request_start + request_offset
+            tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
+            with pl.scope():
+                _prefill_compressor_ratio128_tile(
+                    x,
+                    compress_state,
+                    request_table,
+                    wkv,
+                    wgate,
+                    ape,
+                    norm_w,
+                    cmp_freqs_cos,
+                    cmp_freqs_sin,
+                    cmp_kv,
+                    position_ids,
+                    cmp_slot_mapping,
+                    state_slot_mapping,
+                    rope_dup_idx_template,
+                    rope_swap_idx_template,
+                    rope_sign_template,
+                    state_order_fence,
+                    tile_base,
+                    tile_rows,
+                )
     return cmp_kv, compress_state
 
 
 @pl.jit
 def prefill_compressor_ratio128_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
-    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -489,7 +497,9 @@ def prefill_compressor_ratio128_test(
     state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
     x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
     cmp_freqs_cos.bind_dynamic(0, T_DYN)
     cmp_freqs_sin.bind_dynamic(0, T_DYN)
@@ -499,6 +509,7 @@ def prefill_compressor_ratio128_test(
 
     return prefill_compressor_ratio128(
         x,
+        query_start_loc,
         compress_state,
         compress_state_block_table,
         wkv,
@@ -526,7 +537,7 @@ def golden_prefill_compressor_ratio128(tensors):
     )
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
-    state_block_table = tensors["compress_state_block_table"]
+    state_block_table = tensors["compress_state_block_table"][0]
     cmp_kv_flat = tensors["cmp_kv"].view(CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM)
 
     def state_row(abs_pos):
@@ -595,7 +606,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     def init_compress_state_block_table():
         logical_blocks = torch.arange(HCA_STATE_MAX_BLOCKS, dtype=torch.int64)
-        return ((logical_blocks * 17 + 3) % HCA_STATE_PHYSICAL_BLOCKS).to(torch.int32)
+        return ((logical_blocks * 17 + 3) % HCA_STATE_PHYSICAL_BLOCKS).to(torch.int32).unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -671,6 +682,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
         TensorSpec(
             "compress_state",
             [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
@@ -680,7 +692,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         ),
         TensorSpec(
             "compress_state_block_table",
-            [HCA_STATE_MAX_BLOCKS],
+            [1, HCA_STATE_MAX_BLOCKS],
             torch.int32,
             init_value=init_compress_state_block_table,
         ),

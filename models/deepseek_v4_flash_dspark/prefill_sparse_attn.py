@@ -21,6 +21,7 @@ from config import (
     PREFILL_BATCH,
     PREFILL_SEQ,
 )
+from prefill_metadata import REQUESTS_DYN
 
 # Longest sequence the model config admits; the host-side bound on token_count.
 MAX_SEQ_LEN = M.max_position_embeddings
@@ -217,6 +218,7 @@ def _hca_streaming_wave(
     rope_cos_il: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
     wave_completion: pl.Array[1, pl.TASK_ID],
+    request_offset: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     dense_query_base: pl.Scalar[pl.INDEX],
 ):
@@ -225,7 +227,8 @@ def _hca_streaming_wave(
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
-    query_base = tile_base + dense_query_base
+    query_base = request_offset + tile_base + dense_query_base
+    request_end = request_offset + active_rows
 
     with pl.spmd(
         HCA_QUERY_TILE // HCA_GATHER_TOKEN_TILE,
@@ -239,7 +242,7 @@ def _hca_streaming_wave(
             gather_dst = gather_local_t * WIN
             raw_stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
             valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
-            if gather_t < active_rows:
+            if gather_t < request_end:
                 for gather_k in pl.range(WIN):
                     gather_row_i32 = pl.read(swa_indices, [gather_t, gather_k])
                     if gather_row_i32 >= 0:
@@ -256,7 +259,7 @@ def _hca_streaming_wave(
     with pl.spmd(HCA_QUERY_TILE, name_hint="prefill_hca_stream_raw_qk_pv", deps=[raw_gather_tid]) as raw_heads_tid:
         raw_local_t = pl.tile.get_block_idx()
         raw_t = query_base + raw_local_t
-        if raw_t < active_rows:
+        if raw_t < request_end:
             raw_src = raw_local_t * WIN
             raw_kv_tile = raw_kv[raw_src : raw_src + WIN, 0:HEAD_DIM]
             raw_valid_row = raw_valid[raw_local_t : raw_local_t + 1, 0:WIN]
@@ -295,7 +298,7 @@ def _hca_streaming_wave(
         qk_hb = qk_item - qk_local_t * (H // QK_M_TILE)
         qk_t = query_base + qk_local_t
         qk_token_base = qk_local_t * (H // HEAD_TILE) * HCA_CMP_WORK_COUNT * HEAD_TILE
-        if qk_t < active_rows:
+        if qk_t < request_end:
             qk_position_i32 = pl.read(position_ids, [qk_t])
             if qk_position_i32 >= 0:
                 qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
@@ -350,7 +353,7 @@ def _hca_streaming_wave(
         merge_local_t = merge_item // (H // HEAD_TILE)
         merge_h_idx = merge_item - merge_local_t * (H // HEAD_TILE)
         merge_t = query_base + merge_local_t
-        if merge_t < active_rows:
+        if merge_t < request_end:
             merge_h0 = merge_h_idx * HEAD_TILE
             merge_stream_row = merge_local_t * H + merge_h0
             merge_m = stream_state_m[merge_stream_row : merge_stream_row + HEAD_TILE, 0:1]
@@ -425,6 +428,7 @@ def _hca_streaming_attn_tile(
     cmp_block_table: pl.Tensor[[HCA_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
+    request_offset: pl.Scalar[pl.INDEX],
     active_rows: pl.Scalar[pl.INDEX],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -450,7 +454,7 @@ def _hca_streaming_attn_tile(
             level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_cmp_plan", deps=[packed_init_tid],
         ) as cmp_plan_tid:
             # Maximum compressed-history rows for this tile.
-            plan_last_t = tile_base + tile_rows - 1
+            plan_last_t = request_offset + tile_base + tile_rows - 1
             plan_max_pos = pl.read(position_ids, [plan_last_t])
             plan_visible_rows = (plan_max_pos + 1) // HCA_COMPRESS_RATIO
             if plan_visible_rows < 0:
@@ -494,7 +498,7 @@ def _hca_streaming_attn_tile(
         rope_cs_tid = _prepare_sparse_attn_rope(
             freqs_cos, freqs_sin,
             rope_cos_il, rope_sin_signed, rope_swap_idx,
-            tile_base, tile_rows,
+            request_offset + tile_base, tile_rows,
         )
 
         # Serial query-wave completion.
@@ -518,7 +522,7 @@ def _hca_streaming_attn_tile(
                 stream_state_m, stream_state_l, stream_heads,
                 cmp_partial_m, cmp_partial_l, cmp_partial_o,
                 rope_cos_il, rope_sin_signed,
-                wave_completion, tile_base, dense_query_base,
+                wave_completion, request_offset, tile_base, dense_query_base,
             )
 
         heads_complete_tid = pl.system.task_dummy(deps=[wave_completion[0]])
@@ -528,7 +532,7 @@ def _hca_streaming_attn_tile(
             o_packed_heads,
             wo_a, wo_b, wo_b_scale,
             attn_out,
-            tile_base, tile_rows,
+            request_offset + tile_base, tile_rows,
             heads_complete_tid, o_proj_weight_dep,
         )
         tile_completion[0] = act_tid
@@ -540,7 +544,8 @@ def _sparse_attn_wave(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -584,13 +589,15 @@ def _sparse_attn_wave(
             gather_t = query_base + gather_local_t
             if gather_t < t_dim:
                 if gather_t < active_rows:
+                    request_id = pl.read(local_request_ids, [gather_t])
                     block_base = gather_local_t * PREFILL_SPARSE_PAD
                     stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                        gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
-                        if gather_raw >= 0:
-                            src = pl.cast(gather_raw, pl.INDEX)
-                            stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
+                    if request_id >= 0:
+                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                            gather_raw = pl.read(swa_indices, [gather_t, gather_ki])
+                            if gather_raw >= 0:
+                                src = pl.cast(gather_raw, pl.INDEX)
+                                stage[gather_ki : gather_ki + 1, :] = ori_kv_flat[src : src + 1, :]
                     sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     with pl.spmd(
@@ -609,10 +616,11 @@ def _sparse_attn_wave(
             gather_t = query_base + gather_local_t
             if gather_t < t_dim:
                 if gather_t < active_rows:
+                    request_id = pl.read(local_request_ids, [gather_t])
                     gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                    if gather_block_valid > 0:
-                        block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
-                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    block_base = gather_local_t * PREFILL_SPARSE_PAD + gather_k0
+                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    if request_id >= 0 and gather_block_valid > 0:
                         for gather_ki in pl.range(PREFILL_ATTN_TILE):
                             gather_cmp_k = gather_k0 + gather_ki - WIN
                             if gather_cmp_k < IDX_TOPK:
@@ -620,10 +628,12 @@ def _sparse_attn_wave(
                                 if gather_raw >= 0:
                                     cmp_slot = gather_raw
                                     blk_slot = cmp_slot // BLOCK_SIZE
-                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
-                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                    stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
-                        sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
+                                    blk_raw = pl.read(cmp_block_table, [request_id, blk_slot])
+                                    if blk_raw >= 0 and blk_raw < cmp_block_num:
+                                        blk = pl.cast(blk_raw, pl.INDEX)
+                                        src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
+                                        stage[gather_ki : gather_ki + 1, :] = cmp_kv_flat[src : src + 1, :]
+                    sparse_kv[block_base : block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Keep the existing 16-row vectorized bias path inside each query wave.
     with pl.spmd(
@@ -832,7 +842,8 @@ def _sparse_attn_heads(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -885,6 +896,7 @@ def _sparse_attn_heads(
                     swa_indices,
                     cmp_kv,
                     cmp_block_table,
+                    local_request_ids,
                     cmp_indices,
                     valid_block_mask,
                     attn_sink,
@@ -1091,9 +1103,10 @@ def hca_streaming_attn_physical(
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     cache_ready_dep: pl.Scalar[pl.TASK_ID],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    request_offset: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
 ):
     """Run ratio-128 attention over streamed history."""
-    active_rows = pl.tensor.dim(q, 0)
     tile_completion = pl.array.create(1, pl.TASK_ID)
     tile_completion[0] = cache_ready_dep
     for tile_base in pl.range(0, active_rows, T_PAD):
@@ -1113,7 +1126,7 @@ def hca_streaming_attn_physical(
             _hca_streaming_attn_tile(
                 q, ori_kv, swa_indices,
                 cmp_kv, cmp_block_table,
-                position_ids, attn_sink, active_rows,
+                position_ids, attn_sink, request_offset, active_rows,
                 freqs_cos, freqs_sin,
                 wo_a, wo_b, wo_b_scale,
                 attn_out,
@@ -1121,10 +1134,12 @@ def hca_streaming_attn_physical(
                 tile_completion, tile_base, tile_rows,
             )
     # Publish final o-proj completion outside the manual tile scope.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_publish", deps=[tile_completion[0]]):
-        completion_anchor = pl.read(attn_out, [0, 0])
-        pl.write(attn_out, [0, 0], completion_anchor)
-    return attn_out
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_publish", deps=[tile_completion[0]]
+    ) as publish_tid:
+        completion_anchor = pl.read(attn_out, [request_offset, 0])
+        pl.write(attn_out, [request_offset, 0], completion_anchor)
+    return publish_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1133,7 +1148,8 @@ def sparse_attn_compute(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -1166,6 +1182,7 @@ def sparse_attn_compute(
                 swa_indices,
                 cmp_kv,
                 cmp_block_table,
+                local_request_ids,
                 cmp_indices,
                 valid_block_mask,
                 attn_sink,
@@ -1197,7 +1214,8 @@ def sparse_attn_physical(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -1217,6 +1235,7 @@ def sparse_attn_physical(
         swa_indices,
         cmp_kv,
         cmp_block_table,
+        local_request_ids,
         cmp_indices,
         valid_block_mask,
         attn_sink,
@@ -1237,7 +1256,8 @@ def prefill_sparse_attn_test(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[REQUESTS_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -1250,9 +1270,11 @@ def prefill_sparse_attn_test(
 ):
     ori_kv.bind_dynamic(0, ORI_BLOCK_NUM_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_block_table.bind_dynamic(0, REQUESTS_DYN)
     q.bind_dynamic(0, T_DYN)
     swa_indices.bind_dynamic(0, T_DYN)
     cmp_indices.bind_dynamic(0, T_DYN)
+    local_request_ids.bind_dynamic(0, T_DYN)
     valid_block_mask.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(0, T_DYN)
     freqs_sin.bind_dynamic(0, T_DYN)
@@ -1264,6 +1286,7 @@ def prefill_sparse_attn_test(
         swa_indices,
         cmp_kv,
         cmp_block_table,
+        local_request_ids,
         cmp_indices,
         valid_block_mask,
         attn_sink,
@@ -1286,6 +1309,7 @@ def golden_prefill_sparse_attn(tensors):
     ori_kv = tensors["ori_kv"].float()
     cmp_kv = tensors["cmp_kv"].float()
     cmp_block_table = tensors["cmp_block_table"]
+    local_request_ids = tensors["local_request_ids"]
     swa_indices = tensors["swa_indices"]
     cmp_indices = tensors["cmp_indices"]
     attn_sink = tensors["attn_sink"].float()
@@ -1297,6 +1321,9 @@ def golden_prefill_sparse_attn(tensors):
 
     o = torch.zeros(token_count, H, HEAD_DIM)
     for t in range(token_count):
+        request_id = int(local_request_ids[t].item())
+        if request_id < 0:
+            continue
         gathered = []
         for row_i in swa_indices[t].tolist():
             row = int(row_i)
@@ -1307,7 +1334,7 @@ def golden_prefill_sparse_attn(tensors):
             cmp_slot = int(raw_i)
             if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
                 continue
-            block_id = int(cmp_block_table[cmp_slot // BLOCK_SIZE].item())
+            block_id = int(cmp_block_table[request_id, cmp_slot // BLOCK_SIZE].item())
             intra = cmp_slot % BLOCK_SIZE
             if block_id >= 0:
                 gathered.append(cmp_kv[block_id, intra, 0])
@@ -1414,10 +1441,13 @@ def build_tensor_specs(
         return ((torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
 
     def init_cmp_block_table():
-        table = torch.zeros(CMP_MAX_BLOCKS, dtype=torch.int32)
+        table = torch.zeros(1, CMP_MAX_BLOCKS, dtype=torch.int32)
         for blk in range(CMP_MAX_BLOCKS):
-            table[blk] = blk % cmp_block_num
+            table[0, blk] = blk % cmp_block_num
         return table
+
+    def init_local_request_ids():
+        return torch.zeros(token_count, dtype=torch.int32)
 
     def init_swa_indices():
         idx = torch.full((token_count, WIN), -1, dtype=torch.int32)
@@ -1484,7 +1514,8 @@ def build_tensor_specs(
         TensorSpec(
             "cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv
         ),
-        TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("cmp_block_table", [1, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec("cmp_indices", [token_count, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
         TensorSpec(
             "valid_block_mask",
