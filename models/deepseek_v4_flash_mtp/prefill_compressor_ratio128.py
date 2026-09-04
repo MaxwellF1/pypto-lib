@@ -301,7 +301,9 @@ def golden_prefill_compressor_ratio128(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
-    cmp_kv_flat = tensors["cmp_kv"].view(HCA_CMP_BLOCK_NUM * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM)
+    # Flatten whatever cache the caller passed: the CP path hands in a
+    # single leaf block, not this module's full-size cache.
+    cmp_kv_flat = tensors["cmp_kv"].reshape(-1, HEAD_DIM)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
