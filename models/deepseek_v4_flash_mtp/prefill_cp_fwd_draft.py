@@ -738,7 +738,8 @@ def prefill_cp_fwd(
         [LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32
     ],
     # Shared compressed-KV block table (HCA and CSA compact both index it).
-    cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
     # --- Communication windows ------------------------------------------
     # Domain 1: shared tail exchange (SWA + CSA + HCA reuse one bank under
     # monotonic tail_comm_epoch). The dual-tail exchange also needs a
@@ -1224,7 +1225,7 @@ def prefill_cp_fwd(
                 main_state_workspace1, inner_state_workspace1,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                kv_cache_csa, cmp_kv_csa, cmp_block_table,
+                kv_cache_csa, cmp_kv_csa, csa_cmp_block_table,
                 idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
                 segment_starts_t, segment_lengths_t,
                 segment_active_lengths, owner_segments_t, predecessor_segments,
@@ -1344,7 +1345,7 @@ def prefill_cp_fwd(
                 freqs_cos, freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
-                kv_cache_hca, cmp_kv_hca, cmp_block_table,
+                kv_cache_hca, cmp_kv_hca, hca_cmp_block_table,
                 segment_starts_t, segment_active_lengths, owner_segments_t,
                 predecessor_segments,
                 query_position_ids, query_token_to_request,
@@ -1497,7 +1498,7 @@ def prefill_cp_fwd(
                 main_state_workspace1, inner_state_workspace1,
                 csa_compress_state_final, csa_compress_state_block_table,
                 csa_inner_compress_state_final, csa_inner_compress_state_block_table,
-                kv_cache_final, cmp_kv_final, cmp_block_table,
+                kv_cache_final, cmp_kv_final, csa_cmp_block_table,
                 idx_kv_cache_final, idx_kv_scale_final, idx_block_table,
                 segment_starts_t, segment_lengths_t,
                 segment_active_lengths, owner_segments_t, predecessor_segments,
@@ -1905,7 +1906,8 @@ def l3_prefill_cp_fwd(
     leaf_num_tokens_input: pl.Tensor[
         [CP_SIZE, LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
     # MoE weights (layer-stacked, rank-sliced at launch).
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
@@ -2294,7 +2296,7 @@ def l3_prefill_cp_fwd(
             leaf_positions_input[rank], leaf_main_slots_input[rank],
             leaf_idx_slots_input[rank], leaf_main_state_slots_input[rank],
             leaf_inner_state_slots_input[rank], leaf_num_tokens_input[rank],
-            cmp_block_table[rank],
+            hca_cmp_block_table[rank], csa_cmp_block_table[rank],
             # Communication windows.
             hidden_tail_window, tail_ready, tail_consumed,
             cmp_window, cmp_meta_window, state_window, state_meta_window,
@@ -2551,7 +2553,8 @@ FWD_HOST_ARG_ORDER = (
     "leaf_idx_slots_input", "leaf_main_state_slots_input",
     "leaf_inner_state_slots_input", "leaf_num_tokens_input",
     # shared cmp block table (HCA and CSA compact both index it).
-    "cmp_block_table",
+    "hca_cmp_block_table",
+    "csa_cmp_block_table",
     # MoE weights (layer-stacked, FWD_NUM_LAYERS; rank-sliced at launch).
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid", "input_ids",
@@ -2929,7 +2932,14 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         specs_by_name[name] = csa_by_name[name]
 
     # Shared compressed-KV block table (HCA and CSA compact both index it).
-    specs_by_name["cmp_block_table"] = hca_by_name["cmp_block_table"]
+    # HCA pages one compressed row per block, CSA pages 32: the slot ->
+    # block mapping differs, so each flavour needs its own table.
+    specs_by_name["hca_cmp_block_table"] = _rename_spec(
+        hca_by_name["cmp_block_table"], "hca_cmp_block_table"
+    )
+    specs_by_name["csa_cmp_block_table"] = _rename_spec(
+        csa_by_name["cmp_block_table"], "csa_cmp_block_table"
+    )
 
     # MoE weights: layer-stack the single-layer base (rank-leading).
     moe_specs = build_moe_tensor_specs(layer_id=0, num_tokens=MOE_ROWS)
