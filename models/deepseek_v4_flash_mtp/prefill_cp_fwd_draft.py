@@ -568,7 +568,7 @@ def prefill_cp_fwd(
     hca_cmp_kv: pl.InOut[
         pl.Tensor[
             [
-                FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+                HCA_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
                 HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM,
             ],
             pl.BF16,
@@ -577,7 +577,7 @@ def prefill_cp_fwd(
     csa_cmp_kv: pl.InOut[
         pl.Tensor[
             [
-                FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+                CSA_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
                 CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM,
             ],
             pl.BF16,
@@ -1166,7 +1166,7 @@ def prefill_cp_fwd(
             [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
             csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-            [csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
+            [pair_i * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
         hc_attn_scale_csa: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [csa_layer * 3])
@@ -1309,7 +1309,7 @@ def prefill_cp_fwd(
             [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
             hca_cmp_kv, [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-            [hca_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
+            [pair_i * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -1440,7 +1440,7 @@ def prefill_cp_fwd(
             [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
             csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-            [final_csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
+            [(CSA_NUM_LAYERS - 1) * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_final: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [final_csa_layer * MIX_HC, 0])
         hc_attn_scale_final: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [final_csa_layer * 3])
@@ -1713,14 +1713,14 @@ def l3_prefill_cp_fwd(
     # pool per compression ratio -- see the per-rank entry above.
     hca_cmp_kv: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+            [CP_SIZE, HCA_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
              HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             pl.BF16,
         ]
     ],
     csa_cmp_kv: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+            [CP_SIZE, CSA_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
              CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             pl.BF16,
         ]
@@ -2804,9 +2804,9 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     # One pool per compression ratio: a cache block holds BLOCK_SIZE / ratio
     # rows, so HCA (128:1) and CSA (4:1) pages differ and cannot share a
     # tensor. Seeded from each flavour's own single-layer module spec.
-    def _cmp_pool(page_rows, donor_spec):
+    def _cmp_pool(num_layers, page_rows, donor_spec):
         shape = [
-            cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+            cp_size, num_layers * PREFILL_CMP_BLOCK_NUM,
             page_rows, 1, HEAD_DIM,
         ]
 
@@ -2819,14 +2819,14 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         return shape, init_pool
 
     hca_cmp_shape, init_hca_cmp = _cmp_pool(
-        HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"]
+        HCA_NUM_LAYERS, HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"]
     )
     specs_by_name["hca_cmp_kv"] = TensorSpec(
         "hca_cmp_kv", hca_cmp_shape,
         torch.bfloat16, init_value=init_hca_cmp,
     )
     csa_cmp_shape, init_csa_cmp = _cmp_pool(
-        CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"]
+        CSA_NUM_LAYERS, CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"]
     )
     specs_by_name["csa_cmp_kv"] = TensorSpec(
         "csa_cmp_kv", csa_cmp_shape,
