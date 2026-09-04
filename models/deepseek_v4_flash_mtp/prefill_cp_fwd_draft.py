@@ -466,11 +466,9 @@ def _fwd_moe_tail(
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_x_target: pld.DistributedTensor[[COMPACT_TOTAL_CAP, D], pl.INT8],
     compact_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_x_recv_counts: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_scale_target: pld.DistributedTensor[
         [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], pl.FP32
     ],
-    compact_scale_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_reverse_target: pld.DistributedTensor[
         [COMPACT_TOTAL_CAP, D], pl.BF16
     ],
@@ -509,8 +507,8 @@ def _fwd_moe_tail(
         moe_grouped_x, moe_grouped_scale, moe_grouped_y,
         moe_dense_y, moe_returned_y,
         count_target, count_signal,
-        compact_x_target, compact_x_signal, compact_x_recv_counts,
-        compact_scale_target, compact_scale_signal,
+        compact_x_target, compact_x_signal,
+        compact_scale_target,
         compact_reverse_target, compact_reverse_signal,
         attention_done_tid, layer_id,
         pl.cast(layer_id + 1, pl.INT32),
@@ -850,11 +848,9 @@ def prefill_cp_fwd(
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_x_target: pld.DistributedTensor[[COMPACT_TOTAL_CAP, D], pl.INT8],
     compact_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_x_recv_counts: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_scale_target: pld.DistributedTensor[
         [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], pl.FP32
     ],
-    compact_scale_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     compact_reverse_target: pld.DistributedTensor[
         [COMPACT_TOTAL_CAP, D], pl.BF16
     ],
@@ -993,8 +989,8 @@ def prefill_cp_fwd(
             moe_grouped_x, moe_grouped_scale, moe_grouped_y,
             moe_dense_y, moe_returned_y,
             count_target, count_signal,
-            compact_x_target, compact_x_signal, compact_x_recv_counts,
-            compact_scale_target, compact_scale_signal,
+            compact_x_target, compact_x_signal,
+            compact_scale_target,
             compact_reverse_target, compact_reverse_signal,
             hidden_a, completion_anchor_l0,
             attention_done_l0,
@@ -1113,8 +1109,8 @@ def prefill_cp_fwd(
             moe_grouped_x, moe_grouped_scale, moe_grouped_y,
             moe_dense_y, moe_returned_y,
             count_target, count_signal,
-            compact_x_target, compact_x_signal, compact_x_recv_counts,
-            compact_scale_target, compact_scale_signal,
+            compact_x_target, compact_x_signal,
+            compact_scale_target,
             compact_reverse_target, compact_reverse_signal,
             hidden_b, completion_anchor_l1,
             attention_done_l1,
@@ -1288,8 +1284,8 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal, compact_x_recv_counts,
-                compact_scale_target, compact_scale_signal,
+                compact_x_target, compact_x_signal,
+                compact_scale_target,
                 compact_reverse_target, compact_reverse_signal,
                 hidden_a, completion_anchor_csa,
                 attention_done_csa,
@@ -1403,8 +1399,8 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal, compact_x_recv_counts,
-                compact_scale_target, compact_scale_signal,
+                compact_x_target, compact_x_signal,
+                compact_scale_target,
                 compact_reverse_target, compact_reverse_signal,
                 hidden_b, completion_anchor_hca,
                 attention_done_hca,
@@ -1563,8 +1559,8 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal, compact_x_recv_counts,
-                compact_scale_target, compact_scale_signal,
+                compact_x_target, compact_x_signal,
+                compact_scale_target,
                 compact_reverse_target, compact_reverse_signal,
                 hidden_a, completion_anchor_final_csa,
                 attention_done_final_csa,
@@ -1591,9 +1587,9 @@ def prefill_cp_fwd(
     # stage selects and CP-broadcasts the global-final row before LM head.
     # Both pl.Out tensors are written in place.
     with pl.scope():
-        # Attention domains use request-retained monotonic epochs; compact MoE
-        # collective signals self-clear in all_to_all_v. Fence the final MoE
-        # completion and restore only the six attention signal banks.
+        # Every domain now uses request-retained monotonic epochs over a
+        # hand-written transport, so no bank self-clears. Fence the final MoE
+        # completion and restore all of them together.
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="prefill_cp_fwd_signal_clear",
@@ -1607,9 +1603,13 @@ def prefill_cp_fwd(
                 pl.write(hca_compact_consumed, [src, 0], zero)
                 pl.write(csa_compact_ready, [src, 0], zero)
                 pl.write(csa_compact_consumed, [src, 0], zero)
-            # The MoE reverse exchange runs a per-layer monotonic epoch, so its
-            # window restarts from zero with the attention banks.
+            # The MoE dispatch and reverse exchanges run a per-layer monotonic
+            # epoch, so their windows restart from zero with the attention
+            # banks. count/x carry the dispatch credits; the scale rail shares
+            # the x bank.
             for src in pl.range(N_RANKS):
+                pl.write(count_signal, [src, 0], zero)
+                pl.write(compact_x_signal, [src, 0], zero)
                 pl.write(compact_reverse_signal, [src, 0], zero)
 
         tile_blocks = (ATTN_TILE_ROWS // COPY_TOKEN_TILE) * HC_MULT
@@ -2041,14 +2041,8 @@ def l3_prefill_cp_fwd(
     compact_x_signal_buf = pld.alloc_window_buffer(
         [N_RANKS, 1], dtype=pl.INT32
     )
-    compact_x_recv_counts_buf = pld.alloc_window_buffer(
-        [N_RANKS, 1], dtype=pl.INT32
-    )
     compact_scale_target_buf = pld.alloc_window_buffer(
         [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], dtype=pl.FP32
-    )
-    compact_scale_signal_buf = pld.alloc_window_buffer(
-        [N_RANKS, 1], dtype=pl.INT32
     )
     compact_reverse_target_buf = pld.alloc_window_buffer(
         [COMPACT_TOTAL_CAP, D], dtype=pl.BF16
@@ -2180,16 +2174,10 @@ def l3_prefill_cp_fwd(
         compact_x_signal = pld.window(
             compact_x_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
-        compact_x_recv_counts = pld.window(
-            compact_x_recv_counts_buf, [N_RANKS, 1], dtype=pl.INT32
-        )
         compact_scale_target = pld.window(
             compact_scale_target_buf,
             [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD],
             dtype=pl.FP32,
-        )
-        compact_scale_signal = pld.window(
-            compact_scale_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
         compact_reverse_target = pld.window(
             compact_reverse_target_buf, [COMPACT_TOTAL_CAP, D], dtype=pl.BF16
@@ -2326,8 +2314,8 @@ def l3_prefill_cp_fwd(
             moe_grouped_y[rank], moe_dense_y[rank], moe_returned_y[rank],
             # Compact MoE comm windows.
             count_target, count_signal,
-            compact_x_target, compact_x_signal, compact_x_recv_counts,
-            compact_scale_target, compact_scale_signal,
+            compact_x_target, compact_x_signal,
+            compact_scale_target,
             compact_reverse_target, compact_reverse_signal,
             # Phase 3 final-tail weights (rank-sliced).
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank],
