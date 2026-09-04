@@ -150,6 +150,7 @@ from prefill_cp_zigzag import (
 # calls the cores directly (never @pl.jit children); the constants are used
 # only for static child-side shape annotations and typed pl.slice offsets.
 from prefill_cp_hca_draft import (
+    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_SIZE,
@@ -178,7 +179,6 @@ from prefill_cp_csa_draft import (
     prefill_cp_csa_core,
 )
 from config import (
-    BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,
     IDX_CACHE_MAX_BLOCKS,
@@ -563,9 +563,23 @@ def prefill_cp_fwd(
     ],
     # Compressed KV cache: FWD_NUM_LAYERS per-layer pools (every attention
     # layer owns a compressed-KV slice); sliced by the global layer index.
-    cmp_kv: pl.InOut[
+    # HCA and CSA compress at different ratios, so their cache blocks hold a
+    # different number of rows (BLOCK_SIZE / ratio) and cannot share one pool.
+    hca_cmp_kv: pl.InOut[
         pl.Tensor[
-            [FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [
+                FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+                HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM,
+            ],
+            pl.BF16,
+        ]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [
+                FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+                CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM,
+            ],
             pl.BF16,
         ]
     ],
@@ -1149,9 +1163,9 @@ def prefill_cp_fwd(
             [csa_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_csa: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -1292,9 +1306,9 @@ def prefill_cp_fwd(
             [hca_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_hca: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            hca_cmp_kv, [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [hca_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -1423,9 +1437,9 @@ def prefill_cp_fwd(
             [final_csa_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_final: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [final_csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_final: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [final_csa_layer * MIX_HC, 0])
@@ -1695,10 +1709,19 @@ def l3_prefill_cp_fwd(
             pl.BF16,
         ]
     ],
-    # Compressed KV cache: FWD_NUM_LAYERS per-layer pools (rank-leading).
-    cmp_kv: pl.InOut[
+    # Compressed KV cache: FWD_NUM_LAYERS per-layer pools (rank-leading), one
+    # pool per compression ratio -- see the per-rank entry above.
+    hca_cmp_kv: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             pl.BF16,
         ]
     ],
@@ -2236,7 +2259,7 @@ def l3_prefill_cp_fwd(
             wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank],
             gamma_cq[rank], gamma_ckv[rank],
             freqs_cos[rank], freqs_sin[rank],
-            kv_cache[rank], cmp_kv[rank],
+            kv_cache[rank], hca_cmp_kv[rank], csa_cmp_kv[rank],
             attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
             segment_starts_t, predecessor_segments[rank],
             query_position_ids[rank], query_token_to_request[rank],
@@ -2459,7 +2482,7 @@ _RESIDENT_STATIC_NAMES = frozenset(
 )
 _RESIDENT_STATE_NAMES = frozenset(
     {
-        "kv_cache", "cmp_kv", "hca_compress_state",
+        "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "hca_compress_state",
         "csa_compress_state", "csa_inner_compress_state",
         "idx_kv_cache", "idx_kv_scale",
     }
@@ -2496,7 +2519,7 @@ FWD_HOST_ARG_ORDER = (
     # common attention weights (layer-stacked, FWD_NUM_LAYERS).
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "freqs_cos", "freqs_sin", "kv_cache", "cmp_kv",
+    "freqs_cos", "freqs_sin", "kv_cache", "hca_cmp_kv", "csa_cmp_kv",
     "attn_sink", "wo_a", "wo_b", "wo_b_scale",
     # shared CP metadata (one copy).
     "segment_starts_t", "predecessor_segments",
@@ -2778,21 +2801,36 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     # cmp_kv: compressed KV cache, FWD_NUM_LAYERS per-layer pools (every
     # attention layer owns a compressed-KV slice). Stacked on the per-rank
     # block axis the same way as kv_cache. Mirrors baseline prefill_fwd.py.
-    cmp_kv_shape = [
-        cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
-        BLOCK_SIZE, 1, HEAD_DIM,
-    ]
+    # One pool per compression ratio: a cache block holds BLOCK_SIZE / ratio
+    # rows, so HCA (128:1) and CSA (4:1) pages differ and cannot share a
+    # tensor. Seeded from each flavour's own single-layer module spec.
+    def _cmp_pool(page_rows, donor_spec):
+        shape = [
+            cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+            page_rows, 1, HEAD_DIM,
+        ]
 
-    def init_cmp_kv_fwd():
-        base_cmp_kv = hca_by_name["cmp_kv"].create_tensor()
-        cmp_kv_fwd = torch.zeros(cmp_kv_shape, dtype=torch.bfloat16)
-        cmp_kv_fwd[:, :PREFILL_CMP_BLOCK_NUM, :, :, :] = base_cmp_kv
-        return cmp_kv_fwd
+        def init_pool():
+            base = donor_spec.create_tensor()
+            pool = torch.zeros(shape, dtype=torch.bfloat16)
+            pool[:, :PREFILL_CMP_BLOCK_NUM, :, :, :] = base
+            return pool
 
-    specs_by_name["cmp_kv"] = TensorSpec(
-        "cmp_kv",
-        cmp_kv_shape,
-        torch.bfloat16, init_value=init_cmp_kv_fwd, 
+        return shape, init_pool
+
+    hca_cmp_shape, init_hca_cmp = _cmp_pool(
+        HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"]
+    )
+    specs_by_name["hca_cmp_kv"] = TensorSpec(
+        "hca_cmp_kv", hca_cmp_shape,
+        torch.bfloat16, init_value=init_hca_cmp,
+    )
+    csa_cmp_shape, init_csa_cmp = _cmp_pool(
+        CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"]
+    )
+    specs_by_name["csa_cmp_kv"] = TensorSpec(
+        "csa_cmp_kv", csa_cmp_shape,
+        torch.bfloat16, init_value=init_csa_cmp,
     )
 
     # --- HCA type-specific (layers 3 and 5) --------------------------------
@@ -3358,7 +3396,7 @@ def _check_logits(actual, _expected, *, inputs, **_kwargs):
 # compare_fn is built before compilation, and a spec learns its direction only
 # once the harness stamps it from the compiled artifact.
 _OUTPUT_NAMES = (
-    "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
+    "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "idx_kv_cache", "idx_kv_scale",
     "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
     "effective_x_workspace",
     "moe_x_mixed", "moe_post_ffn", "moe_comb_ffn", "moe_ffn_out",
