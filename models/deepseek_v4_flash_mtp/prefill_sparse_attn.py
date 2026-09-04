@@ -127,8 +127,16 @@ STAGED_SWA_PB_DSLABS = D // STAGED_SWA_PROJ_B_D_TILE
 
 # Ratio-128 native HCA attention.  Each CP segment exposes one temporary
 # physical raw cache containing predecessor128 + current512, and compressed
-# history is consumed directly from the canonical BLOCK_SIZE-row cache page.
+# history is read from the paged compressed cache.
 HCA_COMPRESS_RATIO = 128
+# A compressed cache block holds BLOCK_SIZE / ratio rows, because the block
+# table is indexed by the same logical page as the raw KV cache and a page
+# spans BLOCK_SIZE tokens. The two sparse flavours compress at different
+# ratios, so they page differently -- same definition prefill_hca /
+# prefill_csa / decode_sparse_attn_* use.
+CSA_COMPRESS_RATIO = 4
+HCA_CMP_PAGE_ROWS = BLOCK_SIZE // HCA_COMPRESS_RATIO  # 1 row per page
+CSA_CMP_PAGE_ROWS = BLOCK_SIZE // CSA_COMPRESS_RATIO  # 32 rows per page
 HCA_FULL_CACHE_BLOCKS = 1 + STAGED_SWA_ROWS // BLOCK_SIZE
 HCA_FULL_CACHE_ROWS = HCA_FULL_CACHE_BLOCKS * BLOCK_SIZE
 # The DSpark 1M-prefix donor uses 8 rows because its compressed work count can
@@ -140,10 +148,9 @@ HCA_ATTN_TILE = 128
 HCA_MAX_COMPRESSED_ROWS = (
     M.max_position_embeddings + HCA_COMPRESS_RATIO - 1
 ) // HCA_COMPRESS_RATIO
-HCA_CMP_PAGES_PER_WORK = HCA_ATTN_TILE // BLOCK_SIZE
 HCA_CMP_TABLE_BLOCKS = (
-    HCA_MAX_COMPRESSED_ROWS + BLOCK_SIZE - 1
-) // BLOCK_SIZE
+    HCA_MAX_COMPRESSED_ROWS + HCA_CMP_PAGE_ROWS - 1
+) // HCA_CMP_PAGE_ROWS
 HCA_CMP_WORK_COUNT = (
     HCA_MAX_COMPRESSED_ROWS + HCA_ATTN_TILE - 1
 ) // HCA_ATTN_TILE
@@ -166,7 +173,7 @@ assert STAGED_SWA_ROWS % QUANT_TOKEN_TILE == 0
 assert STAGED_SWA_ROWS % PROJ_B_ACT_TASK_T_TILE == 0
 assert HCA_FULL_CACHE_ROWS == STAGED_SWA_ROWS + WIN
 assert HCA_ATTN_TILE % BLOCK_SIZE == 0
-assert HCA_CMP_TABLE_BLOCKS == HCA_CMP_WORK_COUNT * HCA_CMP_PAGES_PER_WORK
+assert HCA_ATTN_TILE % HCA_CMP_PAGE_ROWS == 0
 
 @pl.jit.inline
 def sparse_attn_math(
@@ -876,7 +883,7 @@ def _physical_sparse_wave(
     ],
     swa_indices: pl.Tensor[[STAGED_SWA_ROWS, WIN], pl.INT32],
     cmp_kv: pl.Tensor[
-        [CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        [CMP_BLOCK_NUM_DYN, CSA_CMP_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
     ],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[STAGED_SWA_ROWS, IDX_TOPK], pl.INT32],
@@ -918,7 +925,7 @@ def _physical_sparse_wave(
     )
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(
-        cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM]
+        cmp_kv, [cmp_block_num * CSA_CMP_PAGE_ROWS, HEAD_DIM]
     )
     o_packed = pl.reshape(
         o_packed_heads, [O_GROUPS * STAGED_SWA_ROWS, O_GROUP_IN]
@@ -1004,7 +1011,7 @@ def _physical_sparse_wave(
                                 cmp_indices, [gather_t, gather_cmp_k]
                             )
                             if logical_slot >= 0:
-                                logical_block = logical_slot // BLOCK_SIZE
+                                logical_block = logical_slot // CSA_CMP_PAGE_ROWS
                                 if logical_block < CMP_MAX_BLOCKS:
                                     physical_block = pl.read(
                                         cmp_block_table, [logical_block]
@@ -1015,8 +1022,8 @@ def _physical_sparse_wave(
                                             pl.cast(
                                                 physical_block, pl.INDEX
                                             )
-                                            * BLOCK_SIZE
-                                            + logical_slot % BLOCK_SIZE
+                                            * CSA_CMP_PAGE_ROWS
+                                            + logical_slot % CSA_CMP_PAGE_ROWS
                                         )
                                         stage[
                                             gather_ki : gather_ki + 1,
@@ -1325,7 +1332,7 @@ def _physical_sparse_heads_512(
     ],
     swa_indices: pl.Tensor[[STAGED_SWA_ROWS, WIN], pl.INT32],
     cmp_kv: pl.Tensor[
-        [CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        [CMP_BLOCK_NUM_DYN, CSA_CMP_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
     ],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[STAGED_SWA_ROWS, IDX_TOPK], pl.INT32],
@@ -2128,7 +2135,7 @@ def _hca_native_heads_512(
     ],
     predecessor_valid: pl.Scalar[pl.INDEX],
     cmp_kv: pl.Tensor[
-        [CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        [CMP_BLOCK_NUM_DYN, HCA_CMP_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
     ],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[STAGED_SWA_ROWS], pl.INT32],
@@ -2145,7 +2152,7 @@ def _hca_native_heads_512(
     """Gather one C128 cache page, then stream one 512-query wave."""
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_kv_flat = pl.reshape(
-        cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM]
+        cmp_kv, [cmp_block_num * HCA_CMP_PAGE_ROWS, HEAD_DIM]
     )
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = packed_init_tid
@@ -2204,47 +2211,63 @@ def _hca_native_heads_512(
             )
             if pl.cast(gather_work, pl.INT32) < gather_active_count_i32:
                 gather_dst0 = gather_work * HCA_ATTN_TILE
-                for gather_page in pl.unroll(HCA_CMP_PAGES_PER_WORK):
-                    gather_table_col = (
-                        gather_work * HCA_CMP_PAGES_PER_WORK
-                        + gather_page
+                # Clear the whole work tile once; the pages below fill only
+                # the slots their block-table entry resolves.
+                pl.store(
+                    pl.tile.full(
+                        [HCA_ATTN_TILE, HEAD_DIM],
+                        dtype=pl.BF16,
+                        value=0.0,
+                    ),
+                    [gather_dst0, 0],
+                    cmp_work_kv,
+                )
+                # cmp_block_table is indexed by compressed slot / page rows,
+                # the same mapping decode_sparse_attn_hca and the generic
+                # sparse_attn use. At ratio 128 a page is one row, so a
+                # 128-row work tile needs 128 lookups -- one contiguous
+                # BLOCK_SIZE-row read would silently require an identity
+                # table and walk off the end of the block it resolved.
+                for gather_page in pl.range(
+                    HCA_ATTN_TILE // HCA_CMP_PAGE_ROWS
+                ):
+                    gather_slot = (
+                        gather_work * HCA_ATTN_TILE
+                        + gather_page * HCA_CMP_PAGE_ROWS
                     )
-                    gather_local = gather_page * BLOCK_SIZE
-                    gather_dst = gather_dst0 + gather_local
-                    pl.store(
-                        pl.tile.full(
-                            [BLOCK_SIZE, HEAD_DIM],
-                            dtype=pl.BF16,
-                            value=0.0,
-                        ),
-                        [gather_dst, 0],
-                        cmp_work_kv,
-                    )
-                    gather_block_i32 = pl.read(
-                        cmp_block_table, [gather_table_col]
-                    )
-                    if gather_block_i32 >= 0:
-                        if gather_block_i32 < cmp_block_num:
-                            if gather_page == 0:
-                                pl.write(
-                                    cmp_work_valid,
-                                    [gather_work, 0],
-                                    pl.cast(1, pl.INT32),
+                    gather_table_col = gather_slot // HCA_CMP_PAGE_ROWS
+                    if gather_table_col < HCA_CMP_TABLE_BLOCKS:
+                        gather_block_i32 = pl.read(
+                            cmp_block_table, [gather_table_col]
+                        )
+                        if gather_block_i32 >= 0:
+                            if gather_block_i32 < cmp_block_num:
+                                if gather_page == 0:
+                                    pl.write(
+                                        cmp_work_valid,
+                                        [gather_work, 0],
+                                        pl.cast(1, pl.INT32),
+                                    )
+                                gather_block = pl.cast(
+                                    gather_block_i32, pl.INDEX
                                 )
-                            gather_block = pl.cast(
-                                gather_block_i32, pl.INDEX
-                            )
-                            gather_src = gather_block * BLOCK_SIZE
-                            gather_page_kv = pl.load(
-                                cmp_kv_flat,
-                                [gather_src, 0],
-                                [BLOCK_SIZE, HEAD_DIM],
-                            )
-                            pl.store(
-                                gather_page_kv,
-                                [gather_dst, 0],
-                                cmp_work_kv,
-                            )
+                                gather_src = (
+                                    gather_block * HCA_CMP_PAGE_ROWS
+                                )
+                                gather_page_kv = pl.load(
+                                    cmp_kv_flat,
+                                    [gather_src, 0],
+                                    [HCA_CMP_PAGE_ROWS, HEAD_DIM],
+                                )
+                                pl.store(
+                                    gather_page_kv,
+                                    [
+                                        gather_dst0
+                                        + gather_page * HCA_CMP_PAGE_ROWS,
+                                        0,
+                                    ],
+                                    cmp_work_kv,
+                                )
 
         rope_cos_il = pl.create_tensor(
             [STAGED_SWA_ROWS, ROPE_DIM],
@@ -2338,7 +2361,7 @@ def hca_streaming_attn_512(
     ],
     predecessor_valid: pl.Scalar[pl.INT32],
     cmp_kv: pl.Tensor[
-        [CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        [CMP_BLOCK_NUM_DYN, HCA_CMP_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
     ],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[STAGED_SWA_ROWS], pl.INT32],
@@ -2425,7 +2448,7 @@ def physical_sparse_attn_512(
     ],
     swa_indices: pl.Tensor[[STAGED_SWA_ROWS, WIN], pl.INT32],
     cmp_kv: pl.Tensor[
-        [CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+        [CMP_BLOCK_NUM_DYN, CSA_CMP_PAGE_ROWS, 1, HEAD_DIM], pl.BF16
     ],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[STAGED_SWA_ROWS, IDX_TOPK], pl.INT32],
