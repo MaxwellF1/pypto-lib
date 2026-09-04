@@ -16,6 +16,7 @@ from config import (
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,
     FLASH as M,
+    FP32_NEG_INF,
     HCA_STATE_PHYSICAL_BLOCKS,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_MAX_BLOCKS,
@@ -29,7 +30,6 @@ from lm_head import (
     lm_head,
 )
 from prefill_compressor_ratio128 import (
-    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_SIZE,
@@ -60,11 +60,25 @@ from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_SIZE,
 )
 from prefill_sparse_attn import (
+    BIAS_TOKEN_TILE,
+    PREFILL_ATTN_BLOCKS,
+    PREFILL_ATTN_TILE,
     PREFILL_SPARSE_PAD,
+    SPARSE_BIAS_COLS,
+    SPARSE_CMP_BIAS_COLS,
+    VALID_BLOCK_MASK_COLS,
 )
 
 CP_CMP_BLOCK_NUM_DYN = pl.dynamic("CP_CMP_BLOCK_NUM_DYN")
 CP_CMP_STORAGE_BLOCK_SIZE_DYN = pl.dynamic("CP_CMP_STORAGE_BLOCK_SIZE_DYN")
+
+# Rows per C128 compressed cache block on the CP path. CANN Recipes and the
+# PTOAS 0.60 DSpark donor page C128 compressed rows in full cache blocks, so
+# one logical block covers BLOCK_SIZE compressed rows (BLOCK_SIZE *
+# COMPRESS_RATIO source tokens). Serving pages one row per original-KV page --
+# prefill_compressor_ratio128.CMP_STORAGE_BLOCK_SIZE -- and the shared
+# compressor reads whichever the caller's tensor carries.
+HCA_CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE
 
 
 # model config
@@ -297,6 +311,103 @@ def prefill_cp_last_hidden_lm_head(
         done_epoch,
     )
     return logits
+
+
+@pl.jit.inline
+def _prefill_cp_dual_tail_exchange_wave(
+    local_hidden_tail: pl.Tensor[
+        [EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16
+    ],
+    local_kv_tail: pl.Tensor[
+        [EPOCHS * LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], pl.BF16
+    ],
+    reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    hidden_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, D], pl.BF16
+    ],
+    kv_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
+    ],
+    ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    logical_hidden_out: pl.Out[
+        pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]
+    ],
+    logical_kv_out: pl.Out[
+        pl.Tensor[
+            [EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
+        ]
+    ],
+    my_rank: pl.Scalar[pl.INT32],
+    payload_epoch: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]:
+    """Exchange hidden and KV tails with one barrier.
+
+    ``payload_epoch`` selects rows in the invocation-local payload/output
+    tensors; ``comm_epoch`` drives the shared cross-layer ready/consumed
+    counters (``consumed >= comm_epoch``, ``ready >= comm_epoch + 1``).
+    Splitting the two lets a multi-layer FWD pass a monotonic communication
+    epoch per global layer while keeping the local payload index at 0.
+    """
+    epoch_value = pl.cast(comm_epoch + 1, pl.INT32)
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.wait(
+                signal=consumed, offsets=[peer, 0],
+                expected=comm_epoch, cmp=pld.WaitCmp.Ge,
+            )
+
+    for peer in pl.range(CP_SIZE):
+        for part in pl.range(LOCAL_PARTS):
+            publish_pos = my_rank * LOCAL_PARTS + part
+            publish_dst_row = publish_pos * TAIL_ROWS
+            src_row_base = payload_epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS
+            pld.tensor.put(
+                dst=hidden_window, peer=peer, src=local_hidden_tail,
+                dst_offsets=[publish_dst_row, 0], src_offsets=[src_row_base, 0], shape=[TAIL_ROWS, D],
+                chunk_rows=ROW_TILE, chunk_cols=D, pipeline=True,
+            )
+            pld.tensor.put(
+                dst=kv_window, peer=peer, src=local_kv_tail,
+                dst_offsets=[publish_dst_row, 0], src_offsets=[src_row_base, 0], shape=[TAIL_ROWS, HEAD_DIM],
+                chunk_rows=ROW_TILE, chunk_cols=HEAD_DIM, pipeline=True,
+            )
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=ready, peer=peer, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+
+    for seg in pl.range(NUM_SEGMENTS):
+        gather_pos = reverse_index[seg]
+        owner = owner_rank_table[seg]
+        if owner != my_rank:
+            pld.system.wait(
+                signal=ready, offsets=[owner, 0],
+                expected=epoch_value, cmp=pld.WaitCmp.Ge,
+            )
+        gather_src_row = gather_pos * TAIL_ROWS
+        gather_dst_row = payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
+        for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
+            hidden_tile = hidden_window[gather_src_row + t0 : gather_src_row + t0 + ROW_TILE, 0:D]
+            kv_tile = kv_window[gather_src_row + t0 : gather_src_row + t0 + ROW_TILE, 0:HEAD_DIM]
+            logical_hidden_out[gather_dst_row + t0 : gather_dst_row + t0 + ROW_TILE, 0:D] = hidden_tile
+            logical_kv_out[gather_dst_row + t0 : gather_dst_row + t0 + ROW_TILE, 0:HEAD_DIM] = kv_tile
+
+    for peer in pl.range(CP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=consumed, peer=peer, offsets=[my_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+
+    # Return the logical hidden root.
+    return logical_hidden_out
 
 
 @pl.jit.inline
@@ -703,3 +814,175 @@ def _prefill_cp_csa_compact_finish_wave(
             )
 
 
+@pl.jit.inline
+def _prefill_cp_sparse_stage(
+    cache_flat: pl.Tensor[[ORI_CACHE_ROWS, HEAD_DIM], pl.BF16],
+    local_kv: pl.Tensor[[LOCAL_ROWS, HEAD_DIM], pl.BF16],
+    logical_tails: pl.Tensor[[CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[
+        [
+            CP_CMP_BLOCK_NUM_DYN,
+            CP_CMP_STORAGE_BLOCK_SIZE_DYN,
+            1,
+            HEAD_DIM,
+        ],
+        pl.BF16,
+    ],
+    cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_storage_block_size: pl.Scalar[pl.INT32],
+    query_positions: pl.Tensor[[LOCAL_ROWS], pl.INT32],
+    query_requests: pl.Tensor[[LOCAL_ROWS], pl.INT32],
+    overlay_positions: pl.Tensor[[NUM_LOCAL_TILES, OVERLAY_ROWS], pl.INT32],
+    overlay_requests: pl.Tensor[[NUM_LOCAL_TILES, OVERLAY_ROWS], pl.INT32],
+    predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
+    segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
+    swa_indices: pl.Tensor[[LOCAL_ROWS, WIN], pl.INT32],
+    cmp_indices: pl.Tensor[[LOCAL_ROWS, IDX_TOPK], pl.INT32],
+    sparse_kv: pl.Tensor[[LOCAL_SPARSE_ROWS, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[LOCAL_ROWS, PREFILL_SPARSE_PAD], pl.FP32],
+    valid_block_mask: pl.Tensor[[LOCAL_ROWS, VALID_BLOCK_MASK_COLS], pl.INT32],
+    overlay_active_lengths: pl.Tensor[[NUM_LOCAL_TILES, OVERLAY_SOURCES], pl.INT32],
+):
+    """Stage persistent, overlay, and compressed sparse sources."""
+    cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    prefix = pl.read(segment_starts_t, [0])
+    with pl.spmd(
+        (LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS,
+        name_hint="prefill_cp_gather_kv",
+    ) as gather_tid:
+        block = pl.tile.get_block_idx()
+        schedule = block // PREFILL_ATTN_BLOCKS
+        sparse_block = block - schedule * PREFILL_ATTN_BLOCKS
+        token_block = (LOCAL_ROWS // 2) - 1 - schedule
+        token0 = token_block * 2
+        key0 = sparse_block * PREFILL_ATTN_TILE
+        for token_delta in pl.range(2):
+            row = token0 + token_delta
+            if row < LOCAL_ROWS:
+                stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for key_delta in pl.range(PREFILL_ATTN_TILE):
+                    sparse_col = key0 + key_delta
+                    if sparse_col < WIN:
+                        raw = pl.read(swa_indices, [row, sparse_col])
+                        if raw >= 0:
+                            query_abs = pl.read(query_positions, [row])
+                            query_req = pl.read(query_requests, [row])
+                            key_abs = query_abs - WIN + 1 + sparse_col
+                            if raw < ORI_CACHE_ROWS:
+                                if key_abs < prefix:
+                                    if key_abs <= query_abs and query_req >= 0:
+                                        source = pl.cast(raw, pl.INDEX)
+                                        stage[key_delta:key_delta + 1, :] = cache_flat[
+                                            source:source + 1, :
+                                        ]
+                            elif raw < OVERLAY_BASE + OVERLAY_ROWS:
+                                tile = row // TAIL_ROWS
+                                overlay_row = raw - OVERLAY_BASE
+                                if overlay_row >= PRED_OVERLAY_ROWS:
+                                    source_kind = 1
+                                    source_row = overlay_row - PRED_OVERLAY_ROWS
+                                else:
+                                    source_kind = 0
+                                    source_row = overlay_row
+                                overlay_index = source_row
+                                if source_kind == 1:
+                                    overlay_index = PRED_OVERLAY_ROWS + source_row
+                                active = pl.read(overlay_active_lengths, [tile, source_kind])
+                                overlay_abs = pl.read(overlay_positions, [tile, overlay_index])
+                                overlay_req = pl.read(overlay_requests, [tile, overlay_index])
+                                if source_row >= 0 and source_row < active:
+                                    if overlay_abs == key_abs and overlay_abs <= query_abs:
+                                        if overlay_req == query_req and overlay_req >= 0:
+                                            if source_kind == 1:
+                                                source = tile * TAIL_ROWS + source_row
+                                                stage[key_delta:key_delta + 1, :] = local_kv[
+                                                    source:source + 1, :
+                                                ]
+                                            elif tile % MAX_SEGMENT_TILES == 0:
+                                                part = tile // MAX_SEGMENT_TILES
+                                                predecessor = pl.read(predecessor_segments, [part])
+                                                if predecessor >= 0:
+                                                    source = predecessor * TAIL_ROWS + source_row
+                                                    stage[key_delta:key_delta + 1, :] = logical_tails[
+                                                        source:source + 1, :
+                                                    ]
+                                            else:
+                                                source = (tile - 1) * TAIL_ROWS + source_row
+                                                stage[key_delta:key_delta + 1, :] = local_kv[
+                                                    source:source + 1, :
+                                                ]
+                    else:
+                        cmp_col = sparse_col - WIN
+                        if cmp_col < IDX_TOPK:
+                            logical_slot = pl.read(cmp_indices, [row, cmp_col])
+                            if logical_slot >= 0:
+                                logical_block = logical_slot // cmp_storage_block_size
+                                if logical_block < PREFILL_CMP_MAX_BLOCKS:
+                                    physical_block = pl.read(cmp_block_table, [logical_block])
+                                    # The Recipes temporary root reserves
+                                    # physical page 0 as the sentinel.
+                                    if physical_block > 0:
+                                        source_block = (
+                                            pl.cast(physical_block, pl.INDEX)
+                                            * cmp_storage_block_size
+                                        )
+                                        source_intra = pl.cast(
+                                            logical_slot % cmp_storage_block_size,
+                                            pl.INDEX,
+                                        )
+                                        source = source_block + source_intra
+                                        stage[key_delta:key_delta + 1, :] = cmp_kv_flat[
+                                            source:source + 1, :
+                                        ]
+                output_row = row * PREFILL_SPARSE_PAD + key0
+                sparse_kv[output_row:output_row + PREFILL_ATTN_TILE, :] = stage
+
+    with pl.spmd(
+        LOCAL_ROWS // BIAS_TOKEN_TILE,
+        name_hint="prefill_cp_build_bias",
+    ) as bias_tid:
+        bias_block = pl.tile.get_block_idx()
+        row0 = bias_block * BIAS_TOKEN_TILE
+        raw_idx = pl.cast(swa_indices[row0:row0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
+        raw_valid = pl.minimum(pl.maximum(pl.add(raw_idx, 1.0), 0.0), 1.0)
+        raw_bias = pl.sub(raw_valid, 1.0)
+        sparse_bias[row0:row0 + BIAS_TOKEN_TILE, 0:WIN] = pl.mul(raw_bias, -FP32_NEG_INF)
+        if SPARSE_CMP_BIAS_COLS > 0:
+            cmp_idx = pl.cast(cmp_indices[row0:row0 + BIAS_TOKEN_TILE, 0:SPARSE_CMP_BIAS_COLS], target_type=pl.FP32)
+            cmp_valid = pl.minimum(pl.maximum(pl.add(cmp_idx, 1.0), 0.0), 1.0)
+            cmp_bias = pl.sub(cmp_valid, 1.0)
+            sparse_bias[row0:row0 + BIAS_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = pl.mul(cmp_bias, -FP32_NEG_INF)
+        if SPARSE_BIAS_COLS < PREFILL_SPARSE_PAD:
+            sparse_bias[
+                row0:row0 + BIAS_TOKEN_TILE,
+                SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD,
+            ] = pl.full(
+                [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS],
+                dtype=pl.FP32,
+                value=FP32_NEG_INF,
+            )
+
+    with pl.spmd(
+        LOCAL_ROWS, name_hint="prefill_cp_build_valid_mask"
+    ) as mask_tid:
+        row = pl.tile.get_block_idx()
+        mask = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+        for sparse_block in pl.range(PREFILL_ATTN_BLOCKS):
+            block_valid = pl.cast(0, pl.INT32)
+            key0 = sparse_block * PREFILL_ATTN_TILE
+            for key_delta in pl.range(PREFILL_ATTN_TILE):
+                sparse_col = key0 + key_delta
+                raw = pl.cast(-1, pl.INT32)
+                if sparse_col < WIN:
+                    raw = pl.read(swa_indices, [row, sparse_col])
+                else:
+                    cmp_col = sparse_col - WIN
+                    if cmp_col < IDX_TOPK:
+                        raw = pl.read(cmp_indices, [row, cmp_col])
+                if raw >= 0:
+                    block_valid = pl.cast(1, pl.INT32)
+            pl.write(mask, [0, sparse_block], block_valid)
+        valid_block_mask[row:row + 1, 0:VALID_BLOCK_MASK_COLS] = mask
+
+    return pl.system.task_dummy(deps=[gather_tid, bias_tid, mask_tid])

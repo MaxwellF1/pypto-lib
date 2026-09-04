@@ -162,10 +162,6 @@ def gate(
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                     pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
         if N_EXPERTS < SCORE_PAD:
-            # Fill the pad columns a token tile at a time. One [T_PAD, pad]
-            # FP32 tile is 512 KiB at EP4 and 768 KiB at EP2 -- both over the
-            # 184 KiB Vec budget, so the whole-buffer form only compiles at
-            # EP8, where N_EXPERTS == SCORE_PAD makes this branch dead.
             for pad_block in pl.range(T_PAD // GATE_M_TILE):
                 pad_t0 = pad_block * GATE_M_TILE
                 biased_scores_buf[
