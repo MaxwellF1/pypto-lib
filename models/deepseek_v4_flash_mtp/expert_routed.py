@@ -14,7 +14,6 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 
 import pypto.language as pl
-import config
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
                     EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX)
@@ -30,9 +29,6 @@ SWIGLU_LIMIT = M.swiglu_limit
 
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
-PREFILL_MOE_WEIGHT_LAYERS = getattr(
-    config, "PREFILL_MOE_WEIGHT_LAYERS", 1
-)
 
 # tiling
 RECV_TILE = 16
@@ -77,20 +73,11 @@ def expert_routed(
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1: pl.Tensor[
-        [PREFILL_MOE_WEIGHT_LAYERS * N_LOCAL_EXPERTS, MOE_INTER, D],
-        pl.INT8,
-    ],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[
-        [PREFILL_MOE_WEIGHT_LAYERS * N_LOCAL_EXPERTS, MOE_INTER, D],
-        pl.INT8,
-    ],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[
-        [PREFILL_MOE_WEIGHT_LAYERS * N_LOCAL_EXPERTS, D, MOE_INTER],
-        pl.INT8,
-    ],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
