@@ -1472,6 +1472,9 @@ def prefill_cp_csa_core(
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
     ],
+    kv_tail_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
+    ],
     tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     main_window: pld.DistributedTensor[
@@ -3083,6 +3086,9 @@ def prefill_cp_csa_rank(
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
     ],
+    kv_tail_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
+    ],
     tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     main_window: pld.DistributedTensor[
@@ -3147,7 +3153,7 @@ def prefill_cp_csa_rank(
         segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests, overlay_positions, overlay_requests,
         overlay_active_lengths, swa_indices, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
         leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
-        tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
+        kv_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
         main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
         wo_b_scale, x_out, completion_token, my_rank,
         pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
@@ -3315,6 +3321,9 @@ def prefill_cp_csa_test(
     hidden_tail_buf = pld.alloc_window_buffer(
         [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
     )
+    kv_tail_buf = pld.alloc_window_buffer(
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
     tail_ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     tail_consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     main_buf = pld.alloc_window_buffer(
@@ -3347,6 +3356,9 @@ def prefill_cp_csa_test(
     for rank in pl.range(pld.world_size()):
         hidden_tail_window = pld.window(
             hidden_tail_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
+        )
+        kv_tail_window = pld.window(
+            kv_tail_buf, [CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16
         )
         tail_ready = pld.window(tail_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
         tail_consumed = pld.window(
@@ -3454,6 +3466,7 @@ def prefill_cp_csa_test(
             leaf_inner_state_slots_input[rank],
             leaf_num_tokens_input[rank],
             hidden_tail_window,
+            kv_tail_window,
             tail_ready,
             tail_consumed,
             main_window,

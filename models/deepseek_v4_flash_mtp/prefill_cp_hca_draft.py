@@ -23,7 +23,6 @@ from config import (
     PREFILL_ORI_MAX_BLOCKS,
 )
 from prefill_compressor_ratio128 import (
-    CMP_STORAGE_BLOCK_SIZE,
     COMPRESS_RATIO,
     COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_NUM,
@@ -39,6 +38,7 @@ from prefill_cp_exchange import (
     CMP_ROWS_PER_RANK,
     CMP_ROWS_PER_SEGMENT,
     CMP_WINDOW_ROWS,
+    HCA_CMP_STORAGE_BLOCK_SIZE as CMP_STORAGE_BLOCK_SIZE,
     STATE_META_DIM,
     STATE_WINDOW_ROWS,
     _prefill_cp_hidden_tail_exchange_wave,
@@ -120,6 +120,9 @@ LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
 # 128-row cache block per leaf scratch, then compact only its first row into
 # the shared Recipes cache ABI.
 LEAF_CMP_BLOCKS = 1
+# Rows in one leaf's cache slice, i.e. the same bytes seen one row per block --
+# the view the shared ratio-128 compressor declares.
+LEAF_CMP_SLICE_ROWS = LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 LEAF_CMP_ROWS = (
     LOCAL_PARTS * MAX_COMPRESS_LEAVES * LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE
 )
@@ -563,6 +566,9 @@ def prefill_cp_hca_core(
     final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
+    ],
+    kv_tail_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
     ],
     tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -1037,12 +1043,23 @@ def prefill_cp_hca_core(
                 [cmp_block0, 0, 0, 0],
             )
             active = pl.read(leaf_num_tokens, [part, leaf])
-            cmp_leaf, state_part = prefill_compressor_ratio128(
+            # The compressor addresses cmp_kv purely as a flat row space and
+            # declares serving's one-row-per-block paging. Hand it the same
+            # bytes under that view; CP's BLOCK_SIZE-row paging only concerns
+            # the block-table consumers downstream.
+            cmp_leaf_rows = pl.reshape(
+                cmp_leaf, [LEAF_CMP_SLICE_ROWS, 1, 1, HEAD_DIM]
+            )
+            cmp_leaf_rows, state_part = prefill_compressor_ratio128(
                 x_leaf, state_part, compress_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 freqs_cos, freqs_sin,
-                cmp_leaf, position_leaf, active,
+                cmp_leaf_rows, position_leaf, active,
                 cmp_slots_leaf, state_slots_leaf,
+            )
+            cmp_leaf = pl.reshape(
+                cmp_leaf_rows,
+                [LEAF_CMP_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             )
             leaf_cmp = pl.assemble(leaf_cmp, cmp_leaf, [cmp_block0, 0, 0, 0])
         scratch_state = pl.assemble(scratch_state, state_part, [state_base, 0, 0])
@@ -1427,6 +1444,9 @@ def prefill_cp_hca_rank(
     hidden_tail_window: pld.DistributedTensor[
         [CP_TAIL_WINDOW_ROWS, D], pl.BF16
     ],
+    kv_tail_window: pld.DistributedTensor[
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], pl.BF16
+    ],
     tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cmp_window: pld.DistributedTensor[
@@ -1474,7 +1494,7 @@ def prefill_cp_hca_rank(
         snapshot_positions, snapshot_valid, final_segment_t,
         reverse_index, owner_rank_table, owner_part_table,
         final_win_seg_src, final_win_row_src, final_slot_mapping,
-        hidden_tail_window,
+        hidden_tail_window, kv_tail_window,
         tail_ready, tail_consumed,
         cmp_window, cmp_meta_window,
         state_window, state_meta_window,
@@ -1656,6 +1676,9 @@ def prefill_cp_hca_test(
     hidden_tail_buf = pld.alloc_window_buffer(
         [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
     )
+    kv_tail_buf = pld.alloc_window_buffer(
+        [CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16
+    )
     tail_ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     tail_consumed_buf = pld.alloc_window_buffer(
         [CP_SIZE, 1], dtype=pl.INT32
@@ -1682,6 +1705,11 @@ def prefill_cp_hca_test(
     for rank in pl.range(pld.world_size()):
         hidden_tail_window = pld.window(
             hidden_tail_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
+        )
+        kv_tail_window = pld.window(
+            kv_tail_buf,
+            [CP_TAIL_WINDOW_ROWS, HEAD_DIM],
+            dtype=pl.BF16,
         )
         tail_ready = pld.window(
             tail_ready_buf, [CP_SIZE, 1], dtype=pl.INT32
@@ -1758,6 +1786,7 @@ def prefill_cp_hca_test(
             final_win_row_src,
             final_slot_mapping,
             hidden_tail_window,
+            kv_tail_window,
             tail_ready,
             tail_consumed,
             cmp_window,
