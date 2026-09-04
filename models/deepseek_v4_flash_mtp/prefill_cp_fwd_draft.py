@@ -102,6 +102,7 @@ config.PREFILL_MOE_WEIGHT_LAYERS = _parse_static_int(
 )
 
 from moe import (
+    clear_compact_moe_signals,
     check_compact_slab,
     COMPACT_EXPERT_SCALE_PAD,
     COMPACT_GROUPED_TOTAL_CAP,
@@ -740,12 +741,6 @@ def prefill_cp_fwd(
     ],
     tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    # Monotonic run-boundary fence banks (never cleared). They order the
-    # end-of-run signal clear against retained-graph re-execution: without
-    # them, a fast rank's next-run notify races a slow rank's clear and the
-    # increment is lost (probabilistic cross-round deadlock at CP8/L43).
-    run_fence_enter: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    run_fence_exit: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Domain 2: HCA compact (one bank reused by HCA layers; compact_comm_epoch).
     cmp_window: pld.DistributedTensor[
         [CMP_WINDOW_ROWS, HEAD_DIM], pl.BF16
@@ -1587,30 +1582,13 @@ def prefill_cp_fwd(
     # stage selects and CP-broadcasts the global-final row before LM head.
     # Both pl.Out tensors are written in place.
     with pl.scope():
-        # Every domain now uses request-retained monotonic epochs over a
-        # hand-written transport, so no bank self-clears. Fence the final MoE
-        # completion and restore all of them together.
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="prefill_cp_fwd_signal_clear",
-        ):
-            _completion_anchor = pl.read(publish_anchor, [0, 0, 0])
-            zero = pl.cast(0, pl.INT32)
-            for src in pl.range(CP_SIZE):
-                pl.write(tail_ready, [src, 0], zero)
-                pl.write(tail_consumed, [src, 0], zero)
-                pl.write(hca_compact_ready, [src, 0], zero)
-                pl.write(hca_compact_consumed, [src, 0], zero)
-                pl.write(csa_compact_ready, [src, 0], zero)
-                pl.write(csa_compact_consumed, [src, 0], zero)
-            # The MoE dispatch and reverse exchanges run a per-layer monotonic
-            # epoch, so their windows restart from zero with the attention
-            # banks. count/x carry the dispatch credits; the scale rail shares
-            # the x bank.
-            for src in pl.range(N_RANKS):
-                pl.write(count_signal, [src, 0], zero)
-                pl.write(compact_x_signal, [src, 0], zero)
-                pl.write(compact_reverse_signal, [src, 0], zero)
+        # Attention domains run request-retained monotonic epochs and are never
+        # cleared, as in the baseline forward. Only the MoE credit banks are
+        # restored, through the same helper every other entry uses.
+        clear_compact_moe_signals(
+            publish_anchor, count_signal, compact_x_signal,
+            compact_reverse_signal,
+        )
 
         tile_blocks = (ATTN_TILE_ROWS // COPY_TOKEN_TILE) * HC_MULT
         with pl.spmd(
@@ -2026,8 +2004,6 @@ def l3_prefill_cp_fwd(
     )
     tail_ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     tail_consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
-    run_fence_enter_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
-    run_fence_exit_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
 
     # Domain 2: compact MoE count/x/scale windows plus the reverse-exchange
     # payload and its barrier signal.
@@ -2156,12 +2132,6 @@ def l3_prefill_cp_fwd(
         tail_consumed = pld.window(
             tail_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
         )
-        run_fence_enter = pld.window(
-            run_fence_enter_buf, [CP_SIZE, 1], dtype=pl.INT32
-        )
-        run_fence_exit = pld.window(
-            run_fence_exit_buf, [CP_SIZE, 1], dtype=pl.INT32
-        )
         count_target = pld.window(
             count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32
         )
@@ -2289,7 +2259,6 @@ def l3_prefill_cp_fwd(
             cmp_block_table[rank],
             # Communication windows.
             kv_tail_window, hidden_tail_window, tail_ready, tail_consumed,
-            run_fence_enter, run_fence_exit,
             cmp_window, cmp_meta_window, state_window, state_meta_window,
             hca_compact_ready, hca_compact_consumed,
             main_window, idx_window, scale_window, record_window,

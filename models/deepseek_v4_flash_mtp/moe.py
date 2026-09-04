@@ -137,6 +137,27 @@ def clear_moe_signals(
             pl.write(combine_arrived, [src, 0], zero)
 
 
+@pl.jit.inline
+def clear_compact_moe_signals(
+    completion_anchor: pl.Tensor[[1, 1, 8], pl.FP32],
+    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+):
+    """clear_moe_signals for the compact transport's three credit banks.
+
+    Same contract and the same three roles -- counts, payload, combine -- over
+    the compact windows and the compact path's small completion anchor.
+    """
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear"):
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(count_signal, [src, 0], zero)
+            pl.write(x_signal, [src, 0], zero)
+            pl.write(reverse_signal, [src, 0], zero)
+
+
 # === Dispatch ================================================================
 # Lane push, count publish, arrival wait, and cumsum gather run in one
 # pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
