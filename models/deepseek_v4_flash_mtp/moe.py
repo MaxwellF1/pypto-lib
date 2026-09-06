@@ -1155,7 +1155,6 @@ def prefill_moe_compact_grouped_resident(
         x_mixed,
         post_ffn,
         comb_ffn,
-        prior_dep,
     )
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
@@ -1440,10 +1439,9 @@ def moe(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre_dep = pl.system.task_dummy(deps=[])
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn, hc_pre_dep,
+        x_mixed, post_ffn, comb_ffn,
     )
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)

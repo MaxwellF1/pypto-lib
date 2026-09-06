@@ -68,16 +68,11 @@ def hc_pre(
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
 ):
     """One pl.spmd task per work-type, ordered by their GM read/write dependencies.
 
     rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn / mix_x. Cross-scope
     buffers are sized to t_linear, the token count padded up to whole 16-row cube tiles.
-
-    The two entry tasks also wait on ``prior_dep``. Callers with nothing to
-    fence against pass ``pl.system.task_dummy(deps=[])``, which is ready on
-    submit and leaves the inferred edges as the only ordering.
     """
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
@@ -90,13 +85,7 @@ def hc_pre(
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms.
-    with pl.spmd(
-        t_dim // T_TILE,
-        name_hint="hc_pre_rms",
-        deps=[prior_dep],
-        allow_early_resolve=True,
-    ) as _rms_tid:
-        t = pl.tile.get_block_idx()
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
@@ -112,13 +101,7 @@ def hc_pre(
     # linear: split-K matmul -> per-split partials. The t_dim..t_linear pad rows are
     # zero-filled by valid_shape, never materialized.
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    with pl.spmd(
-        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_pre_linear",
-        deps=[prior_dep],
-        allow_early_resolve=True,
-    ) as _linear_tid:
-        task = pl.tile.get_block_idx()
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         linear_split = task % LINEAR_OK
         k_base = linear_split * LINEAR_K_PER_SPLIT
@@ -279,7 +262,6 @@ def hc_pre(
             x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
     return x_mixed
 
-
 @pl.jit
 def hc_pre_test(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -295,8 +277,7 @@ def hc_pre_test(
     post.bind_dynamic(0, T_DYN)
     comb.bind_dynamic(0, T_DYN)
 
-    hc_pre_dep = pl.system.task_dummy(deps=[])
-    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb, hc_pre_dep)
+    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
 
 

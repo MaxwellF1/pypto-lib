@@ -1569,10 +1569,9 @@ def prefill_cp_csa_core(
         kv_tile = pl.slice(local_kv, [T, HEAD_DIM], [row0, 0])
         qr_tile = pl.slice(qr, [T, Q_LORA], [row0, 0])
         qr_scale_tile = pl.slice(qr_scale, [T, 1], [row0, 0])
-        hc_pre_dep = pl.system.task_dummy(deps=[])
         hc_pre(
             x_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            mixed_tile, post_tile, comb_tile, hc_pre_dep,
+            mixed_tile, post_tile, comb_tile,
         )
         rms_tid = rms_norm(mixed_tile, attn_norm_w, normed_tile)
         late_dep = pl.system.task_dummy(deps=[rms_tid])
