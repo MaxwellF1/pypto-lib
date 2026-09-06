@@ -638,6 +638,7 @@ def prefill_cp_hca_core(
     # Recipes treats the two owned 512-row segments as one rank-local 1024-row
     # query projection.  KV is projected later from the augmented hidden
     # sequence (predecessor128 + current512), after hidden-only CP exchange.
+    hc_pre_dep = pl.system.task_dummy(deps=[])
     hc_pre(
         x_flat,
         hc_attn_fn,
@@ -646,6 +647,7 @@ def prefill_cp_hca_core(
         mixed,
         post,
         comb,
+        hc_pre_dep,
     )
     rms_norm(mixed, attn_norm_w, normed)
     for tile in pl.range(NUM_LOCAL_TILES):

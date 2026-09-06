@@ -42,7 +42,7 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
-from hc_pre import hc_pre, prefill_hc_pre
+from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
@@ -1147,7 +1147,7 @@ def prefill_moe_compact_grouped_resident(
     expert-specific ``smooth_scale_1`` input quantization is therefore a
     follow-up quantization-protocol gap, not claimed as aligned here.
     """
-    prefill_hc_pre(
+    hc_pre(
         x_hc,
         hc_ffn_fn,
         hc_ffn_scale,
@@ -1440,9 +1440,10 @@ def moe(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre_dep = pl.system.task_dummy(deps=[])
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
+        x_mixed, post_ffn, comb_ffn, hc_pre_dep,
     )
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)

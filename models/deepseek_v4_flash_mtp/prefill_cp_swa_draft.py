@@ -523,6 +523,7 @@ def prefill_cp_swa_core(
     # Recipes CP prefill is one rank-local 1024-token semantic projection. The
     # two logical 512-token segments stay visible in the CP metadata below;
     # they are not exposed as eight fixed 128-token projection calls.
+    hc_pre_dep = pl.system.task_dummy(deps=[])
     hc_pre(
         x_flat,
         hc_attn_fn,
@@ -531,6 +532,7 @@ def prefill_cp_swa_core(
         x_mixed,
         post,
         comb,
+        hc_pre_dep,
     )
     rms_norm(x_mixed, attn_norm_w, normed)
     materialize_rope_rows(
