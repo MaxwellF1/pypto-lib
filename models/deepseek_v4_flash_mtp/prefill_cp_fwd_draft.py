@@ -154,6 +154,7 @@ from prefill_cp_zigzag import (
 # calls the cores directly (never @pl.jit children); the constants are used
 # only for static child-side shape annotations and typed pl.slice offsets.
 from prefill_cp_hca_draft import (
+    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
     HCA_STATE_BLOCK_SIZE,
@@ -182,7 +183,6 @@ from prefill_cp_csa_draft import (
     prefill_cp_csa_core,
 )
 from config import (
-    BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,
     IDX_CACHE_MAX_BLOCKS,
@@ -550,8 +550,8 @@ def prefill_cp_fwd(
     wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     # kv_cache layers are concatenated on dim 0 (FWD_NUM_LAYERS * ORI_MAX_BLOCKS
     # blocks total) so a 4D slice matches the source rank and the inline SWA
     # core receives a statically shaped [ORI_MAX_BLOCKS, ...] InOut whose
@@ -565,9 +565,19 @@ def prefill_cp_fwd(
     ],
     # Compressed KV cache: FWD_NUM_LAYERS per-layer pools (every attention
     # layer owns a compressed-KV slice); sliced by the global layer index.
-    cmp_kv: pl.InOut[
+    # One compressed-KV pool per flavour: a cache block holds
+    # BLOCK_SIZE / COMPRESS_RATIO rows, which differs between HCA and CSA.
+    hca_cmp_kv: pl.InOut[
         pl.Tensor[
-            [FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             pl.BF16,
         ]
     ],
@@ -725,8 +735,9 @@ def prefill_cp_fwd(
     leaf_num_tokens_input: pl.Tensor[
         [LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    # Shared compressed-KV block table (HCA and CSA compact both index it).
-    cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    # Indexed by logical compressed page, whose row count is per-flavour.
+    hca_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
     # --- Communication windows ------------------------------------------
     # Domain 1: shared tail exchange (SWA + CSA + HCA reuse one bank under
     # monotonic tail_comm_epoch). The dual-tail exchange also needs a
@@ -890,6 +901,31 @@ def prefill_cp_fwd(
     separately launches the CP-last-hidden + TP LM-head stage.
     """
 
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    compressed_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    compressed_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+
     # --- Layer 0: SWA attention -> one local-1024 MoE -> hidden_a --------
     x_attn_l0 = pl.create_tensor(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D],
@@ -922,7 +958,7 @@ def prefill_cp_fwd(
         prefill_cp_swa_core(
             x_hc, hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0, attn_norm_w_l0,
             wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
-            freqs_cos, freqs_sin, kv_cache_l0,
+            swa_freqs_cos, swa_freqs_sin, kv_cache_l0,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             segment_starts_t, segment_tail_positions,
             predecessor_segments,
@@ -1025,7 +1061,7 @@ def prefill_cp_fwd(
         prefill_cp_swa_core(
             hidden_a, hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1, attn_norm_w_l1,
             wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
-            freqs_cos, freqs_sin, kv_cache_l1,
+            swa_freqs_cos, swa_freqs_sin, kv_cache_l1,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             segment_starts_t, segment_tail_positions,
             predecessor_segments,
@@ -1152,9 +1188,9 @@ def prefill_cp_fwd(
             [csa_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_csa: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -1205,7 +1241,7 @@ def prefill_cp_fwd(
                 hidden_b,
                 hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa, attn_norm_w_csa,
                 wq_a_csa, wq_b_csa, wq_b_scale_csa, wkv_csa, gamma_cq_csa, gamma_ckv_csa,
-                freqs_cos, freqs_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
                 csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                 hadamard_idx_csa, idx_wq_b_csa, idx_wq_b_scale_csa, idx_weights_proj_csa,
                 csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
@@ -1213,7 +1249,7 @@ def prefill_cp_fwd(
                 main_state_workspace1, inner_state_workspace1,
                 csa_compress_state_csa, csa_compress_state_block_table,
                 csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                kv_cache_csa, cmp_kv_csa, cmp_block_table,
+                kv_cache_csa, cmp_kv_csa, csa_cmp_block_table,
                 idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
                 segment_starts_t, segment_lengths_t,
                 segment_active_lengths, owner_segments_t, predecessor_segments,
@@ -1295,9 +1331,9 @@ def prefill_cp_fwd(
             [hca_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_hca: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            hca_cmp_kv, [PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [hca_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -1330,10 +1366,10 @@ def prefill_cp_fwd(
                 hidden_a,
                 hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca, attn_norm_w_hca,
                 wq_a_hca, wq_b_hca, wq_b_scale_hca, wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                freqs_cos, freqs_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
-                kv_cache_hca, cmp_kv_hca, cmp_block_table,
+                kv_cache_hca, cmp_kv_hca, hca_cmp_block_table,
                 segment_starts_t, segment_active_lengths, owner_segments_t,
                 predecessor_segments,
                 query_position_ids, query_token_to_request,
@@ -1426,9 +1462,9 @@ def prefill_cp_fwd(
             [final_csa_layer * ORI_MAX_BLOCKS, 0, 0, 0],
         )
         cmp_kv_final: pl.Tensor[
-            [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
+            [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
         ] = pl.slice(
-            cmp_kv, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            csa_cmp_kv, [PREFILL_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             [final_csa_layer * PREFILL_CMP_BLOCK_NUM, 0, 0, 0],
         )
         hc_attn_fn_final: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [final_csa_layer * MIX_HC, 0])
@@ -1478,7 +1514,7 @@ def prefill_cp_fwd(
                 hidden_b,
                 hc_attn_fn_final, hc_attn_scale_final, hc_attn_base_final, attn_norm_w_final,
                 wq_a_final, wq_b_final, wq_b_scale_final, wkv_final, gamma_cq_final, gamma_ckv_final,
-                freqs_cos, freqs_sin,
+                compressed_freqs_cos, compressed_freqs_sin,
                 csa_cmp_wkv_final, csa_cmp_wgate_final, csa_cmp_ape_final, csa_cmp_norm_w_final,
                 hadamard_idx_final, idx_wq_b_final, idx_wq_b_scale_final, idx_weights_proj_final,
                 csa_inner_wkv_final, csa_inner_wgate_final, csa_inner_ape_final, csa_inner_norm_w_final,
@@ -1486,7 +1522,7 @@ def prefill_cp_fwd(
                 main_state_workspace1, inner_state_workspace1,
                 csa_compress_state_final, csa_compress_state_block_table,
                 csa_inner_compress_state_final, csa_inner_compress_state_block_table,
-                kv_cache_final, cmp_kv_final, cmp_block_table,
+                kv_cache_final, cmp_kv_final, csa_cmp_block_table,
                 idx_kv_cache_final, idx_kv_scale_final, idx_block_table,
                 segment_starts_t, segment_lengths_t,
                 segment_active_lengths, owner_segments_t, predecessor_segments,
@@ -1674,10 +1710,10 @@ def l3_prefill_cp_fwd(
         [CP_SIZE, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16
     ],
     freqs_cos: pl.Tensor[
-        [CP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
+        [CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
     ],
     freqs_sin: pl.Tensor[
-        [CP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
+        [CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
     ],
     kv_cache: pl.InOut[
         pl.Tensor[
@@ -1686,9 +1722,17 @@ def l3_prefill_cp_fwd(
         ]
     ],
     # Compressed KV cache: FWD_NUM_LAYERS per-layer pools (rank-leading).
-    cmp_kv: pl.InOut[
+    hca_cmp_kv: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
+            pl.BF16,
+        ]
+    ],
+    csa_cmp_kv: pl.InOut[
+        pl.Tensor[
+            [CP_SIZE, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+             CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
             pl.BF16,
         ]
     ],
@@ -1872,7 +1916,8 @@ def l3_prefill_cp_fwd(
     leaf_num_tokens_input: pl.Tensor[
         [CP_SIZE, LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], pl.INT32
     ],
-    cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[CP_SIZE, PREFILL_CMP_MAX_BLOCKS], pl.INT32],
     # MoE weights (layer-stacked, rank-sliced at launch).
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
@@ -2221,7 +2266,7 @@ def l3_prefill_cp_fwd(
             wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank],
             gamma_cq[rank], gamma_ckv[rank],
             freqs_cos[rank], freqs_sin[rank],
-            kv_cache[rank], cmp_kv[rank],
+            kv_cache[rank], hca_cmp_kv[rank], csa_cmp_kv[rank],
             attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
             segment_starts_t, predecessor_segments[rank],
             query_position_ids[rank], query_token_to_request[rank],
@@ -2256,7 +2301,7 @@ def l3_prefill_cp_fwd(
             leaf_positions_input[rank], leaf_main_slots_input[rank],
             leaf_idx_slots_input[rank], leaf_main_state_slots_input[rank],
             leaf_inner_state_slots_input[rank], leaf_num_tokens_input[rank],
-            cmp_block_table[rank],
+            hca_cmp_block_table[rank], csa_cmp_block_table[rank],
             # Communication windows.
             kv_tail_window, hidden_tail_window, tail_ready, tail_consumed,
             cmp_window, cmp_meta_window, state_window, state_meta_window,
@@ -2444,7 +2489,7 @@ _RESIDENT_STATIC_NAMES = frozenset(
 )
 _RESIDENT_STATE_NAMES = frozenset(
     {
-        "kv_cache", "cmp_kv", "hca_compress_state",
+        "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "hca_compress_state",
         "csa_compress_state", "csa_inner_compress_state",
         "idx_kv_cache", "idx_kv_scale",
     }
@@ -2481,7 +2526,7 @@ FWD_HOST_ARG_ORDER = (
     # common attention weights (layer-stacked, FWD_NUM_LAYERS).
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-    "freqs_cos", "freqs_sin", "kv_cache", "cmp_kv",
+    "freqs_cos", "freqs_sin", "kv_cache", "hca_cmp_kv", "csa_cmp_kv",
     "attn_sink", "wo_a", "wo_b", "wo_b_scale",
     # shared CP metadata (one copy).
     "segment_starts_t", "predecessor_segments",
@@ -2512,8 +2557,9 @@ FWD_HOST_ARG_ORDER = (
     "leaf_positions_input", "leaf_main_slots_input",
     "leaf_idx_slots_input", "leaf_main_state_slots_input",
     "leaf_inner_state_slots_input", "leaf_num_tokens_input",
-    # shared cmp block table (HCA and CSA compact both index it).
-    "cmp_block_table",
+    # Per-flavour compressed-KV block tables.
+    "hca_cmp_block_table",
+    "csa_cmp_block_table",
     # MoE weights (layer-stacked, FWD_NUM_LAYERS; rank-sliced at launch).
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid", "input_ids",
@@ -2727,7 +2773,15 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     for name in _SWA_SHARED_NAMES:
         base = swa_by_name[name]
         if name in {"freqs_cos", "freqs_sin"}:
-            specs_by_name[name] = _replicate_resident_spec(base, cp_size)
+            compressed = csa_by_name[name]
+
+            def init_profiles(swa=base, cmp=compressed):
+                return torch.stack([swa.create_tensor(), cmp.create_tensor()], dim=0)
+
+            profiles = TensorSpec(
+                name, [2, *base.shape], base.dtype, init_value=init_profiles,
+            )
+            specs_by_name[name] = _replicate_resident_spec(profiles, cp_size)
         else:
             specs_by_name[name] = base
 
@@ -2763,21 +2817,35 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     # cmp_kv: compressed KV cache, FWD_NUM_LAYERS per-layer pools (every
     # attention layer owns a compressed-KV slice). Stacked on the per-rank
     # block axis the same way as kv_cache. Mirrors baseline prefill_fwd.py.
-    cmp_kv_shape = [
-        cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
-        BLOCK_SIZE, 1, HEAD_DIM,
-    ]
+    # CP HCA pages 128 compressed rows; CSA pages 32 compressed rows.
+    # Each pool is seeded from its own single-layer module spec.
+    def _cmp_pool(page_rows, donor):
+        shape = [
+            cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
+            page_rows, 1, HEAD_DIM,
+        ]
 
-    def init_cmp_kv_fwd():
-        base_cmp_kv = hca_by_name["cmp_kv"].create_tensor()
-        cmp_kv_fwd = torch.zeros(cmp_kv_shape, dtype=torch.bfloat16)
-        cmp_kv_fwd[:, :PREFILL_CMP_BLOCK_NUM, :, :, :] = base_cmp_kv
-        return cmp_kv_fwd
+        def init_pool():
+            base = donor.create_tensor()
+            pool = torch.zeros(shape, dtype=torch.bfloat16)
+            pool[:, :PREFILL_CMP_BLOCK_NUM, :, :, :] = base
+            return pool
 
-    specs_by_name["cmp_kv"] = TensorSpec(
-        "cmp_kv",
-        cmp_kv_shape,
-        torch.bfloat16, init_value=init_cmp_kv_fwd, 
+        return shape, init_pool
+
+    hca_cmp_shape, init_hca_cmp = _cmp_pool(
+        HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"]
+    )
+    specs_by_name["hca_cmp_kv"] = TensorSpec(
+        "hca_cmp_kv", hca_cmp_shape,
+        torch.bfloat16, init_value=init_hca_cmp,
+    )
+    csa_cmp_shape, init_csa_cmp = _cmp_pool(
+        CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"]
+    )
+    specs_by_name["csa_cmp_kv"] = TensorSpec(
+        "csa_cmp_kv", csa_cmp_shape,
+        torch.bfloat16, init_value=init_csa_cmp,
     )
 
     # --- HCA type-specific (layers 3 and 5) --------------------------------
@@ -2875,8 +2943,16 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     for name in _CSA_METADATA_NAMES:
         specs_by_name[name] = csa_by_name[name]
 
-    # Shared compressed-KV block table (HCA and CSA compact both index it).
-    specs_by_name["cmp_block_table"] = hca_by_name["cmp_block_table"]
+    # Per-flavour tables: an HCA page is BLOCK_SIZE rows, a CSA page
+    # BLOCK_SIZE / CSA_COMPRESS_RATIO.
+    specs_by_name["hca_cmp_block_table"] = TensorSpec(
+        "hca_cmp_block_table", list(hca_by_name["cmp_block_table"].shape),
+        torch.int32, init_value=hca_by_name["cmp_block_table"].create_tensor,
+    )
+    specs_by_name["csa_cmp_block_table"] = TensorSpec(
+        "csa_cmp_block_table", list(csa_by_name["cmp_block_table"].shape),
+        torch.int32, init_value=csa_by_name["cmp_block_table"].create_tensor,
+    )
 
     # MoE weights: layer-stack the single-layer base (rank-leading).
     moe_specs = build_moe_tensor_specs(layer_id=0, num_tokens=MOE_ROWS)
@@ -3343,7 +3419,7 @@ def _check_logits(actual, _expected, *, inputs, **_kwargs):
 # compare_fn is built before compilation, and a spec learns its direction only
 # once the harness stamps it from the compiled artifact.
 _OUTPUT_NAMES = (
-    "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
+    "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "idx_kv_cache", "idx_kv_scale",
     "hca_compress_state", "csa_compress_state", "csa_inner_compress_state",
     "effective_x_workspace",
     "moe_x_mixed", "moe_post_ffn", "moe_comb_ffn", "moe_ffn_out",
@@ -3414,6 +3490,15 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs and outputs under the work dir for replay")
+    parser.add_argument("--dump-outputs", type=str, default=None,
+                        help="directory to write the device's own output tensors "
+                             "into, for cross-entry comparison")
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="dir with in/{name}.pt (and optional out/{name}.pt); "
+                             "replaces generated inputs so a run can be driven "
+                             "from another entry's frozen tensors")
     parser.add_argument(
         "--check-outputs", "--check-x-out", action="store_true", default=False,
         dest="check_outputs",
@@ -3508,11 +3593,33 @@ if __name__ == "__main__":
         golden_fn = None
         compare_fn = None
 
+    if args.dump_outputs:
+        import pathlib
+
+        import torch as _torch
+
+        _dump_dir = pathlib.Path(args.dump_outputs)
+        _dump_dir.mkdir(parents=True, exist_ok=True)
+
+        def _dump(name, inner):
+            def cmp(actual, expected, **kwargs):
+                _torch.save(actual.cpu(), _dump_dir / f"{name}.pt")
+                if inner is None:
+                    return True, ""
+                return inner(actual, expected, **kwargs)
+            return cmp
+
+        compare_fn = dict(compare_fn or {})
+        for _n in ("hidden_out", "logits"):
+            compare_fn[_n] = _dump(_n, compare_fn.get(_n))
+
     result = run(
         fn=l3_prefill_cp_fwd,
         specs=specs,
         golden_fn=golden_fn,
         compare_fn=compare_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(
