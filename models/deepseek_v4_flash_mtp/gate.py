@@ -162,6 +162,10 @@ def gate(
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                     pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
         if N_EXPERTS < SCORE_PAD:
+            # A one-shot pl.full over T_PAD rows materializes the whole tile in
+            # the Vec buffer, so its cost grows with T_PAD: at the CP forward's
+            # 1024 rows an EP2 pad is 768 KiB against a 184 KiB budget. Fill the
+            # same columns a row block at a time; the bytes stored are the same.
             for pad_block in pl.range(T_PAD // GATE_M_TILE):
                 pad_t0 = pad_block * GATE_M_TILE
                 biased_scores_buf[
