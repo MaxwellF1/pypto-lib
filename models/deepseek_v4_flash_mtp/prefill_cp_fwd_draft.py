@@ -3461,6 +3461,7 @@ if __name__ == "__main__":
         help=f"number of FWD layers (parsed at import; choices {FWD_LAYER_CHOICES}; 43 is the production schedule)",
     )
     parser.add_argument("--enable-chip-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False,
@@ -3602,6 +3603,7 @@ if __name__ == "__main__":
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            enable_dep_gen=args.enable_dep_gen,
             ring_task_window=FWD_RING_TASK_WINDOW,
             ring_heap=FWD_RING_HEAP,
             ring_dep_pool=FWD_RING_DEP_POOL,
