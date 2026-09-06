@@ -431,14 +431,18 @@ def prefill_expert_grouped(
                         inter_base = block * (
                             ACT_GATE_INNER * ACT_INTER_TILE
                         )
-                        # Load the padded row-major scale tile before selecting
-                        # col0. A direct ND [16, 1] slice lowers to a ColMajor
-                        # VecTile TLOAD, which A2/A3 AscendC does not support.
+                        # Materialize col0 as a dense [RECV_TILE, 1] vector:
+                        # a column view of a padded tile keeps the row pitch.
                         x_scale_padded = expert_scale[
                             flat_tile_row : flat_tile_row + RECV_TILE,
                             0:PREFILL_EXPERT_SCALE_PAD,
                         ]
-                        x_scale_tile = x_scale_padded[:, 0:1]
+                        x_scale_transposed = pl.transpose(
+                            x_scale_padded, axis1=0, axis2=1
+                        )
+                        x_scale_tile = pl.reshape(
+                            x_scale_transposed[0:1, :], [RECV_TILE, 1]
+                        )
                         for inner in pl.pipeline(ACT_GATE_INNER, stage=2):
                             inter0 = inter_base + inner * ACT_INTER_TILE
                             gate_i32 = w13_tile_i32[

@@ -1942,18 +1942,25 @@ def _hca_native_wave(
                                     * HEAD_TILE
                                     + qk_work * HEAD_TILE
                                 )
+                                qk_m_column = qk_m[
+                                    qk_src_h0:qk_src_h0 + HEAD_TILE,
+                                    0:1,
+                                ]
+                                qk_l_column = qk_l[
+                                    qk_src_h0:qk_src_h0 + HEAD_TILE,
+                                    0:1,
+                                ]
+                                # Write whole scratch rows: a narrow column
+                                # store ignores the padded row pitch.
+                                qk_stat_zeros = pl.full(
+                                    [HEAD_TILE, 8], dtype=pl.FP32, value=0.0
+                                )
                                 cmp_partial_m[
-                                    qk_row:qk_row + HEAD_TILE, 0:1
-                                ] = qk_m[
-                                    qk_src_h0:qk_src_h0 + HEAD_TILE,
-                                    0:1,
-                                ]
+                                    qk_row:qk_row + HEAD_TILE, 0:8
+                                ] = pl.row_expand_add(qk_stat_zeros, qk_m_column)
                                 cmp_partial_l[
-                                    qk_row:qk_row + HEAD_TILE, 0:1
-                                ] = qk_l[
-                                    qk_src_h0:qk_src_h0 + HEAD_TILE,
-                                    0:1,
-                                ]
+                                    qk_row:qk_row + HEAD_TILE, 0:8
+                                ] = pl.row_expand_add(qk_stat_zeros, qk_l_column)
                                 cmp_partial_o[
                                     qk_row:qk_row + HEAD_TILE,
                                     0:HEAD_DIM,
@@ -2024,8 +2031,20 @@ def _hca_native_wave(
                     merge_cmp_l_padded = cmp_partial_l[
                         merge_row:merge_row + HEAD_TILE, 0:8
                     ]
-                    merge_cmp_m = merge_cmp_m_padded[:, 0:1]
-                    merge_cmp_l = merge_cmp_l_padded[:, 0:1]
+                    # Read col0 as a dense [HEAD_TILE, 1] vector: a column
+                    # view of a padded tile keeps the row pitch.
+                    merge_cmp_m_transposed = pl.transpose(
+                        merge_cmp_m_padded, axis1=0, axis2=1
+                    )
+                    merge_cmp_l_transposed = pl.transpose(
+                        merge_cmp_l_padded, axis1=0, axis2=1
+                    )
+                    merge_cmp_m = pl.reshape(
+                        merge_cmp_m_transposed[0:1, :], [HEAD_TILE, 1]
+                    )
+                    merge_cmp_l = pl.reshape(
+                        merge_cmp_l_transposed[0:1, :], [HEAD_TILE, 1]
+                    )
                     merge_cmp_o = cmp_partial_o[
                         merge_row:merge_row + HEAD_TILE, 0:HEAD_DIM
                     ]
