@@ -1081,7 +1081,6 @@ def prefill_moe_compact_grouped_resident(
         [N_LOCAL, D, MOE_INTER], pl.INT8
     ],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    smooth_scale_2: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -1143,8 +1142,7 @@ def prefill_moe_compact_grouped_resident(
     ``num_tokens == T``; an inactive physical tail is not initialized here.
 
     This path implements compact count/A2Av transport, 16-row-aligned grouped
-    routed experts, Recipes ``smooth_scale_2`` before the W2 activation
-    quantizer, and source-side BF16 top-k weighting. It deliberately still
+    routed experts and source-side BF16 top-k weighting. It deliberately still
     shares one token-wise INT8 input/scale across the six routes. Recipes'
     expert-specific ``smooth_scale_1`` input quantization is therefore a
     follow-up quantization-protocol gap, not claimed as aligned here.
@@ -1270,7 +1268,6 @@ def prefill_moe_compact_grouped_resident(
         routed_w13_scale,
         routed_w2,
         routed_w2_scale,
-        smooth_scale_2,
         grouped_y,
     )
 

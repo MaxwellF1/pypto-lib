@@ -431,7 +431,6 @@ def _fwd_moe_tail(
     routed_w13_scale: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    smooth_scale_2: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -499,7 +498,7 @@ def _fwd_moe_tail(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids_flat,
         routed_w13, routed_w13_scale,
-        routed_w2, routed_w2_scale, smooth_scale_2,
+        routed_w2, routed_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next_work,
@@ -813,9 +812,6 @@ def prefill_cp_fwd(
     ],
     routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    smooth_scale_2: pl.Tensor[
-        [FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32
-    ],
     shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
@@ -996,7 +992,6 @@ def prefill_cp_fwd(
     routed_w13_scale_l0: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32] = pl.slice(routed_w13_scale, [N_LOCAL, 2 * MOE_INTER], [0 * N_LOCAL, 0])
     routed_w2_l0: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [0 * N_LOCAL, 0, 0])
     routed_w2_scale_l0: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [0 * N_LOCAL, 0])
-    smooth_scale_2_l0: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(smooth_scale_2, [N_LOCAL, MOE_INTER], [0 * N_LOCAL, 0])
     shared_w1_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [0 * MOE_INTER, 0])
     shared_w1_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w3_l0: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [0 * MOE_INTER, 0])
@@ -1011,7 +1006,6 @@ def prefill_cp_fwd(
             norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0,
             routed_w13_l0, routed_w13_scale_l0,
             routed_w2_l0, routed_w2_scale_l0,
-            smooth_scale_2_l0,
             shared_w1_l0, shared_w1_scale_l0,
             shared_w3_l0, shared_w3_scale_l0,
             shared_w2_l0, shared_w2_scale_l0,
@@ -1099,7 +1093,6 @@ def prefill_cp_fwd(
     routed_w13_scale_l1: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32] = pl.slice(routed_w13_scale, [N_LOCAL, 2 * MOE_INTER], [1 * N_LOCAL, 0])
     routed_w2_l1: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [1 * N_LOCAL, 0, 0])
     routed_w2_scale_l1: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [1 * N_LOCAL, 0])
-    smooth_scale_2_l1: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(smooth_scale_2, [N_LOCAL, MOE_INTER], [1 * N_LOCAL, 0])
     shared_w1_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [1 * MOE_INTER, 0])
     shared_w1_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w3_l1: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [1 * MOE_INTER, 0])
@@ -1131,7 +1124,6 @@ def prefill_cp_fwd(
             norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1,
             routed_w13_l1, routed_w13_scale_l1,
             routed_w2_l1, routed_w2_scale_l1,
-            smooth_scale_2_l1,
             shared_w1_l1, shared_w1_scale_l1,
             shared_w3_l1, shared_w3_scale_l1,
             shared_w2_l1, shared_w2_scale_l1,
@@ -1290,7 +1282,6 @@ def prefill_cp_fwd(
         routed_w13_scale_csa: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32] = pl.slice(routed_w13_scale, [N_LOCAL, 2 * MOE_INTER], [csa_layer * N_LOCAL, 0])
         routed_w2_csa: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [csa_layer * N_LOCAL, 0, 0])
         routed_w2_scale_csa: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [csa_layer * N_LOCAL, 0])
-        smooth_scale_2_csa: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(smooth_scale_2, [N_LOCAL, MOE_INTER], [csa_layer * N_LOCAL, 0])
         shared_w1_csa: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [csa_layer * MOE_INTER, 0])
         shared_w1_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w3_csa: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [csa_layer * MOE_INTER, 0])
@@ -1306,7 +1297,6 @@ def prefill_cp_fwd(
                 norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa,
                 routed_w13_csa, routed_w13_scale_csa,
                 routed_w2_csa, routed_w2_scale_csa,
-                smooth_scale_2_csa,
                 shared_w1_csa, shared_w1_scale_csa,
                 shared_w3_csa, shared_w3_scale_csa,
                 shared_w2_csa, shared_w2_scale_csa,
@@ -1405,7 +1395,6 @@ def prefill_cp_fwd(
         routed_w13_scale_hca: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32] = pl.slice(routed_w13_scale, [N_LOCAL, 2 * MOE_INTER], [hca_layer * N_LOCAL, 0])
         routed_w2_hca: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [hca_layer * N_LOCAL, 0, 0])
         routed_w2_scale_hca: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [hca_layer * N_LOCAL, 0])
-        smooth_scale_2_hca: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(smooth_scale_2, [N_LOCAL, MOE_INTER], [hca_layer * N_LOCAL, 0])
         shared_w1_hca: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [hca_layer * MOE_INTER, 0])
         shared_w1_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w3_hca: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [hca_layer * MOE_INTER, 0])
@@ -1421,7 +1410,6 @@ def prefill_cp_fwd(
                 norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca,
                 routed_w13_hca, routed_w13_scale_hca,
                 routed_w2_hca, routed_w2_scale_hca,
-                smooth_scale_2_hca,
                 shared_w1_hca, shared_w1_scale_hca,
                 shared_w3_hca, shared_w3_scale_hca,
                 shared_w2_hca, shared_w2_scale_hca,
@@ -1565,7 +1553,6 @@ def prefill_cp_fwd(
         routed_w13_scale_final: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32] = pl.slice(routed_w13_scale, [N_LOCAL, 2 * MOE_INTER], [final_csa_layer * N_LOCAL, 0])
         routed_w2_final: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8] = pl.slice(routed_w2, [N_LOCAL, D, MOE_INTER], [final_csa_layer * N_LOCAL, 0, 0])
         routed_w2_scale_final: pl.Tensor[[N_LOCAL, D], pl.FP32] = pl.slice(routed_w2_scale, [N_LOCAL, D], [final_csa_layer * N_LOCAL, 0])
-        smooth_scale_2_final: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32] = pl.slice(smooth_scale_2, [N_LOCAL, MOE_INTER], [final_csa_layer * N_LOCAL, 0])
         shared_w1_final: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w1, [MOE_INTER, D], [final_csa_layer * MOE_INTER, 0])
         shared_w1_scale_final: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w1_scale, [MOE_INTER], [final_csa_layer * MOE_INTER])
         shared_w3_final: pl.Tensor[[MOE_INTER, D], pl.INT8] = pl.slice(shared_w3, [MOE_INTER, D], [final_csa_layer * MOE_INTER, 0])
@@ -1581,7 +1568,6 @@ def prefill_cp_fwd(
                 norm_w_final, gate_w_final, gate_bias_final, tid2eid_final,
                 routed_w13_final, routed_w13_scale_final,
                 routed_w2_final, routed_w2_scale_final,
-                smooth_scale_2_final,
                 shared_w1_final, shared_w1_scale_final,
                 shared_w3_final, shared_w3_scale_final,
                 shared_w2_final, shared_w2_scale_final,
@@ -1940,9 +1926,6 @@ def l3_prefill_cp_fwd(
     ],
     routed_w2_scale: pl.Tensor[
         [N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32
-    ],
-    smooth_scale_2: pl.Tensor[
-        [N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32
     ],
     shared_w1: pl.Tensor[
         [N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8
@@ -2316,7 +2299,6 @@ def l3_prefill_cp_fwd(
             input_ids[rank],
             routed_w13[rank], routed_w13_scale[rank],
             routed_w2[rank], routed_w2_scale[rank],
-            smooth_scale_2[rank],
             shared_w1[rank], shared_w1_scale[rank],
             shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
@@ -2414,7 +2396,7 @@ _MOE_WEIGHT_NAMES = (
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid",
     "routed_w13", "routed_w13_scale",
-    "routed_w2", "routed_w2_scale", "smooth_scale_2",
+    "routed_w2", "routed_w2_scale",
     "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
     "shared_w2", "shared_w2_scale",
 )
@@ -2564,7 +2546,7 @@ FWD_HOST_ARG_ORDER = (
     "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
     "gate_w", "gate_bias", "tid2eid", "input_ids",
     "routed_w13", "routed_w13_scale",
-    "routed_w2", "routed_w2_scale", "smooth_scale_2",
+    "routed_w2", "routed_w2_scale",
     "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
     "shared_w2", "shared_w2_scale",
     # rank-local resident MoE workspaces, reused across every layer.
@@ -2999,15 +2981,6 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
         [N_RANKS, N_LOCAL, 2 * MOE_INTER],
         torch.float32,
         init_value=_init_routed_w13_scale,
-        resident="stacked",
-    )
-    # The compact grouped expert adds Recipes' post-SwiGLU smooth scale; the
-    # legacy MoE fixture builder intentionally has no such parameter.
-    moe_by_name["smooth_scale_2"] = TensorSpec(
-        "smooth_scale_2",
-        [N_RANKS, N_LOCAL, MOE_INTER],
-        torch.float32,
-        init_value=1.0,
         resident="stacked",
     )
     for name in _MOE_WEIGHT_NAMES:

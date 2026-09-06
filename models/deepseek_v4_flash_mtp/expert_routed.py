@@ -295,7 +295,6 @@ def prefill_expert_grouped(
         pl.INT8,
     ],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    smooth_scale_2: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
     expert_y: pl.Tensor[[PREFILL_EXPERT_GROUPED_CAP, D], pl.BF16],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Count-driven Recipes-style local grouped routed-expert compute.
@@ -495,15 +494,6 @@ def prefill_expert_grouped(
                             )
                             activated_chunk = pl.mul(
                                 pl.mul(gate_fp32, sigmoid), up_fp32
-                            )
-                            # Recipes applies the local expert's smooth2 after
-                            # SwiGLU and before the W2 activation quantizer.
-                            activated_chunk = pl.col_expand_mul(
-                                activated_chunk,
-                                smooth_scale_2[
-                                    local_i : local_i + 1,
-                                    inter0 : inter0 + ACT_INTER_TILE,
-                                ],
                             )
                             h_valid = pl.set_validshape(
                                 activated_chunk,
