@@ -102,13 +102,13 @@ config.PREFILL_MOE_WEIGHT_LAYERS = _parse_static_int(
 )
 
 from moe import (
-    clear_compact_moe_signals,
-    check_compact_slab,
-    COMPACT_EXPERT_SCALE_PAD,
-    COMPACT_GROUPED_TOTAL_CAP,
-    COMPACT_ROUTES_PER_SRC,
-    COMPACT_SCALE_PAD,
-    COMPACT_TOTAL_CAP,
+    clear_prefill_moe_signals,
+    check_prefill_moe_slab,
+    PREFILL_MOE_EXPERT_SCALE_PAD,
+    PREFILL_MOE_GROUPED_TOTAL_CAP,
+    PREFILL_MOE_ROUTES_PER_SRC,
+    PREFILL_MOE_SCALE_PAD,
+    PREFILL_MOE_TOTAL_CAP,
     D,
     HC_DIM,
     HC_MULT,
@@ -121,7 +121,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
-    prefill_moe_compact_grouped_resident,
+    prefill_moe,
 )
 from prefill_cp_swa_draft import (
     BLOCK_ROWS,
@@ -219,7 +219,7 @@ from lm_head import (
 # Static CP/EP contract
 # ---------------------------------------------------------------------------
 # This entry builds the compact prefill MoE, whose tiles constrain the slab.
-check_compact_slab()
+check_prefill_moe_slab()
 assert CP_SIZE in CP_CHOICES, f"--cp must be one of {CP_CHOICES} (got {CP_SIZE})"
 assert CP_SIZE == N_RANKS, (
     f"CP FWD requires CP == EP == pld.world_size() (got CP={CP_SIZE}, EP={N_RANKS})"
@@ -443,36 +443,36 @@ def _fwd_moe_tail(
         pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]
     ],
     moe_ffn_out: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
-    moe_dense_x: pl.InOut[pl.Tensor[[COMPACT_TOTAL_CAP, D], pl.INT8]],
+    moe_dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
     moe_dense_scale: pl.InOut[
-        pl.Tensor[[COMPACT_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD], pl.FP32]
+        pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
     moe_grouped_x: pl.InOut[
-        pl.Tensor[[COMPACT_GROUPED_TOTAL_CAP, D], pl.INT8]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
     ],
     moe_grouped_scale: pl.InOut[
         pl.Tensor[
-            [COMPACT_GROUPED_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD], pl.FP32
+            [PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
         ]
     ],
     moe_grouped_y: pl.InOut[
-        pl.Tensor[[COMPACT_GROUPED_TOTAL_CAP, D], pl.BF16]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
     ],
-    moe_dense_y: pl.InOut[pl.Tensor[[COMPACT_TOTAL_CAP, D], pl.BF16]],
+    moe_dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
     moe_returned_y: pl.InOut[
-        pl.Tensor[[COMPACT_ROUTES_PER_SRC, D], pl.BF16]
+        pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
     ],
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_x_target: pld.DistributedTensor[[COMPACT_TOTAL_CAP, D], pl.INT8],
-    compact_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_scale_target: pld.DistributedTensor[
-        [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], pl.FP32
+    prefill_moe_x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    prefill_moe_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    prefill_moe_scale_target: pld.DistributedTensor[
+        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32
     ],
-    compact_reverse_target: pld.DistributedTensor[
-        [COMPACT_TOTAL_CAP, D], pl.BF16
+    prefill_moe_reverse_target: pld.DistributedTensor[
+        [PREFILL_MOE_TOTAL_CAP, D], pl.BF16
     ],
-    compact_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    prefill_moe_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     hidden_out: pl.Out[
         pl.Tensor[
             [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D],
@@ -493,7 +493,7 @@ def _fwd_moe_tail(
     )
     input_ids_flat = pl.reshape(input_ids, [MOE_ROWS])
 
-    moe_tid = prefill_moe_compact_grouped_resident(
+    moe_tid = prefill_moe(
         x_attn_flat,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids_flat,
@@ -507,9 +507,9 @@ def _fwd_moe_tail(
         moe_grouped_x, moe_grouped_scale, moe_grouped_y,
         moe_dense_y, moe_returned_y,
         count_target, count_signal,
-        compact_x_target, compact_x_signal,
-        compact_scale_target,
-        compact_reverse_target, compact_reverse_signal,
+        prefill_moe_x_target, prefill_moe_x_signal,
+        prefill_moe_scale_target,
+        prefill_moe_reverse_target, prefill_moe_reverse_signal,
         attention_done_tid, layer_id,
         pl.cast(layer_id + 1, pl.INT32),
         pl.cast(MOE_ROWS, pl.INT32),
@@ -825,38 +825,38 @@ def prefill_cp_fwd(
         pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]
     ],
     moe_ffn_out: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
-    moe_dense_x: pl.InOut[pl.Tensor[[COMPACT_TOTAL_CAP, D], pl.INT8]],
+    moe_dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
     moe_dense_scale: pl.InOut[
-        pl.Tensor[[COMPACT_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD], pl.FP32]
+        pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
     moe_grouped_x: pl.InOut[
-        pl.Tensor[[COMPACT_GROUPED_TOTAL_CAP, D], pl.INT8]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
     ],
     moe_grouped_scale: pl.InOut[
         pl.Tensor[
-            [COMPACT_GROUPED_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD], pl.FP32
+            [PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
         ]
     ],
     moe_grouped_y: pl.InOut[
-        pl.Tensor[[COMPACT_GROUPED_TOTAL_CAP, D], pl.BF16]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
     ],
-    moe_dense_y: pl.InOut[pl.Tensor[[COMPACT_TOTAL_CAP, D], pl.BF16]],
+    moe_dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
     moe_returned_y: pl.InOut[
-        pl.Tensor[[COMPACT_ROUTES_PER_SRC, D], pl.BF16]
+        pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
     ],
     # Compact count/x/scale/reverse windows. all_to_all_v owns reusable,
     # self-clearing collective signals, so no per-wave epoch ABI remains.
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_x_target: pld.DistributedTensor[[COMPACT_TOTAL_CAP, D], pl.INT8],
-    compact_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    compact_scale_target: pld.DistributedTensor[
-        [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], pl.FP32
+    prefill_moe_x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    prefill_moe_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    prefill_moe_scale_target: pld.DistributedTensor[
+        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32
     ],
-    compact_reverse_target: pld.DistributedTensor[
-        [COMPACT_TOTAL_CAP, D], pl.BF16
+    prefill_moe_reverse_target: pld.DistributedTensor[
+        [PREFILL_MOE_TOTAL_CAP, D], pl.BF16
     ],
-    compact_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    prefill_moe_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # Phase 3 final-tail weights (HC head + final RMSNorm). The HC head
     # projects the [HC_MULT, D] hyper-connection mix to a single [D] row; the
     # final RMSNorm normalizes it into hidden_out for the LM head.
@@ -1014,9 +1014,9 @@ def prefill_cp_fwd(
             moe_grouped_x, moe_grouped_scale, moe_grouped_y,
             moe_dense_y, moe_returned_y,
             count_target, count_signal,
-            compact_x_target, compact_x_signal,
-            compact_scale_target,
-            compact_reverse_target, compact_reverse_signal,
+            prefill_moe_x_target, prefill_moe_x_signal,
+            prefill_moe_scale_target,
+            prefill_moe_reverse_target, prefill_moe_reverse_signal,
             hidden_a, completion_anchor_l0,
             attention_done_l0,
             pl.cast(0, pl.INT32),
@@ -1132,9 +1132,9 @@ def prefill_cp_fwd(
             moe_grouped_x, moe_grouped_scale, moe_grouped_y,
             moe_dense_y, moe_returned_y,
             count_target, count_signal,
-            compact_x_target, compact_x_signal,
-            compact_scale_target,
-            compact_reverse_target, compact_reverse_signal,
+            prefill_moe_x_target, prefill_moe_x_signal,
+            prefill_moe_scale_target,
+            prefill_moe_reverse_target, prefill_moe_reverse_signal,
             hidden_b, completion_anchor_l1,
             attention_done_l1,
             pl.cast(1, pl.INT32),
@@ -1305,9 +1305,9 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal,
-                compact_scale_target,
-                compact_reverse_target, compact_reverse_signal,
+                prefill_moe_x_target, prefill_moe_x_signal,
+                prefill_moe_scale_target,
+                prefill_moe_reverse_target, prefill_moe_reverse_signal,
                 hidden_a, completion_anchor_csa,
                 attention_done_csa,
                 csa_layer,
@@ -1418,9 +1418,9 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal,
-                compact_scale_target,
-                compact_reverse_target, compact_reverse_signal,
+                prefill_moe_x_target, prefill_moe_x_signal,
+                prefill_moe_scale_target,
+                prefill_moe_reverse_target, prefill_moe_reverse_signal,
                 hidden_b, completion_anchor_hca,
                 attention_done_hca,
                 hca_layer,
@@ -1576,9 +1576,9 @@ def prefill_cp_fwd(
                 moe_grouped_x, moe_grouped_scale, moe_grouped_y,
                 moe_dense_y, moe_returned_y,
                 count_target, count_signal,
-                compact_x_target, compact_x_signal,
-                compact_scale_target,
-                compact_reverse_target, compact_reverse_signal,
+                prefill_moe_x_target, prefill_moe_x_signal,
+                prefill_moe_scale_target,
+                prefill_moe_reverse_target, prefill_moe_reverse_signal,
                 hidden_a, completion_anchor_final_csa,
                 attention_done_final_csa,
                 final_csa_layer,
@@ -1607,9 +1607,9 @@ def prefill_cp_fwd(
         # Attention domains run request-retained monotonic epochs and are never
         # cleared, as in the baseline forward. Only the MoE credit banks are
         # restored, through the same helper every other entry uses.
-        clear_compact_moe_signals(
-            publish_anchor, count_signal, compact_x_signal,
-            compact_reverse_signal,
+        clear_prefill_moe_signals(
+            publish_anchor, count_signal, prefill_moe_x_signal,
+            prefill_moe_reverse_signal,
         )
 
         tile_blocks = (ATTN_TILE_ROWS // COPY_TOKEN_TILE) * HC_MULT
@@ -1960,30 +1960,30 @@ def l3_prefill_cp_fwd(
         pl.Tensor[[CP_SIZE, MOE_ROWS, D], pl.BF16]
     ],
     moe_dense_x: pl.InOut[
-        pl.Tensor[[CP_SIZE, COMPACT_TOTAL_CAP, D], pl.INT8]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.INT8]
     ],
     moe_dense_scale: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, COMPACT_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD], pl.FP32
+            [CP_SIZE, PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
         ]
     ],
     moe_grouped_x: pl.InOut[
-        pl.Tensor[[CP_SIZE, COMPACT_GROUPED_TOTAL_CAP, D], pl.INT8]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
     ],
     moe_grouped_scale: pl.InOut[
         pl.Tensor[
-            [CP_SIZE, COMPACT_GROUPED_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD],
+            [CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
             pl.FP32,
         ]
     ],
     moe_grouped_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, COMPACT_GROUPED_TOTAL_CAP, D], pl.BF16]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
     ],
     moe_dense_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, COMPACT_TOTAL_CAP, D], pl.BF16]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.BF16]
     ],
     moe_returned_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, COMPACT_ROUTES_PER_SRC, D], pl.BF16]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
     ],
     # Phase 3 final-tail weights and outputs. The HC head + final RMSNorm run
     # inlined in the FWD child; a prefill-only CP-last-hidden + LM-head child
@@ -2039,19 +2039,19 @@ def l3_prefill_cp_fwd(
         [N_RANKS, N_LOCAL], dtype=pl.INT32
     )
     count_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    compact_x_target_buf = pld.alloc_window_buffer(
-        [COMPACT_TOTAL_CAP, D], dtype=pl.INT8
+    prefill_moe_x_target_buf = pld.alloc_window_buffer(
+        [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8
     )
-    compact_x_signal_buf = pld.alloc_window_buffer(
+    prefill_moe_x_signal_buf = pld.alloc_window_buffer(
         [N_RANKS, 1], dtype=pl.INT32
     )
-    compact_scale_target_buf = pld.alloc_window_buffer(
-        [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD], dtype=pl.FP32
+    prefill_moe_scale_target_buf = pld.alloc_window_buffer(
+        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32
     )
-    compact_reverse_target_buf = pld.alloc_window_buffer(
-        [COMPACT_TOTAL_CAP, D], dtype=pl.BF16
+    prefill_moe_reverse_target_buf = pld.alloc_window_buffer(
+        [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16
     )
-    compact_reverse_signal_buf = pld.alloc_window_buffer(
+    prefill_moe_reverse_signal_buf = pld.alloc_window_buffer(
         [N_RANKS, 1], dtype=pl.INT32
     )
 
@@ -2166,22 +2166,22 @@ def l3_prefill_cp_fwd(
         count_signal = pld.window(
             count_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
-        compact_x_target = pld.window(
-            compact_x_target_buf, [COMPACT_TOTAL_CAP, D], dtype=pl.INT8
+        prefill_moe_x_target = pld.window(
+            prefill_moe_x_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8
         )
-        compact_x_signal = pld.window(
-            compact_x_signal_buf, [N_RANKS, 1], dtype=pl.INT32
+        prefill_moe_x_signal = pld.window(
+            prefill_moe_x_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
-        compact_scale_target = pld.window(
-            compact_scale_target_buf,
-            [COMPACT_TOTAL_CAP, COMPACT_SCALE_PAD],
+        prefill_moe_scale_target = pld.window(
+            prefill_moe_scale_target_buf,
+            [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD],
             dtype=pl.FP32,
         )
-        compact_reverse_target = pld.window(
-            compact_reverse_target_buf, [COMPACT_TOTAL_CAP, D], dtype=pl.BF16
+        prefill_moe_reverse_target = pld.window(
+            prefill_moe_reverse_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16
         )
-        compact_reverse_signal = pld.window(
-            compact_reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32
+        prefill_moe_reverse_signal = pld.window(
+            prefill_moe_reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
         # Domain 4: HCA compact windows.
         cmp_window = pld.window(
@@ -2310,9 +2310,9 @@ def l3_prefill_cp_fwd(
             moe_grouped_y[rank], moe_dense_y[rank], moe_returned_y[rank],
             # Compact MoE comm windows.
             count_target, count_signal,
-            compact_x_target, compact_x_signal,
-            compact_scale_target,
-            compact_reverse_target, compact_reverse_signal,
+            prefill_moe_x_target, prefill_moe_x_signal,
+            prefill_moe_scale_target,
+            prefill_moe_reverse_target, prefill_moe_reverse_signal,
             # Phase 3 final-tail weights (rank-sliced).
             hc_head_fn[rank], hc_head_scale[rank], hc_head_base[rank],
             final_norm_w[rank],
@@ -3018,35 +3018,35 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
             init_value=0.0, 
         ),
         TensorSpec(
-            "moe_dense_x", [cp_size, COMPACT_TOTAL_CAP, D], torch.int8,
+            "moe_dense_x", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.int8,
             init_value=0, 
         ),
         TensorSpec(
             "moe_dense_scale",
-            [cp_size, COMPACT_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD],
+            [cp_size, PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
             torch.float32, init_value=0.0, 
         ),
         TensorSpec(
             "moe_grouped_x",
-            [cp_size, COMPACT_GROUPED_TOTAL_CAP, D],
+            [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, D],
             torch.int8, init_value=0, 
         ),
         TensorSpec(
             "moe_grouped_scale",
-            [cp_size, COMPACT_GROUPED_TOTAL_CAP, COMPACT_EXPERT_SCALE_PAD],
+            [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
             torch.float32, init_value=0.0, 
         ),
         TensorSpec(
             "moe_grouped_y",
-            [cp_size, COMPACT_GROUPED_TOTAL_CAP, D],
+            [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, D],
             torch.bfloat16, init_value=0.0, 
         ),
         TensorSpec(
-            "moe_dense_y", [cp_size, COMPACT_TOTAL_CAP, D], torch.bfloat16,
+            "moe_dense_y", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.bfloat16,
             init_value=0.0, 
         ),
         TensorSpec(
-            "moe_returned_y", [cp_size, COMPACT_ROUTES_PER_SRC, D],
+            "moe_returned_y", [cp_size, PREFILL_MOE_ROUTES_PER_SRC, D],
             torch.bfloat16, init_value=0.0, 
         ),
     ]

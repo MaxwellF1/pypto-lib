@@ -341,7 +341,7 @@ def prefill_expert_grouped(
 
     with pl.scope():
         # The intermediate A8 tensor follows the same aligned expert layout as
-        # the compact receive/output tensors.
+        # the prefill MoE receive/output tensors.
         h_i8 = pl.create_tensor(
             [PREFILL_EXPERT_GROUPED_CAP, MOE_INTER], dtype=pl.INT8
         )
@@ -579,7 +579,7 @@ def prefill_expert_grouped(
         # W2 produces unweighted expert output. Each expert accumulates the
         # TaskId of every live output tile, then one dummy task fences those
         # producers. The scope-external dummy below fans the per-expert fences
-        # into the single completion TaskId that compact combine consumes.
+        # into the single completion TaskId that prefill_moe_combine consumes.
         for local_e in pl.parallel(N_LOCAL_EXPERTS):
             weight_e = local_e
             w2_act_tids = pl.array.create(
