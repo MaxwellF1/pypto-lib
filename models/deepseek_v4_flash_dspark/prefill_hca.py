@@ -264,14 +264,17 @@ def prefill_attention_hca(
         pad_t = pl.tile.get_block_idx()
         if pl.read(local_request_ids, [pad_t]) < 0:
             attn_out[pad_t : pad_t + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-    request_dep = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
+    # Serial chain over requests. A pl.range body is its own scope, so the carry
+    # must be an array outliving it, not a Python name naming a dead local.
+    request_deps = pl.array.create(1, pl.TASK_ID)
+    request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     for request in pl.range(request_count):
         request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
         request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
         request_rows = request_end - request_start
         if request_rows > 0:
-            request_dep = hca_streaming_attn_physical(
+            request_tid = hca_streaming_attn_physical(
                 q,
                 kv_cache, swa_indices,
                 cmp_kv, cmp_block_table[request],
@@ -279,11 +282,14 @@ def prefill_attention_hca(
                 freqs_cos, freqs_sin,
                 wo_a, wo_b, wo_b_scale,
                 attn_out,
-                request_dep,
+                request_deps[0],
                 o_proj_weight_dep,
                 request_start,
                 request_rows,
             )
+            # Store the returned id, not the call: an inline callee assigned
+            # straight into a slot is not expanded.
+            request_deps[0] = request_tid
 
     hc_post(attn_out, x_hc, post, comb, x_out)
     return x_out
@@ -1001,7 +1007,9 @@ def prefill_attention_hca_cp_core(
         pad_t = pl.tile.get_block_idx()
         if pl.read(local_request_ids, [pad_t]) < 0:
             attn_out_local[pad_t : pad_t + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
-    request_dep = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
+    # Serial chain over requests, array carry as in the non-CP path above.
+    request_deps = pl.array.create(1, pl.TASK_ID)
+    request_deps[0] = pl.system.task_dummy(deps=[cache_ready_dep, pad_output_tid])
     request_count = pl.tensor.dim(query_start_loc, 0) - 1
     for request in pl.range(request_count):
         local_start = pl.cast(0, pl.INDEX)
@@ -1013,7 +1021,7 @@ def prefill_attention_hca_cp_core(
                     local_start = local_t
                 request_rows = request_rows + 1
         if request_rows > 0:
-            request_dep = hca_streaming_attn_physical(
+            request_tid = hca_streaming_attn_physical(
                 q,
                 kv_cache, swa_indices,
                 cmp_kv, cmp_block_table[request],
@@ -1021,11 +1029,14 @@ def prefill_attention_hca_cp_core(
                 freqs_cos_local, freqs_sin_local,
                 wo_a, wo_b, wo_b_scale,
                 attn_out_local,
-                request_dep,
+                request_deps[0],
                 o_proj_weight_dep,
                 local_start,
                 request_rows,
             )
+            # Store the returned id, not the call: an inline callee assigned
+            # straight into a slot is not expanded.
+            request_deps[0] = request_tid
     return attn_out_local
 
 
