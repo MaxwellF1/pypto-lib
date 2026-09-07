@@ -418,7 +418,7 @@ def prefill_layer_moe(
         arrived, data_arrived, routed_y_buf, combine_arrived,
         stage_done, stage_token, layer_completion,
         gather_window, gather_signal,
-        group_base, tp_rank, layer_i32, my_rank,
+        group_base, tp_rank, layer_i32, my_rank, pl.cast(pl.tensor.dim(attn_stage, 0), pl.INT32),
     )
     clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_epoch_signal_clear"):

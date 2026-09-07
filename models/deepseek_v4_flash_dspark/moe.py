@@ -623,12 +623,18 @@ def prefill_moe(
     tp_rank: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    group_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT, D], pl.FP32]:
     """Run one CP-aware prefill MoE layer over a rank-local token shard."""
     with pl.scope():
-        hc_pre(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
+        x_mixed_step = x_mixed
+        post_ffn_step = post_ffn
+        comb_ffn_step = comb_ffn
+        if group_tokens > 0:
+            hc_pre(attn_out, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed_step, post_ffn_step, comb_ffn_step)
 
     local_rows = pl.tensor.dim(ffn_out, 0)
+    # Every EP rank participates in every physical wave, including empty groups.
     num_waves = (local_rows + T - 1) // T
     num_waves_i32 = pl.cast(num_waves, pl.INT32)
     for wave in pl.range(num_waves):
@@ -638,6 +644,8 @@ def prefill_moe(
             local_wave_base = wave_i32 * T
             # Physical rows in the fixed-capacity wave.
             wave_rows = pl.min(T, local_rows - local_wave_base)
+            if group_tokens <= 0:
+                wave_rows = pl.cast(0, pl.INDEX)
             wave_rows_i32 = pl.cast(wave_rows, pl.INT32)
             full_wave_base = tp_rank * local_rows + local_wave_base
 
@@ -725,14 +733,15 @@ def prefill_moe(
             pl.write(layer_completion, [0], layer_id + pl.const(1, pl.INT32))
 
     with pl.scope():
-        group_rows = pl.tensor.dim(attn_out, 0)
-        ffn_out_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
-        ffn_out_full, _gather_signal = prefill_cp_token_allgather_step(
-            ffn_out, ffn_out_full,
-            gather_window, gather_signal,
-            group_base, tp_rank,
-        )
-        hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
+        if group_tokens > 0:
+            group_rows = pl.tensor.dim(attn_out, 0)
+            ffn_out_full = pl.create_tensor([group_rows, D], dtype=pl.BF16)
+            ffn_out_full, _gather_signal = prefill_cp_token_allgather_step(
+                ffn_out, ffn_out_full,
+                gather_window, gather_signal,
+                group_base, tp_rank,
+            )
+            hc_post(ffn_out_full, attn_out, post_ffn, comb_ffn, x_hc)
     return x_hc
 
 
