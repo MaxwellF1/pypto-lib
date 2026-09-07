@@ -197,9 +197,7 @@ def build_metadata(cp_size: int = CP_SIZE):
 
     seg_starts_t = torch.tensor(starts, dtype=torch.int32)
     seg_lens_t = torch.tensor(lengths, dtype=torch.int32)
-    segment_tail_positions = torch.full(
-        (nseg, TAIL_ROWS), -1, dtype=torch.int32
-    )
+    segment_tail_positions = torch.full((nseg, TAIL_ROWS), -1, dtype=torch.int32)
     for segment in range(nseg):
         valid = min(TAIL_ROWS, lengths[segment])
         if valid > 0:
@@ -316,9 +314,7 @@ def build_metadata(cp_size: int = CP_SIZE):
 def _cp_swa_stage_sources(
     cache_flat: pl.Tensor[[ORI_CACHE_ROWS, HEAD_DIM], pl.BF16],
     local_kv: pl.Tensor[[LOCAL_ROWS, HEAD_DIM], pl.BF16],
-    predecessor_kv: pl.Tensor[
-        [LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], pl.BF16
-    ],
+    predecessor_kv: pl.Tensor[[LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], pl.BF16],
     query_positions: pl.Tensor[[LOCAL_ROWS], pl.INT32],
     query_requests: pl.Tensor[[LOCAL_ROWS], pl.INT32],
     overlay_positions: pl.Tensor[[NUM_LOCAL_TILES, OVERLAY_ROWS], pl.INT32],
@@ -441,9 +437,7 @@ def prefill_cp_swa_core(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    segment_tail_positions: pl.Tensor[
-        [NUM_SEGMENTS, TAIL_ROWS], pl.INT32
-    ],
+    segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     query_positions: pl.Tensor[
         [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
@@ -497,15 +491,9 @@ def prefill_cp_swa_core(
     rope_cos_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_flat = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_cos_il = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor(
-        [LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
-    )
-    rope_swap_idx = pl.create_tensor(
-        [LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
-    )
-    logical_hidden = pl.create_tensor(
-        [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
-    )
+    rope_sin_signed = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    logical_hidden = pl.create_tensor([CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
     sparse_kv = pl.create_tensor([LOCAL_SPARSE_ROWS, HEAD_DIM], dtype=pl.BF16)
     sparse_bias = pl.create_tensor([LOCAL_ROWS, PREFILL_SPARSE_PAD], dtype=pl.FP32)
     x_flat = pl.reshape(x_hc, [NUM_LOCAL_TILES * TAIL_ROWS, HC_MULT, D])
@@ -523,15 +511,7 @@ def prefill_cp_swa_core(
     # Recipes CP prefill is one rank-local 1024-token semantic projection. The
     # two logical 512-token segments stay visible in the CP metadata below;
     # they are not exposed as eight fixed 128-token projection calls.
-    hc_pre(
-        x_flat,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post,
-        comb,
-    )
+    hc_pre(x_flat, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
     rms_norm(x_mixed, attn_norm_w, normed)
     materialize_rope_rows(
         freqs_cos,
@@ -541,13 +521,7 @@ def prefill_cp_swa_core(
         rope_cos_flat,
         rope_sin_flat,
     )
-    rope_prepare(
-        rope_cos_flat,
-        rope_sin_flat,
-        rope_cos_il,
-        rope_sin_signed,
-        rope_swap_idx,
-    )
+    rope_prepare(rope_cos_flat, rope_sin_flat, rope_cos_il, rope_sin_signed, rope_swap_idx)
     q_proj_rope(
         normed,
         wq_a,
@@ -562,15 +536,11 @@ def prefill_cp_swa_core(
         qr_scale,
     )
 
-    local_hidden_tail = pl.create_tensor(
-        [LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16
-    )
+    local_hidden_tail = pl.create_tensor([LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_tail_assemble"):
         for part in pl.range(LOCAL_PARTS):
             zero = pl.const(0, pl.INT32)
-            for tile, (segment_total,) in pl.range(
-                MAX_SEGMENT_TILES, init_values=(zero,)
-            ):
+            for tile, (segment_total,) in pl.range(MAX_SEGMENT_TILES, init_values=(zero,)):
                 active = pl.read(overlay_active_lengths, [part, tile, 1])
                 final_total = pl.yield_(segment_total + active)
             tail_start = pl.max(final_total - TAIL_ROWS, 0)
@@ -605,12 +575,8 @@ def prefill_cp_swa_core(
 
     # Recipes lowers [predecessor128, current512] for each owned segment,
     # then projects KV locally after the normalized hidden-tail exchange.
-    augmented_hidden = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16
-    )
-    augmented_positions = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS], dtype=pl.INT32
-    )
+    augmented_hidden = pl.create_tensor([LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16)
+    augmented_positions = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT32)
     with pl.spmd(
         LOCAL_PARTS,
         name_hint="cp_swa_augmented_hidden_lowering",
@@ -622,65 +588,33 @@ def prefill_cp_swa_core(
         predecessor_valid = pl.read(overlay_active_lengths, [part, 0, 0])
         for row in pl.range(TAIL_ROWS):
             destination = augmented_row0 + row
-            augmented_hidden[destination:destination + 1, :] = pl.full(
-                [1, D], dtype=pl.BF16, value=0.0
-            )
+            augmented_hidden[destination:destination + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
             pl.write(augmented_positions, [destination], pl.cast(0, pl.INT32))
             if predecessor >= 0 and row < predecessor_valid:
                 source = predecessor * TAIL_ROWS + row
-                augmented_hidden[destination:destination + 1, :] = (
-                    logical_hidden[source:source + 1, :]
-                )
-                position = pl.read(
-                    segment_tail_positions, [predecessor, row]
-                )
+                augmented_hidden[destination:destination + 1, :] = (logical_hidden[source:source + 1, :])
+                position = pl.read(segment_tail_positions, [predecessor, row])
                 if position >= 0:
                     pl.write(augmented_positions, [destination], position)
         for tile in pl.range(MAX_SEGMENT_TILES):
             active = pl.read(overlay_active_lengths, [part, tile, 1])
-            local_row0 = (
-                part * MAX_SEGMENT_TILES + tile
-            ) * TAIL_ROWS
+            local_row0 = (part * MAX_SEGMENT_TILES + tile) * TAIL_ROWS
             augmented_tile0 = augmented_row0 + (tile + 1) * TAIL_ROWS
             for row in pl.range(TAIL_ROWS):
                 destination = augmented_tile0 + row
-                augmented_hidden[destination:destination + 1, :] = pl.full(
-                    [1, D], dtype=pl.BF16, value=0.0
-                )
-                pl.write(
-                    augmented_positions,
-                    [destination],
-                    pl.cast(0, pl.INT32),
-                )
+                augmented_hidden[destination:destination + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                pl.write(augmented_positions, [destination], pl.cast(0, pl.INT32))
                 if row < active:
                     source = local_row0 + row
-                    augmented_hidden[destination:destination + 1, :] = (
-                        normed[source:source + 1, :]
-                    )
-                    pl.write(
-                        augmented_positions,
-                        [destination],
-                        pl.read(q_pos_flat, [source]),
-                    )
+                    augmented_hidden[destination:destination + 1, :] = (normed[source:source + 1, :])
+                    pl.write(augmented_positions, [destination], pl.read(q_pos_flat, [source]))
 
-    augmented_rope_cos = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
-    )
-    augmented_rope_sin = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
-    )
-    augmented_rope_cos_il = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
-    )
-    augmented_rope_sin_signed = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
-    )
-    augmented_rope_swap_idx = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
-    )
-    augmented_kv = pl.create_tensor(
-        [LOCAL_AUGMENTED_ROWS, HEAD_DIM], dtype=pl.BF16
-    )
+    augmented_rope_cos = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    augmented_rope_sin = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    augmented_rope_cos_il = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    augmented_rope_sin_signed = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    augmented_rope_swap_idx = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
+    augmented_kv = pl.create_tensor([LOCAL_AUGMENTED_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
         freqs_cos,
         freqs_sin,
@@ -707,13 +641,8 @@ def prefill_cp_swa_core(
         augmented_lowering_tid,
     )
 
-    predecessor_kv = pl.create_tensor(
-        [LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], dtype=pl.BF16
-    )
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_swa_augmented_kv_scatter",
-    ):
+    predecessor_kv = pl.create_tensor([LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_augmented_kv_scatter"):
         for part in pl.range(LOCAL_PARTS):
             augmented_row0 = part * ROWS_PER_AUGMENTED_PART
             local_row0 = part * MAX_SEGMENT_TILES * TAIL_ROWS
@@ -728,9 +657,7 @@ def prefill_cp_swa_core(
                     augmented_row0 + row0 + ROW_TILE,
                     :,
                 ]
-            for row0 in pl.range(
-                0, MAX_SEGMENT_TILES * TAIL_ROWS, ROW_TILE
-            ):
+            for row0 in pl.range(0, MAX_SEGMENT_TILES * TAIL_ROWS, ROW_TILE):
                 local_kv[
                     local_row0 + row0:local_row0 + row0 + ROW_TILE,
                     :,
@@ -750,38 +677,22 @@ def prefill_cp_swa_core(
         deps=[tail_exchange_tid],
     ) as final_hidden_tid:
         for row in pl.range(TAIL_ROWS):
-            final_hidden[row:row + 1, :] = pl.full(
-                [1, D], dtype=pl.BF16, value=0.0
-            )
+            final_hidden[row:row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
             pl.write(final_positions, [row], pl.cast(0, pl.INT32))
             segment = pl.read(final_win_seg_src, [row])
             source_row = pl.read(final_win_row_src, [row])
             if segment >= 0 and source_row >= 0:
                 source = segment * TAIL_ROWS + source_row
-                final_hidden[row:row + 1, :] = logical_hidden[
-                    source:source + 1, :
-                ]
-                position = pl.read(
-                    segment_tail_positions, [segment, source_row]
-                )
+                final_hidden[row:row + 1, :] = logical_hidden[source:source + 1, :]
+                position = pl.read(segment_tail_positions, [segment, source_row])
                 if position >= 0:
                     pl.write(final_positions, [row], position)
 
-    final_rope_cos = pl.create_tensor(
-        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
-    )
-    final_rope_sin = pl.create_tensor(
-        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16
-    )
-    final_rope_cos_il = pl.create_tensor(
-        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
-    )
-    final_rope_sin_signed = pl.create_tensor(
-        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32
-    )
-    final_rope_swap_idx = pl.create_tensor(
-        [TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32
-    )
+    final_rope_cos = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    final_rope_sin = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    final_rope_cos_il = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    final_rope_sin_signed = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+    final_rope_swap_idx = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     final_kv = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
         freqs_cos,
@@ -850,23 +761,11 @@ def prefill_cp_swa_core(
 
     attn_out = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     q_part0 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [0, 0, 0])
-    sparse_kv_part0 = pl.slice(
-        sparse_kv,
-        [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM],
-        [0, 0],
-    )
-    bias_part0 = pl.slice(
-        sparse_bias, [SEGMENT_ROWS, PREFILL_SPARSE_PAD], [0, 0]
-    )
-    mask_part0 = pl.slice(
-        valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [0, 0]
-    )
-    cos_part0 = pl.slice(
-        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
-    )
-    sin_part0 = pl.slice(
-        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0]
-    )
+    sparse_kv_part0 = pl.slice(sparse_kv, [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], [0, 0])
+    bias_part0 = pl.slice(sparse_bias, [SEGMENT_ROWS, PREFILL_SPARSE_PAD], [0, 0])
+    mask_part0 = pl.slice(valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [0, 0])
+    cos_part0 = pl.slice(rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0])
+    sin_part0 = pl.slice(rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [0, 0])
     attn_out_part0 = pl.slice(attn_out, [SEGMENT_ROWS, D], [0, 0])
     part0_attn_tid = staged_sparse_attn_512(
         q_part0,
@@ -886,33 +785,13 @@ def prefill_cp_swa_core(
 
     part1_row0 = SEGMENT_ROWS
     part1_sparse0 = SEGMENT_ROWS * PREFILL_SPARSE_PAD
-    q_part1 = pl.slice(
-        q, [SEGMENT_ROWS, H, HEAD_DIM], [part1_row0, 0, 0]
-    )
-    sparse_kv_part1 = pl.slice(
-        sparse_kv,
-        [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM],
-        [part1_sparse0, 0],
-    )
-    bias_part1 = pl.slice(
-        sparse_bias,
-        [SEGMENT_ROWS, PREFILL_SPARSE_PAD],
-        [part1_row0, 0],
-    )
-    mask_part1 = pl.slice(
-        valid_mask,
-        [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS],
-        [part1_row0, 0],
-    )
-    cos_part1 = pl.slice(
-        rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
-    )
-    sin_part1 = pl.slice(
-        rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0]
-    )
-    attn_out_part1 = pl.slice(
-        attn_out, [SEGMENT_ROWS, D], [part1_row0, 0]
-    )
+    q_part1 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [part1_row0, 0, 0])
+    sparse_kv_part1 = pl.slice(sparse_kv, [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], [part1_sparse0, 0])
+    bias_part1 = pl.slice(sparse_bias, [SEGMENT_ROWS, PREFILL_SPARSE_PAD], [part1_row0, 0])
+    mask_part1 = pl.slice(valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [part1_row0, 0])
+    cos_part1 = pl.slice(rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0])
+    sin_part1 = pl.slice(rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [part1_row0, 0])
+    attn_out_part1 = pl.slice(attn_out, [SEGMENT_ROWS, D], [part1_row0, 0])
     attention_done_tid = staged_sparse_attn_512(
         q_part1,
         sparse_kv_part1,
@@ -988,9 +867,7 @@ def prefill_cp_swa_rank(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    segment_tail_positions: pl.Tensor[
-        [NUM_SEGMENTS, TAIL_ROWS], pl.INT32
-    ],
+    segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     query_positions: pl.Tensor[
         [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
@@ -1076,9 +953,7 @@ def prefill_cp_swa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    segment_tail_positions: pl.Tensor[
-        [NUM_SEGMENTS, TAIL_ROWS], pl.INT32
-    ],
+    segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[CP_SIZE, LOCAL_PARTS], pl.INT32],
     query_position_ids: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
     query_token_to_request: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],

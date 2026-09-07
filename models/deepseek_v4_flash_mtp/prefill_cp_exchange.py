@@ -97,18 +97,14 @@ PRED_OVERLAY_ROWS = TAIL_ROWS
 OVERLAY_ROWS = 2 * TAIL_ROWS
 OVERLAY_SOURCES = 2
 
-CMP_ROWS_PER_SEGMENT = (
-    MAX_SEGMENT_TILES * TAIL_ROWS // HCA_COMPRESS_RATIO
-)
+CMP_ROWS_PER_SEGMENT = (MAX_SEGMENT_TILES * TAIL_ROWS // HCA_COMPRESS_RATIO)
 CMP_ROWS_PER_RANK = LOCAL_PARTS * CMP_ROWS_PER_SEGMENT
 CMP_META_DIM = 8
 STATE_META_DIM = 8
 CMP_WINDOW_ROWS = CP_SIZE * CMP_ROWS_PER_RANK
 STATE_WINDOW_ROWS = CP_SIZE * TAIL_ROWS
 
-ROWS_PER_RANK = (
-    LOCAL_PARTS * MAX_SEGMENT_TILES * TAIL_ROWS // CSA_COMPRESS_RATIO
-)
+ROWS_PER_RANK = (LOCAL_PARTS * MAX_SEGMENT_TILES * TAIL_ROWS // CSA_COMPRESS_RATIO)
 STATE_ROWS_PER_RANK = 8
 META_DIM = 8
 RECORDS_PER_WINDOW = CP_SIZE * ROWS_PER_RANK
@@ -130,24 +126,14 @@ def prefill_cp_last_hidden_lm_head(
     owner_part_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     lm_head_weight: pl.Tensor[[LM_HEAD_VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Out[
-        pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]
-    ],
+    logits: pl.Out[pl.Tensor[[LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     cp_hidden_window: pld.DistributedTensor[[1, D], pl.BF16],
     cp_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    lm_hidden_window: pld.DistributedTensor[
-        [LM_HEAD_GROUP_LOGIT_ROWS, D], pl.BF16
-    ],
-    lm_hidden_done: pld.DistributedTensor[
-        [LM_HEAD_TP_SIZE, 1], pl.INT32
-    ],
-    lm_logits_window: pld.DistributedTensor[
-        [LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32
-    ],
-    lm_logits_done: pld.DistributedTensor[
-        [LM_HEAD_TP_SIZE, 1], pl.INT32
-    ],
+    lm_hidden_window: pld.DistributedTensor[[LM_HEAD_GROUP_LOGIT_ROWS, D], pl.BF16],
+    lm_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    lm_logits_window: pld.DistributedTensor[[LM_HEAD_MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
+    lm_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -173,13 +159,8 @@ def prefill_cp_last_hidden_lm_head(
     epoch = pl.cast(CP_LAST_HIDDEN_EPOCH, pl.INT32)
     zero = pl.cast(0, pl.INT32)
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_cp_last_hidden_select",
-    ) as select_tid:
-        last_hidden[0:1, 0:D] = pl.full(
-            [1, D], dtype=pl.BF16, value=0.0
-        )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_last_hidden_select") as select_tid:
+        last_hidden[0:1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
         if my_rank == final_owner:
             active = pl.read(segment_active_lengths, [final_part])
             source_row_raw = (
@@ -189,9 +170,7 @@ def prefill_cp_last_hidden_lm_head(
                 - pl.cast(1, pl.INT32)
             )
             source_row = pl.cast(source_row_raw, target_type=pl.INDEX)
-            last_hidden[0:1, 0:D] = hidden_states[
-                source_row:source_row + 1, 0:D
-            ]
+            last_hidden[0:1, 0:D] = hidden_states[source_row:source_row + 1, 0:D]
 
     # PTOAS 0.60 requires each generated orchestration scope to have at most
     # one implicit Out/InOut result.  Keep payload, ready, consumed, and the
@@ -236,12 +215,7 @@ def prefill_cp_last_hidden_lm_head(
         deps=[select_tid],
     ) as ready_wait_tid:
         if my_rank != final_owner:
-            pld.system.wait(
-                signal=cp_ready,
-                offsets=[final_owner, 0],
-                expected=epoch,
-                cmp=pld.WaitCmp.Ge,
-            )
+            pld.system.wait(signal=cp_ready, offsets=[final_owner, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -281,12 +255,7 @@ def prefill_cp_last_hidden_lm_head(
         if my_rank == final_owner:
             for peer in pl.range(CP_SIZE):
                 if peer != my_rank:
-                    pld.system.wait(
-                        signal=cp_consumed,
-                        offsets=[peer, 0],
-                        expected=epoch,
-                        cmp=pld.WaitCmp.Ge,
-                    )
+                    pld.system.wait(signal=cp_consumed, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -412,19 +381,13 @@ def _prefill_cp_dual_tail_exchange_wave(
 
 @pl.jit.inline
 def _prefill_cp_hidden_tail_exchange_wave(
-    local_hidden_tail: pl.Tensor[
-        [EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16
-    ],
+    local_hidden_tail: pl.Tensor[[EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    hidden_window: pld.DistributedTensor[
-        [CP_TAIL_WINDOW_ROWS, D], pl.BF16
-    ],
+    hidden_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    logical_hidden_out: pl.Out[
-        pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]
-    ],
+    logical_hidden_out: pl.Out[pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]],
     my_rank: pl.Scalar[pl.INT32],
     payload_epoch: pl.Scalar[pl.INT32],
     comm_epoch: pl.Scalar[pl.INT32],
@@ -439,19 +402,13 @@ def _prefill_cp_hidden_tail_exchange_wave(
 
     for peer in pl.range(CP_SIZE):
         if peer != my_rank:
-            pld.system.wait(
-                signal=consumed, offsets=[peer, 0],
-                expected=comm_epoch, cmp=pld.WaitCmp.Ge,
-            )
+            pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_epoch, cmp=pld.WaitCmp.Ge)
 
     for peer in pl.range(CP_SIZE):
         for part in pl.range(LOCAL_PARTS):
             publish_pos = my_rank * LOCAL_PARTS + part
             publish_dst_row = publish_pos * TAIL_ROWS
-            src_row_base = (
-                payload_epoch * LOCAL_PARTS * TAIL_ROWS
-                + part * TAIL_ROWS
-            )
+            src_row_base = (payload_epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS)
             pld.tensor.put(
                 dst=hidden_window,
                 peer=peer,
@@ -475,23 +432,12 @@ def _prefill_cp_hidden_tail_exchange_wave(
         gather_pos = reverse_index[seg]
         owner = owner_rank_table[seg]
         if owner != my_rank:
-            pld.system.wait(
-                signal=ready, offsets=[owner, 0],
-                expected=epoch_value, cmp=pld.WaitCmp.Ge,
-            )
+            pld.system.wait(signal=ready, offsets=[owner, 0], expected=epoch_value, cmp=pld.WaitCmp.Ge)
         gather_src_row = gather_pos * TAIL_ROWS
-        gather_dst_row = (
-            payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
-        )
+        gather_dst_row = (payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS)
         for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
-            hidden_tile = hidden_window[
-                gather_src_row + t0:gather_src_row + t0 + ROW_TILE,
-                0:D,
-            ]
-            logical_hidden_out[
-                gather_dst_row + t0:gather_dst_row + t0 + ROW_TILE,
-                0:D,
-            ] = hidden_tile
+            hidden_tile = hidden_window[gather_src_row + t0:gather_src_row + t0 + ROW_TILE, 0:D]
+            logical_hidden_out[gather_dst_row + t0:gather_dst_row + t0 + ROW_TILE, 0:D] = hidden_tile
 
     for peer in pl.range(CP_SIZE):
         if peer != my_rank:
@@ -626,18 +572,13 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
                             physical_block = pl.read(cmp_block_table, [logical_block])
                             if physical_block >= 0:
                                 intra = pl.cast(logical_slot % HCA_CMP_STORAGE_BLOCK_SIZE, pl.INDEX)
-                                cmp_row_tile = cmp_window[
-                                    cmp_source_row : cmp_source_row + 1,
-                                    0:HEAD_DIM,
-                                ]
+                                cmp_row_tile = cmp_window[cmp_source_row : cmp_source_row + 1, 0:HEAD_DIM]
                                 cache_row = (
                                     pl.cast(physical_block, pl.INDEX)
                                     * HCA_CMP_STORAGE_BLOCK_SIZE
                                     + intra
                                 )
-                                cmp_kv[
-                                    cache_row : cache_row + 1, 0:HEAD_DIM
-                                ] = cmp_row_tile
+                                cmp_kv[cache_row : cache_row + 1, 0:HEAD_DIM] = cmp_row_tile
 
     for state_owner in pl.range(CP_SIZE):
         state_valid = pl.read(state_meta_window, [state_owner, 0])
@@ -847,10 +788,7 @@ def _prefill_cp_sparse_stage(
     cmp_cache_rows = pl.tensor.dim(cmp_kv, 0) * pl.tensor.dim(cmp_kv, 1)
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
     prefix = pl.read(segment_starts_t, [0])
-    with pl.spmd(
-        (LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS,
-        name_hint="prefill_cp_gather_kv",
-    ) as gather_tid:
+    with pl.spmd((LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS, name_hint="prefill_cp_gather_kv") as gather_tid:
         block = pl.tile.get_block_idx()
         schedule = block // PREFILL_ATTN_BLOCKS
         sparse_block = block - schedule * PREFILL_ATTN_BLOCKS
@@ -938,10 +876,7 @@ def _prefill_cp_sparse_stage(
                 output_row = row * PREFILL_SPARSE_PAD + key0
                 sparse_kv[output_row:output_row + PREFILL_ATTN_TILE, :] = stage
 
-    with pl.spmd(
-        LOCAL_ROWS // BIAS_TOKEN_TILE,
-        name_hint="prefill_cp_build_bias",
-    ) as bias_tid:
+    with pl.spmd(LOCAL_ROWS // BIAS_TOKEN_TILE, name_hint="prefill_cp_build_bias") as bias_tid:
         bias_block = pl.tile.get_block_idx()
         row0 = bias_block * BIAS_TOKEN_TILE
         raw_idx = pl.cast(swa_indices[row0:row0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
@@ -963,9 +898,7 @@ def _prefill_cp_sparse_stage(
                 value=FP32_NEG_INF,
             )
 
-    with pl.spmd(
-        LOCAL_ROWS, name_hint="prefill_cp_build_valid_mask"
-    ) as mask_tid:
+    with pl.spmd(LOCAL_ROWS, name_hint="prefill_cp_build_valid_mask") as mask_tid:
         row = pl.tile.get_block_idx()
         mask = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
         for sparse_block in pl.range(PREFILL_ATTN_BLOCKS):

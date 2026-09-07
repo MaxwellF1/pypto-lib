@@ -97,9 +97,7 @@ import config
 _EXPECTED_CP_LOCAL_ROWS = 2 * 4 * 128
 FWD_DEFAULT_LAYERS = 8
 config.MOE_TOKENS = _EXPECTED_CP_LOCAL_ROWS
-config.PREFILL_MOE_WEIGHT_LAYERS = _parse_static_int(
-    "num-layers", FWD_DEFAULT_LAYERS
-)
+config.PREFILL_MOE_WEIGHT_LAYERS = _parse_static_int("num-layers", FWD_DEFAULT_LAYERS)
 
 from moe import (
     clear_prefill_moe_signals,
@@ -147,9 +145,7 @@ from prefill_cp_swa_draft import (
     prefill_cp_swa_core,
 )
 from prefill_cp_zigzag import MAX_SEGMENT_TILES
-from prefill_cp_zigzag import (
-    CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM,
-)
+from prefill_cp_zigzag import (CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM)
 # HCA / CSA inline cores and their type-specific constants. The FWD child
 # calls the cores directly (never @pl.jit children); the constants are used
 # only for static child-side shape annotations and typed pl.slice offsets.
@@ -228,9 +224,7 @@ assert LOCAL_PARTS == 2
 ATTN_TILE_ROWS = TAIL_ROWS
 NUM_ATTN_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 LOCAL_ROWS = NUM_ATTN_TILES * ATTN_TILE_ROWS
-assert ATTN_TILE_ROWS == 128, (
-    f"CP attention leaf ABI requires 128 rows (got {ATTN_TILE_ROWS})"
-)
+assert ATTN_TILE_ROWS == 128, (f"CP attention leaf ABI requires 128 rows (got {ATTN_TILE_ROWS})")
 assert LOCAL_ROWS == _EXPECTED_CP_LOCAL_ROWS == MOE_ROWS, (
     f"production CP MoE requires one {LOCAL_ROWS}-row local slab "
     f"(configured MOE_ROWS={MOE_ROWS})"
@@ -331,16 +325,11 @@ def _fwd_attention_stage_barrier_from_completion(
 
 @pl.jit.inline
 def _fwd_attention_stage_barrier_from_x_attn(
-    x_attn: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D],
-        pl.FP32,
-    ],
+    x_attn: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """HCA counterpart: one task samples every attention output tile."""
     x_attn_flat = pl.reshape(x_attn, [MOE_ROWS, HC_MULT, D])
-    stage_tokens = pl.create_tensor(
-        [NUM_ATTN_TILES, 1, 8], dtype=pl.FP32
-    )
+    stage_tokens = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32)
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="fwd_attn_stage_token",
@@ -348,9 +337,7 @@ def _fwd_attention_stage_barrier_from_x_attn(
     ) as stage_tid:
         for tile in pl.range(NUM_ATTN_TILES):
             row0 = tile * ATTN_TILE_ROWS
-            stage_tokens[tile : tile + 1, 0:1, 0:8] = pl.slice(
-                x_attn_flat, [1, 1, 8], [row0, 0, 0]
-            )
+            stage_tokens[tile : tile + 1, 0:1, 0:8] = pl.slice(x_attn_flat, [1, 1, 8], [row0, 0, 0])
     return stage_tid
 
 
@@ -439,39 +426,23 @@ def _fwd_moe_tail(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     moe_x_mixed: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
     moe_post_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT], pl.FP32]],
-    moe_comb_ffn: pl.InOut[
-        pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]
-    ],
+    moe_comb_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]],
     moe_ffn_out: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
     moe_dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
-    moe_dense_scale: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
-    ],
-    moe_grouped_x: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
-    ],
+    moe_dense_scale: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
+    moe_grouped_x: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
     moe_grouped_scale: pl.InOut[
-        pl.Tensor[
-            [PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
-        ]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
-    moe_grouped_y: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
-    ],
+    moe_grouped_y: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
     moe_dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
-    moe_returned_y: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
-    ],
+    moe_returned_y: pl.InOut[pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     prefill_moe_x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
     prefill_moe_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    prefill_moe_scale_target: pld.DistributedTensor[
-        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32
-    ],
-    prefill_moe_reverse_target: pld.DistributedTensor[
-        [PREFILL_MOE_TOTAL_CAP, D], pl.BF16
-    ],
+    prefill_moe_scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    prefill_moe_reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     prefill_moe_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     hidden_out: pl.Out[
         pl.Tensor[
@@ -567,11 +538,7 @@ def prefill_cp_fwd(
     # One compressed-KV pool per flavour: a cache block holds
     # BLOCK_SIZE / COMPRESS_RATIO rows, which differs between HCA and CSA.
     hca_cmp_kv: pl.InOut[
-        pl.Tensor[
-            [FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
-             HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-            pl.BF16,
-        ]
+        pl.Tensor[[FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]
     ],
     csa_cmp_kv: pl.InOut[
         pl.Tensor[
@@ -682,10 +649,7 @@ def prefill_cp_fwd(
         ]
     ],
     idx_kv_scale: pl.InOut[
-        pl.Tensor[
-            [CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1],
-            pl.FP32,
-        ]
+        pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]
     ],
     csa_compress_state_block_table: pl.Tensor[
         [CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32
@@ -801,15 +765,9 @@ def prefill_cp_fwd(
     gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS], pl.INT64
-    ],
-    routed_w13: pl.Tensor[
-        [FWD_NUM_LAYERS * N_LOCAL, 2 * MOE_INTER, D], pl.INT8
-    ],
-    routed_w13_scale: pl.Tensor[
-        [FWD_NUM_LAYERS * N_LOCAL, 2 * MOE_INTER], pl.FP32
-    ],
+    input_ids: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS], pl.INT64],
+    routed_w13: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, 2 * MOE_INTER, D], pl.INT8],
+    routed_w13_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, 2 * MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
     shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
@@ -821,41 +779,25 @@ def prefill_cp_fwd(
     # Rank-local resident MoE workspaces, reused by every serialized layer.
     moe_x_mixed: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
     moe_post_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT], pl.FP32]],
-    moe_comb_ffn: pl.InOut[
-        pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]
-    ],
+    moe_comb_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]],
     moe_ffn_out: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
     moe_dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
-    moe_dense_scale: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
-    ],
-    moe_grouped_x: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
-    ],
+    moe_dense_scale: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
+    moe_grouped_x: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
     moe_grouped_scale: pl.InOut[
-        pl.Tensor[
-            [PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
-        ]
+        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
-    moe_grouped_y: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
-    ],
+    moe_grouped_y: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
     moe_dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
-    moe_returned_y: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
-    ],
+    moe_returned_y: pl.InOut[pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
     # Compact count/x/scale/reverse windows. all_to_all_v owns reusable,
     # self-clearing collective signals, so no per-wave epoch ABI remains.
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     prefill_moe_x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
     prefill_moe_x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    prefill_moe_scale_target: pld.DistributedTensor[
-        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32
-    ],
-    prefill_moe_reverse_target: pld.DistributedTensor[
-        [PREFILL_MOE_TOTAL_CAP, D], pl.BF16
-    ],
+    prefill_moe_scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    prefill_moe_reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     prefill_moe_reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # Phase 3 final-tail weights (HC head + final RMSNorm). The HC head
     # projects the [HC_MULT, D] hyper-connection mix to a single [D] row; the
@@ -967,9 +909,7 @@ def prefill_cp_fwd(
             x_attn_l0, completion_token_l0,
             my_rank, pl.cast(0, pl.INT32),
         )
-    attention_done_l0 = _fwd_attention_stage_barrier_from_completion(
-        completion_token_l0
-    )
+    attention_done_l0 = _fwd_attention_stage_barrier_from_completion(completion_token_l0)
 
     hidden_a = pl.create_tensor(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D],
@@ -1068,9 +1008,7 @@ def prefill_cp_fwd(
             x_attn_l1, completion_token_l1,
             my_rank, pl.cast(1, pl.INT32),
         )
-    attention_done_l1 = _fwd_attention_stage_barrier_from_completion(
-        completion_token_l1
-    )
+    attention_done_l1 = _fwd_attention_stage_barrier_from_completion(completion_token_l1)
 
     hidden_b = pl.create_tensor(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D],
@@ -1266,9 +1204,7 @@ def prefill_cp_fwd(
                 csa_layer,  # tail_comm_epoch
                 compact_ep,  # compact_comm_epoch_base
             )
-        attention_done_csa = _fwd_attention_stage_barrier_from_completion(
-            completion_token_csa
-        )
+        attention_done_csa = _fwd_attention_stage_barrier_from_completion(completion_token_csa)
 
         # CSA MoE weight slices (global layer index csa_layer).
         hc_ffn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -1379,9 +1315,7 @@ def prefill_cp_fwd(
                 hca_layer,  # tail_comm_epoch
                 compact_ep,  # compact_comm_epoch_base
             )
-        attention_done_hca = _fwd_attention_stage_barrier_from_x_attn(
-            x_attn_hca
-        )
+        attention_done_hca = _fwd_attention_stage_barrier_from_x_attn(x_attn_hca)
 
         # HCA MoE weight slices (global layer index hca_layer).
         hc_ffn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -1535,11 +1469,7 @@ def prefill_cp_fwd(
                 final_csa_layer,  # tail_comm_epoch
                 final_csa_compact_ep,  # compact_comm_epoch_base
             )
-        attention_done_final_csa = (
-            _fwd_attention_stage_barrier_from_completion(
-                completion_token_final_csa
-            )
-        )
+        attention_done_final_csa = (_fwd_attention_stage_barrier_from_completion(completion_token_final_csa))
 
         # Final CSA L42 MoE weight slices (global layer index).
         hc_ffn_fn_final: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [final_csa_layer * MIX_HC, 0])
@@ -1671,36 +1601,18 @@ def l3_prefill_cp_fwd(
     ],
     # SWA attention weights and RoPE tables are replicated once per rank in
     # the host ABI so the L3 harness can keep each copy device-resident.
-    hc_attn_fn: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32
-    ],
+    hc_attn_fn: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * MIX_HC], pl.FP32
-    ],
+    hc_attn_base: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * D], pl.BF16],
     wq_a: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8
-    ],
-    wq_b_scale: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32
-    ],
-    wkv: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16
-    ],
-    gamma_cq: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * Q_LORA], pl.BF16
-    ],
-    gamma_ckv: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16
-    ],
-    freqs_cos: pl.Tensor[
-        [CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
-    ],
-    freqs_sin: pl.Tensor[
-        [CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16
-    ],
+    wq_b: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[CP_SIZE, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.InOut[
         pl.Tensor[
             [CP_SIZE, FWD_NUM_LAYERS * ORI_MAX_BLOCKS, BLOCK_ROWS, 1, HEAD_DIM],
@@ -1723,12 +1635,8 @@ def l3_prefill_cp_fwd(
         ]
     ],
     attn_sink: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16
-    ],
-    wo_b: pl.Tensor[
-        [CP_SIZE, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8
-    ],
+    wo_a: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[CP_SIZE, FWD_NUM_LAYERS * D], pl.FP32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     predecessor_segments: pl.Tensor[[CP_SIZE, LOCAL_PARTS], pl.INT32],
@@ -1762,18 +1670,10 @@ def l3_prefill_cp_fwd(
     # --- HCA type-specific (layers 3 and 5) -----------------------------
     # Compact compressor weights are type-stacked inside a rank-leading
     # resident copy. The rank-local child still receives the original ABI.
-    hca_cmp_wkv: pl.Tensor[
-        [CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM, D], pl.BF16
-    ],
-    hca_cmp_wgate: pl.Tensor[
-        [CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM, D], pl.BF16
-    ],
-    hca_cmp_ape: pl.Tensor[
-        [CP_SIZE, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HEAD_DIM], pl.FP32
-    ],
-    hca_cmp_norm_w: pl.Tensor[
-        [CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM], pl.BF16
-    ],
+    hca_cmp_wkv: pl.Tensor[[CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM, D], pl.BF16],
+    hca_cmp_wgate: pl.Tensor[[CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM, D], pl.BF16],
+    hca_cmp_ape: pl.Tensor[[CP_SIZE, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HEAD_DIM], pl.FP32],
+    hca_cmp_norm_w: pl.Tensor[[CP_SIZE, HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
     # Persistent state: stacked by HCA_NUM_LAYERS on axis 1 (rank-leading).
     hca_compress_state: pl.InOut[
         pl.Tensor[
@@ -1793,45 +1693,18 @@ def l3_prefill_cp_fwd(
     ],
     # --- CSA type-specific (layers 2 and 4) -----------------------------
     # Compact/indexer weights follow the same resident host layout.
-    csa_cmp_wkv: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16
-    ],
-    csa_cmp_wgate: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16
-    ],
-    csa_cmp_ape: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM],
-        pl.FP32,
-    ],
-    csa_cmp_norm_w: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16
-    ],
-    hadamard_idx: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16
-    ],
-    idx_wq_b: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM],
-        pl.INT8,
-    ],
-    idx_wq_b_scale: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32
-    ],
-    idx_weights_proj: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16
-    ],
-    csa_inner_wkv: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_INNER_OUT_DIM, D], pl.BF16
-    ],
-    csa_inner_wgate: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_INNER_OUT_DIM, D], pl.BF16
-    ],
-    csa_inner_ape: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM],
-        pl.FP32,
-    ],
-    csa_inner_norm_w: pl.Tensor[
-        [CP_SIZE, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16
-    ],
+    csa_cmp_wkv: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_cmp_wgate: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
+    csa_cmp_ape: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
+    csa_cmp_norm_w: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
+    hadamard_idx: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    idx_wq_b: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    idx_wq_b_scale: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    idx_weights_proj: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_ape: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
+    csa_inner_norm_w: pl.Tensor[[CP_SIZE, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
     # Persistent state/caches: stacked by CSA_NUM_LAYERS on axis 1.
     csa_compress_state: pl.InOut[
         pl.Tensor[
@@ -1947,44 +1820,21 @@ def l3_prefill_cp_fwd(
     ],
     # Rank-leading resident MoE workspaces, sliced once per child launch and
     # reused by every serialized layer on that rank.
-    moe_x_mixed: pl.InOut[
-        pl.Tensor[[CP_SIZE, MOE_ROWS, D], pl.BF16]
-    ],
-    moe_post_ffn: pl.InOut[
-        pl.Tensor[[CP_SIZE, MOE_ROWS, HC_MULT], pl.FP32]
-    ],
-    moe_comb_ffn: pl.InOut[
-        pl.Tensor[[CP_SIZE, MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]
-    ],
-    moe_ffn_out: pl.InOut[
-        pl.Tensor[[CP_SIZE, MOE_ROWS, D], pl.BF16]
-    ],
-    moe_dense_x: pl.InOut[
-        pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.INT8]
-    ],
+    moe_x_mixed: pl.InOut[pl.Tensor[[CP_SIZE, MOE_ROWS, D], pl.BF16]],
+    moe_post_ffn: pl.InOut[pl.Tensor[[CP_SIZE, MOE_ROWS, HC_MULT], pl.FP32]],
+    moe_comb_ffn: pl.InOut[pl.Tensor[[CP_SIZE, MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]],
+    moe_ffn_out: pl.InOut[pl.Tensor[[CP_SIZE, MOE_ROWS, D], pl.BF16]],
+    moe_dense_x: pl.InOut[pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
     moe_dense_scale: pl.InOut[
-        pl.Tensor[
-            [CP_SIZE, PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32
-        ]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
-    moe_grouped_x: pl.InOut[
-        pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]
-    ],
+    moe_grouped_x: pl.InOut[pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
     moe_grouped_scale: pl.InOut[
-        pl.Tensor[
-            [CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
-            pl.FP32,
-        ]
+        pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
     ],
-    moe_grouped_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]
-    ],
-    moe_dense_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.BF16]
-    ],
-    moe_returned_y: pl.InOut[
-        pl.Tensor[[CP_SIZE, PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]
-    ],
+    moe_grouped_y: pl.InOut[pl.Tensor[[CP_SIZE, PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
+    moe_dense_y: pl.InOut[pl.Tensor[[CP_SIZE, PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
+    moe_returned_y: pl.InOut[pl.Tensor[[CP_SIZE, PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
     # Phase 3 final-tail weights and outputs. The HC head + final RMSNorm run
     # inlined in the FWD child; a prefill-only CP-last-hidden + LM-head child
     # is host-launched per rank over hidden_out. hc_head_fn/scale/base and
@@ -2039,18 +1889,12 @@ def l3_prefill_cp_fwd(
         [N_RANKS, N_LOCAL], dtype=pl.INT32
     )
     count_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    prefill_moe_x_target_buf = pld.alloc_window_buffer(
-        [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8
-    )
-    prefill_moe_x_signal_buf = pld.alloc_window_buffer(
-        [N_RANKS, 1], dtype=pl.INT32
-    )
+    prefill_moe_x_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    prefill_moe_x_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     prefill_moe_scale_target_buf = pld.alloc_window_buffer(
         [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32
     )
-    prefill_moe_reverse_target_buf = pld.alloc_window_buffer(
-        [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16
-    )
+    prefill_moe_reverse_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     prefill_moe_reverse_signal_buf = pld.alloc_window_buffer(
         [N_RANKS, 1], dtype=pl.INT32
     )
@@ -2111,15 +1955,9 @@ def l3_prefill_cp_fwd(
 
     # Domain 6a: Recipes CP-global final hidden.  The final owner publishes one
     # post-RMSNorm [1, D] row; ready/consumed protect retained graph reuse.
-    cp_last_hidden_window_buf = pld.alloc_window_buffer(
-        [1, D], dtype=pl.BF16
-    )
-    cp_last_hidden_ready_buf = pld.alloc_window_buffer(
-        [CP_SIZE, 1], dtype=pl.INT32
-    )
-    cp_last_hidden_consumed_buf = pld.alloc_window_buffer(
-        [CP_SIZE, 1], dtype=pl.INT32
-    )
+    cp_last_hidden_window_buf = pld.alloc_window_buffer([1, D], dtype=pl.BF16)
+    cp_last_hidden_ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
+    cp_last_hidden_consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
 
     # Domain 6b: LM-head TP gather/combine (mirrors baseline prefill_fwd.py
     # Domain "lm_head"). The LM head owns every window and counter it touches:
@@ -2160,9 +1998,7 @@ def l3_prefill_cp_fwd(
         tail_consumed = pld.window(
             tail_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
         )
-        count_target = pld.window(
-            count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32
-        )
+        count_target = pld.window(count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         count_signal = pld.window(
             count_signal_buf, [N_RANKS, 1], dtype=pl.INT32
         )
@@ -2327,15 +2163,9 @@ def l3_prefill_cp_fwd(
     # [1, D] input.  Every CP rank receives the same row, matching Recipes;
     # the four LM-head windows remain group-local.
     for rank in pl.range(pld.world_size()):
-        cp_last_hidden_window = pld.window(
-            cp_last_hidden_window_buf, [1, D], dtype=pl.BF16
-        )
-        cp_last_hidden_ready = pld.window(
-            cp_last_hidden_ready_buf, [CP_SIZE, 1], dtype=pl.INT32
-        )
-        cp_last_hidden_consumed = pld.window(
-            cp_last_hidden_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
-        )
+        cp_last_hidden_window = pld.window(cp_last_hidden_window_buf, [1, D], dtype=pl.BF16)
+        cp_last_hidden_ready = pld.window(cp_last_hidden_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_last_hidden_consumed = pld.window(cp_last_hidden_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
         hidden_window = pld.window(
             lm_head_hidden_window_buf,
             [LM_HEAD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16
@@ -2464,10 +2294,7 @@ _RESIDENT_STATIC_NAMES = frozenset(
     + _HCA_COMPACT_WEIGHT_NAMES
     + _CSA_COMPACT_WEIGHT_NAMES
     + _MOE_WEIGHT_NAMES
-    + (
-        "hc_head_fn", "hc_head_scale", "hc_head_base", "final_norm_w",
-        "lm_head_weight",
-    )
+    + ("hc_head_fn", "hc_head_scale", "hc_head_base", "final_norm_w", "lm_head_weight")
 )
 _RESIDENT_STATE_NAMES = frozenset(
     {
@@ -2590,10 +2417,7 @@ def _make_stacked_swa_attn_spec(name: str, base_spec: TensorSpec,
         raw = base_spec.create_tensor()
         return torch.cat([raw] * num_layers, dim=0)
 
-    return TensorSpec(
-        name, shape, base_spec.dtype, init_value=init_value,
-        resident=base_spec.resident,
-    )
+    return TensorSpec(name, shape, base_spec.dtype, init_value=init_value, resident=base_spec.resident)
 
 
 def _replicate_resident_spec(
@@ -2701,10 +2525,7 @@ def _stack_type_spec(
 
     def init_value():
         raw = base_spec.create_tensor()
-        return torch.cat(
-            [raw] * num_type_layers,
-            dim=1 if rank_leading else 0,
-        )
+        return torch.cat([raw] * num_type_layers, dim=1 if rank_leading else 0)
 
     return TensorSpec(
         name, shape, base_spec.dtype, init_value=init_value,
@@ -2760,9 +2581,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
             def init_profiles(swa=base, cmp=compressed):
                 return torch.stack([swa.create_tensor(), cmp.create_tensor()], dim=0)
 
-            profiles = TensorSpec(
-                name, [2, *base.shape], base.dtype, init_value=init_profiles,
-            )
+            profiles = TensorSpec(name, [2, *base.shape], base.dtype, init_value=init_profiles)
             specs_by_name[name] = _replicate_resident_spec(profiles, cp_size)
         else:
             specs_by_name[name] = base
@@ -2802,10 +2621,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     # CP HCA pages 128 compressed rows; CSA pages 32 compressed rows.
     # Each pool is seeded from its own single-layer module spec.
     def _cmp_pool(page_rows, donor):
-        shape = [
-            cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM,
-            page_rows, 1, HEAD_DIM,
-        ]
+        shape = [cp_size, FWD_NUM_LAYERS * PREFILL_CMP_BLOCK_NUM, page_rows, 1, HEAD_DIM]
 
         def init_pool():
             base = donor.create_tensor()
@@ -2815,16 +2631,12 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
 
         return shape, init_pool
 
-    hca_cmp_shape, init_hca_cmp = _cmp_pool(
-        HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"]
-    )
+    hca_cmp_shape, init_hca_cmp = _cmp_pool(HCA_CMP_STORAGE_BLOCK_SIZE, hca_by_name["cmp_kv"])
     specs_by_name["hca_cmp_kv"] = TensorSpec(
         "hca_cmp_kv", hca_cmp_shape,
         torch.bfloat16, init_value=init_hca_cmp,
     )
-    csa_cmp_shape, init_csa_cmp = _cmp_pool(
-        CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"]
-    )
+    csa_cmp_shape, init_csa_cmp = _cmp_pool(CSA_CMP_STORAGE_BLOCK_SIZE, csa_by_name["cmp_kv"])
     specs_by_name["csa_cmp_kv"] = TensorSpec(
         "csa_cmp_kv", csa_cmp_shape,
         torch.bfloat16, init_value=init_csa_cmp,
@@ -2898,9 +2710,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
             rank_leading=True,
         )
     for new_name, base_name in _CSA_BLOCK_TABLE_RENAME_MAP.items():
-        specs_by_name[new_name] = _rename_spec(
-            csa_by_name[base_name], new_name,
-        )
+        specs_by_name[new_name] = _rename_spec(csa_by_name[base_name], new_name)
     for name in ("idx_kv_cache", "idx_kv_scale"):
         specs_by_name[name] = _stack_type_spec(
             name, csa_by_name[name], CSA_NUM_LAYERS,
@@ -2955,19 +2765,10 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     routed_w3_scale_base = moe_by_name["routed_w3_scale"]
 
     def _init_routed_w13():
-        return torch.cat(
-            [routed_w1_base.create_tensor(), routed_w3_base.create_tensor()],
-            dim=2,
-        )
+        return torch.cat([routed_w1_base.create_tensor(), routed_w3_base.create_tensor()], dim=2)
 
     def _init_routed_w13_scale():
-        return torch.cat(
-            [
-                routed_w1_scale_base.create_tensor(),
-                routed_w3_scale_base.create_tensor(),
-            ],
-            dim=2,
-        )
+        return torch.cat([routed_w1_scale_base.create_tensor(), routed_w3_scale_base.create_tensor()], dim=2)
 
     moe_by_name["routed_w13"] = TensorSpec(
         "routed_w13",
@@ -3001,36 +2802,17 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     # TensorSpec uses ``
     # matching the host ABI while keeping each slab resident across layers.
     moe_workspace_specs = [
-        TensorSpec(
-            "moe_x_mixed", [cp_size, MOE_ROWS, D], torch.bfloat16,
-            init_value=0.0, 
-        ),
-        TensorSpec(
-            "moe_post_ffn", [cp_size, MOE_ROWS, HC_MULT], torch.float32,
-            init_value=0.0, 
-        ),
-        TensorSpec(
-            "moe_comb_ffn", [cp_size, MOE_ROWS, HC_MULT * HC_MULT],
-            torch.float32, init_value=0.0, 
-        ),
-        TensorSpec(
-            "moe_ffn_out", [cp_size, MOE_ROWS, D], torch.bfloat16,
-            init_value=0.0, 
-        ),
-        TensorSpec(
-            "moe_dense_x", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.int8,
-            init_value=0, 
-        ),
+        TensorSpec("moe_x_mixed", [cp_size, MOE_ROWS, D], torch.bfloat16, init_value=0.0),
+        TensorSpec("moe_post_ffn", [cp_size, MOE_ROWS, HC_MULT], torch.float32, init_value=0.0),
+        TensorSpec("moe_comb_ffn", [cp_size, MOE_ROWS, HC_MULT * HC_MULT], torch.float32, init_value=0.0),
+        TensorSpec("moe_ffn_out", [cp_size, MOE_ROWS, D], torch.bfloat16, init_value=0.0),
+        TensorSpec("moe_dense_x", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.int8, init_value=0),
         TensorSpec(
             "moe_dense_scale",
             [cp_size, PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
             torch.float32, init_value=0.0, 
         ),
-        TensorSpec(
-            "moe_grouped_x",
-            [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, D],
-            torch.int8, init_value=0, 
-        ),
+        TensorSpec("moe_grouped_x", [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, D], torch.int8, init_value=0),
         TensorSpec(
             "moe_grouped_scale",
             [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD],
@@ -3041,10 +2823,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
             [cp_size, PREFILL_MOE_GROUPED_TOTAL_CAP, D],
             torch.bfloat16, init_value=0.0, 
         ),
-        TensorSpec(
-            "moe_dense_y", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.bfloat16,
-            init_value=0.0, 
-        ),
+        TensorSpec("moe_dense_y", [cp_size, PREFILL_MOE_TOTAL_CAP, D], torch.bfloat16, init_value=0.0),
         TensorSpec(
             "moe_returned_y", [cp_size, PREFILL_MOE_ROUTES_PER_SRC, D],
             torch.bfloat16, init_value=0.0, 
@@ -3367,9 +3146,7 @@ def _check_logits(actual, _expected, *, inputs, **_kwargs):
     for rank in range(1, cp_size):
         rank_mask = row_indices[rank] >= 0
         if not torch.equal(rank_mask, reference_mask):
-            failures.append(
-                f"rank {rank}: valid logits mask differs from rank 0"
-            )
+            failures.append(f"rank {rank}: valid logits mask differs from rank 0")
             continue
         candidate = actual[rank][rank_mask]
         if not torch.allclose(candidate, reference, rtol=1e-4, atol=1e-4):
@@ -3544,9 +3321,7 @@ if __name__ == "__main__":
         compiled = l3_prefill_cp_fwd.compile(
             config=RunConfig(
                 platform=args.platform,
-                distributed_config=DistributedConfig(
-                    device_ids=device_ids[:args.cp], num_sub_workers=0
-                ),
+                distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
                 dump_passes=args.dump_passes,
             )
         )
