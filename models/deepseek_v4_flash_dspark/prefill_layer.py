@@ -107,6 +107,11 @@ from prefill_swa import golden_prefill_attention_swa, prefill_attention_swa_cp
 # model config
 GROUP_TOKENS = TP_SIZE * T
 
+# runtime
+# Per-ring output heap, 1 GiB on each of the 4 rings. The 256 MiB compile-time
+# default deadlocks the ring allocator on this layer.
+PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
 # fixture
 SUPPORTED_LAYERS = (0, 2, 3)
 
@@ -416,6 +421,16 @@ def prefill_layer_moe(
         group_base, tp_rank, layer_i32, my_rank,
     )
     clear_prefill_moe_signals(stage_token, arrived, data_arrived, combine_arrived, stage_done)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_epoch_signal_clear"):
+        # Clear the two fixed-threshold epoch signals the MoE clear does not own.
+        # Reading the final MoE output orders this after every peer's last notify,
+        # which the wave-barrier epoch alone does not establish.
+        _completion_anchor = pl.read(x_next, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(epoch_init_done, [src, 0], zero)
+        for source_tp in pl.range(TP_SIZE):
+            pl.write(gather_signal, [source_tp, 0], zero)
     return x_next
 
 
@@ -1066,6 +1081,7 @@ def main():
                 device_ids=device_ids[:N_RANKS], num_sub_workers=0
             ),
             platform=args.platform,
+            ring_heap=PREFILL_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,
