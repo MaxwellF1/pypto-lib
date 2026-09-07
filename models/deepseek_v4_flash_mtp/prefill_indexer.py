@@ -162,9 +162,7 @@ def prefill_indexer(
     # === Q RoPE + Hadamard rotation + per-row INT8 quant ===
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
-    qr_hadamard_scale_dq = pl.create_tensor(
-        [T * IDX_N_HEADS, 1], dtype=pl.FP32
-    )
+    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
 
     # Materialize fixed-shape interleaved RoPE rows.
     rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -224,23 +222,16 @@ def prefill_indexer(
 
     for quant_idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_ROW_TILE, name_hint="prefill_idx_qr_quant", allow_early_resolve=True):
         r0 = quant_idx * QH_QUANT_ROW_TILE
-        qh_amax = pl.full(
-            [1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS
-        )
+        qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_tile = qh_acc_gm[
-                r0 : r0 + QH_QUANT_ROW_TILE,
-                h0 : h0 + HEAD_DIM_TILE,
-            ]
+            qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
             qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
             qh_row_max = pl.reshape(pl.row_max(qh_abs), [1, QH_QUANT_ROW_TILE])
             qh_amax = pl.maximum(qh_amax, qh_row_max)
         scale_max = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
         scale_quant_row = pl.div(scale_max, qh_amax)
         qr_scale_tile = pl.reshape(pl.recip(scale_quant_row), [QH_QUANT_ROW_TILE, 1])
-        qr_hadamard_scale_dq[
-            r0 : r0 + QH_QUANT_ROW_TILE, :
-        ] = qr_scale_tile
+        qr_hadamard_scale_dq[r0 : r0 + QH_QUANT_ROW_TILE, :] = qr_scale_tile
         scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_ROW_TILE, 1])
         for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
             qh_quant_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE]
@@ -263,9 +254,7 @@ def prefill_indexer(
                 weights_acc = pl.matmul(x_tile, wp_tile, out_dtype=pl.FP32)
             else:
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, wp_tile)
-        weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(
-            weights_acc, WEIGHTS_SCALE
-        )
+        weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     # === inner compressor: build the paged compressed index KV cache ===
     idx_kv_cache_out, idx_kv_scale_out, inner_compress_state_out = prefill_indexer_compressor(
@@ -330,10 +319,7 @@ def prefill_indexer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
             score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
     else:
-        for score_out_idx in pl.spmd(
-            T // SCORE_OUT_TOKEN_TILE,
-            name_hint="prefill_idx_score_out",
-        ):
+        for score_out_idx in pl.spmd(T // SCORE_OUT_TOKEN_TILE, name_hint="prefill_idx_score_out"):
             score_out_t0 = score_out_idx * SCORE_OUT_TOKEN_TILE
             score_out_flat[
                 score_out_t0 : score_out_t0 + SCORE_OUT_TOKEN_TILE,
@@ -385,10 +371,7 @@ def _cp_topk512_query(
 
     if query < num_tokens:
         position = pl.read(position_ids, [query])
-        visible_count = pl.max(
-            pl.min((position + 1) // COMPRESS_RATIO, CP_INDEXER_SCORE_CAP),
-            0,
-        )
+        visible_count = pl.max(pl.min((position + 1) // COMPRESS_RATIO, CP_INDEXER_SCORE_CAP), 0)
         if visible_count > 0:
             score_row_raw = pl.load(
                 score_wide,
@@ -396,21 +379,11 @@ def _cp_topk512_query(
                 [1, CP_INDEXER_SORT_LEN],
                 valid_shape=[1, visible_count],
             )
-            score_row = pl.tile.fillpad(
-                score_row_raw, pad_value=pl.PadValue.min
-            )
-            score_floor = pl.tile.full(
-                [1, CP_INDEXER_SORT_LEN],
-                dtype=pl.FP32,
-                value=FP32_NEG_INF,
-            )
+            score_row = pl.tile.fillpad(score_row_raw, pad_value=pl.PadValue.min)
+            score_floor = pl.tile.full([1, CP_INDEXER_SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
             score_row = pl.maximum(score_row, score_floor)
-            index_ramp = pl.tile.arange(
-                0, [1, CP_INDEXER_SORT_LEN], dtype=pl.INT32
-            )
-            pairs = pl.tile.sort32(
-                score_row, pl.reinterpret_view(index_ramp, pl.UINT32)
-            )
+            index_ramp = pl.tile.arange(0, [1, CP_INDEXER_SORT_LEN], dtype=pl.INT32)
+            pairs = pl.tile.sort32(score_row, pl.reinterpret_view(index_ramp, pl.UINT32))
             pairs = pl.tile.mrgsort(pairs, block_len=64)
             pairs = pl.tile.mrgsort(pairs, block_len=256)
             pairs = pl.tile.mrgsort(pairs, block_len=1024)
@@ -418,24 +391,16 @@ def _cp_topk512_query(
             # The 64/256/1024 stages therefore fully sort 2048 scores.  A
             # 4096 stage is only valid for the 8192-score #1080 donor leaf;
             # on this 2048-score row it lowers to an illegal AIV config.
-            top_pairs = pl.tile.slice(
-                pairs, [1, 2 * IDX_TOPK], [0, 0]
-            )
+            top_pairs = pl.tile.slice(pairs, [1, 2 * IDX_TOPK], [0, 0])
             selected_indices = pl.tile.gather_mask(
                 top_pairs,
                 mask_pattern=pl.tile.MaskPattern.P1010,
                 output_dtype=pl.INT32,
             )
-            output_indices = pl.tile.full(
-                [1, IDX_TOPK], dtype=pl.INT32, value=-1
-            )
+            output_indices = pl.tile.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             valid_topk = pl.min(visible_count, IDX_TOPK)
             for lane in pl.range(valid_topk):
-                pl.tile.write(
-                    output_indices,
-                    [0, lane],
-                    pl.tile.read(selected_indices, [0, lane]),
-                )
+                pl.tile.write(output_indices, [0, lane], pl.tile.read(selected_indices, [0, lane]))
             pl.store(output_indices, [query, 0], cmp_topk_indices)
 
 
@@ -450,12 +415,8 @@ def _prefill_indexer_cp_score_topk(
     cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Tensor[
-        [IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8
-    ],
-    idx_kv_scale: pl.Tensor[
-        [IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP16
-    ],
+    idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP16],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -547,17 +508,12 @@ def _prefill_indexer_cp_score_topk(
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     # QuantLightningIndexer consumes per-token-head query scales as FP16.
-    qr_hadamard_scale_dq = pl.create_tensor(
-        [T * IDX_N_HEADS, 1], dtype=pl.FP16
-    )
+    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP16)
     for quant_idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_ROW_TILE, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=True):
         r0 = quant_idx * QH_QUANT_ROW_TILE
         qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-            qh_tile = qh_acc_gm[
-                r0 : r0 + QH_QUANT_ROW_TILE,
-                h0 : h0 + HEAD_DIM_TILE,
-            ]
+            qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
             qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
             qh_row_max = pl.reshape(pl.row_max(qh_abs), [1, QH_QUANT_ROW_TILE])
             qh_amax = pl.maximum(qh_amax, qh_row_max)
@@ -597,23 +553,15 @@ def _prefill_indexer_cp_score_topk(
 
     # Score paged INT8 cache rows.
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
-    kv_cache_i8_flat = pl.reshape(
-        idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM]
-    )
-    kv_scale_flat = pl.reshape(
-        idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1]
-    )
+    kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM])
+    kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
     score_wide = pl.create_tensor([T, CP_INDEXER_SORT_LEN], dtype=pl.FP32)
     for si in pl.parallel(0, T, SCORE_INIT_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_idx_score_init"):
             score_init_tile = pl.full([SCORE_INIT_TILE, CP_INDEXER_SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
             score_wide[si : si + SCORE_INIT_TILE, :] = score_init_tile
 
-    with pl.spmd(
-        T // SCORE_TOKEN_TILE,
-        name_hint="prefill_cp_idx_score",
-        deps=[prior_dep],
-    ) as score_tid:
+    with pl.spmd(T // SCORE_TOKEN_TILE, name_hint="prefill_cp_idx_score", deps=[prior_dep]) as score_tid:
         score_idx = pl.tile.get_block_idx()
         token0 = score_idx * SCORE_TOKEN_TILE
         last_pos = pl.read(position_ids, [num_tokens - 1])
@@ -626,17 +574,10 @@ def _prefill_indexer_cp_score_topk(
                 physical_block_raw = pl.read(idx_block_table, [logical_block])
                 # Recipes page 0 is a zero sentinel, never a data page.
                 if physical_block_raw > 0 and physical_block_raw < idx_block_num:
-                    kv_row0 = (
-                        pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE
-                        + page_offset
-                    )
-                    kv_q_i8_full = kv_cache_i8_flat[
-                        kv_row0 : kv_row0 + CACHE_TILE, 0:IDX_HEAD_DIM
-                    ]
+                    kv_row0 = (pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE + page_offset)
+                    kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CACHE_TILE, 0:IDX_HEAD_DIM]
                     kv_cache_scale_dq = pl.cast(
-                        kv_scale_flat[
-                            kv_row0 : kv_row0 + CACHE_TILE, :
-                        ],
+                        kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :],
                         target_type=pl.FP32,
                         mode="none",
                     )
@@ -647,28 +588,18 @@ def _prefill_indexer_cp_score_topk(
                             qr_hadamard_i8_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
                             score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_i8_tile, out_dtype=pl.INT32, b_trans=True)
                             qh_scale_source = pl.cast(
-                                qr_hadamard_scale_dq[
-                                    q_s0 : q_s0 + IDX_N_HEADS, :
-                                ],
+                                qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :],
                                 target_type=pl.FP32,
                                 mode="none",
                             )
-                            qh_scale_s = pl.reshape(
-                                qh_scale_source, [1, IDX_N_HEADS]
-                            )
+                            qh_scale_s = pl.reshape(qh_scale_source, [1, IDX_N_HEADS])
                             score_acc_fp32 = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
                             score_row_scaled = pl.row_expand_mul(score_acc_fp32, kv_cache_scale_dq)
                             score_scaled = pl.col_expand_mul(score_row_scaled, qh_scale_s)
                             score_zero = pl.mul(score_scaled, 0.0)
                             relu_score_s = pl.maximum(score_scaled, score_zero)
-                            weight_row = pl.cast(
-                                weights[t : t + 1, :],
-                                target_type=pl.FP32,
-                                mode="none",
-                            )
-                            weighted_heads = pl.col_expand_mul(
-                                relu_score_s, weight_row
-                            )
+                            weight_row = pl.cast(weights[t : t + 1, :], target_type=pl.FP32, mode="none")
+                            weighted_heads = pl.col_expand_mul(relu_score_s, weight_row)
                             weighted_sum = pl.row_sum(weighted_heads)
                             weighted_score_s = pl.reshape(weighted_sum, [1, CACHE_TILE])
                             pos = pl.read(position_ids, [t])
@@ -686,14 +617,8 @@ def _prefill_indexer_cp_score_topk(
     # Select the model-configured TopK=512 with the incore tile path used by
     # #1080.  The old orchestration-level 4096 merge lowers to an illegal
     # vector configuration on A2/A3.
-    with pl.spmd(
-        T,
-        name_hint="prefill_cp_idx_topk",
-        deps=[score_tid, prior_dep],
-    ) as _topk_tid:
-        _cp_topk512_query(
-            score_wide, position_ids, num_tokens, cmp_topk_indices
-        )
+    with pl.spmd(T, name_hint="prefill_cp_idx_topk", deps=[score_tid, prior_dep]) as _topk_tid:
+        _cp_topk512_query(score_wide, position_ids, num_tokens, cmp_topk_indices)
 
     return cmp_topk_indices, _topk_tid
 
@@ -712,15 +637,10 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
             if non_padding:
                 return f"inactive top-k row {t} contains {non_padding} non--1 entries"
             continue
-        visible = min(
-            int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO),
-            INDEXER_TOPK_CAP,
-        )
+        visible = min(int((int(position_ids[t].item()) + 1) // COMPRESS_RATIO), INDEXER_TOPK_CAP)
         prefix = row[:visible]
         if visible:
-            out_of_range = int(
-                ((prefix < 0) | (prefix >= visible)).count_nonzero().item()
-            )
+            out_of_range = int(((prefix < 0) | (prefix >= visible)).count_nonzero().item())
             if out_of_range:
                 return (
                     f"top-k row {t} has {out_of_range} entries outside "
@@ -728,10 +648,7 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
                 )
             unique_count = int(torch.unique(prefix).numel())
             if unique_count != visible:
-                return (
-                    f"top-k row {t} visible prefix has "
-                    f"{unique_count}/{visible} unique entries"
-                )
+                return (f"top-k row {t} visible prefix has " f"{unique_count}/{visible} unique entries")
         tail_non_padding = int((row[visible:] != -1).count_nonzero().item())
         if tail_non_padding:
             return f"top-k row {t} tail contains {tail_non_padding} non--1 entries"
@@ -806,9 +723,7 @@ def golden_prefill_indexer_core(tensors):
     cache_flat_i8 = tensors["idx_kv_cache"].reshape(
         PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, IDX_HEAD_DIM
     )
-    scale_flat = tensors["idx_kv_scale"].float().reshape(
-        PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, 1
-    )
+    scale_flat = tensors["idx_kv_scale"].float().reshape(PREFILL_IDX_BLOCK_NUM * IDX_STORAGE_BLOCK_SIZE, 1)
     idx_block_table = tensors["idx_block_table"]
     rows = [
         int(idx_block_table[c // CACHE_TILE].item()) * IDX_STORAGE_BLOCK_SIZE + (c % CACHE_TILE)
@@ -1119,11 +1034,7 @@ if __name__ == "__main__":
         score = actual_outputs["score"]
         a_top = actual[..., :IDX_TOPK]
         e_top = expected[..., :IDX_TOPK]
-        contract_error = topk_prefix_contract_error(
-            a_top,
-            inputs["position_ids"],
-            args.num_tokens,
-        )
+        contract_error = topk_prefix_contract_error(a_top, inputs["position_ids"], args.num_tokens)
         if contract_error:
             return False, f"    {contract_error}"
         invalid_top = a_top < 0

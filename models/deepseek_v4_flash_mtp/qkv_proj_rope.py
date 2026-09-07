@@ -231,11 +231,7 @@ def rope_prepare(
                 rope_sin_signed_view,
             )
             pl.store(
-                pl.set_validshape(
-                    pl.cast(qrp_tail_swap_f, target_type=pl.INT32),
-                    qrp_valid_rows,
-                    ROPE_DIM,
-                ),
+                pl.set_validshape(pl.cast(qrp_tail_swap_f, target_type=pl.INT32), qrp_valid_rows, ROPE_DIM),
                 [qrp_t0, 0],
                 rope_swap_idx_view,
             )
@@ -372,10 +368,7 @@ def q_proj_rope(
             # Full 64-row cube tiles use the dense path.  The A2/A3 partial-M path is
             # not numerically reliable at this tile size, so the final incomplete
             # 64-row block is lowered through the established 16-row cube shape.
-            for qproj_n_idx in pl.spmd(
-                (H * HEAD_DIM) // QPROJ_MM_N_TILE,
-                name_hint="qproj_matmul",
-            ):
+            for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
                 w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
                 for t0 in pl.range(0, qproj_full_rows, DENSE_QPROJ_M_TILE):
                     col_acc = pl.create_tensor([DENSE_QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
