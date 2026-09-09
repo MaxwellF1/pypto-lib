@@ -286,34 +286,29 @@ def expert_shared_test(
 
 
 def golden_expert_shared(tensors):
-    """Torch reference for the shared expert.
-
-    Input is the per-token INT8 quant produced by gate (shared with
-    dispatch / routed expert); we dequant inside to match the kernel's
-    dequant-then-matmul pattern."""
+    """Compute the shared-expert reference with INT32 accumulation."""
     from utils import int8_quant_per_row
     import torch
-    import torch.nn.functional as F
 
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
+    x_local_i8 = tensors["x_local_i8"].to(torch.int32)
+    x_local_scale_dq = tensors["x_local_scale_dq"].float()
+    w1_scale = tensors["shared_w1_scale"].float().unsqueeze(0)
+    w3_scale = tensors["shared_w3_scale"].float().unsqueeze(0)
+    w2_scale = tensors["shared_w2_scale"].float().unsqueeze(0)
 
-    x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
-    x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
-    x_local = x_local_i8.float() * x_local_scale_dq
-    sw1 = dequant_w(tensors["shared_w1"], tensors["shared_w1_scale"].float())
-    sw3 = dequant_w(tensors["shared_w3"], tensors["shared_w3_scale"].float())
-    sw2 = dequant_w(tensors["shared_w2"], tensors["shared_w2_scale"].float())
-
-    sh_gate = x_local @ sw1.T
-    sh_up = x_local @ sw3.T
+    gate_int = x_local_i8 @ tensors["shared_w1"].to(torch.int32).T
+    up_int = x_local_i8 @ tensors["shared_w3"].to(torch.int32).T
+    sh_gate = gate_int.float() * x_local_scale_dq * w1_scale
+    sh_up = up_int.float() * x_local_scale_dq * w3_scale
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sh_h = F.silu(sh_gate) * sh_up
+    # Preserve the kernel's activation order before the INT8 rounding boundary.
+    sigmoid = torch.reciprocal(torch.exp(-sh_gate) + 1.0)
+    sh_h = (sh_gate * sigmoid) * sh_up
     sh_h_i8, sh_h_sd = int8_quant_per_row(sh_h)
-    sh_h = sh_h_i8.float() * sh_h_sd
-    sh = sh_h @ sw2.T
+    sh_int = sh_h_i8.to(torch.int32) @ tensors["shared_w2"].to(torch.int32).T
+    sh = sh_int.float() * sh_h_sd * w2_scale
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
@@ -385,6 +380,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
+    import torch
     from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
@@ -395,6 +391,8 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    # Keep the activation requantization boundary case reproducible.
+    torch.manual_seed(5)
     result = run(
         fn=expert_shared_test,
         specs=build_tensor_specs(),
