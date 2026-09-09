@@ -21,9 +21,9 @@ that every kernel imports as a bare sibling module.
 | Decode context length | up to 16,384 positions, paged in 128-token pages (`max_position_embeddings`, `BLOCK_SIZE`) |
 | Prefill shape | one request per rank partition, each with up to 8,192 active tokens per dispatch; the program walks the dynamic extent in 128-token tiles (`PREFILL_BATCH`, `PREFILL_SEQ`) |
 | Platform | Ascend A2/A3, single node |
-| Expert parallelism | EP8 uses all 256 routed experts; the existing EP2/EP4 harness configurations scale the total to 64/128 experts, retaining 32 experts per rank |
+| Expert parallelism | `--ep 2/4/8`; the deployment point is EP 8, and each rank holds `256 / ep` routed experts |
 | LM-head parallelism | `--tp 2/4/8/16` vocab shards over DP row owners, `--tp <= --ep` |
-| Context parallelism | prefill CP is 1 or the full EP world; eligible cold single-owner requests use CP by default, while decode attention retains its rank-local micro-batch |
+| Other components | no tensor parallelism — attention is data-parallel (each rank owns its own decode micro-batch) and the MoE is expert-parallel |
 | Quantization | W8A8 INT8: INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
 
 ### What is quantized
@@ -87,39 +87,11 @@ three compressor states) are passed in flat and sliced per layer.
 
 ### `prefill_fwd`
 
-[prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) exposes
-the established `l3_prefill_fwd` HOST signature. The lib owns CP request
-exchange, device metadata and workspace; callers continue to pass the same
-weights, paged caches, request metadata and output tensors.
-
-The private rank dispatcher selects CP for a cold request with a single
-owner and a supported length. CP=1, existing prefix/chunk continuation,
-multiple-owner requests and requests outside CP capacity use local scheduling.
-Both schedules follow the 43-layer attention/MoE order and share the
-`hc_head → rms_norm` tail. The HOST uses the existing LM head to project
-selected owner rows. Local and CP scheduling remain distinct where ownership,
-communication and persistent-cache semantics differ.
-
-CP uses two zigzag segments per rank. The segment span is computed from the
-request length, with a minimum of 128 rows; the backing capacity remains four
-128-row tiles per segment. Consequently CP2, CP4 and CP8 support cold requests
-within capacities of 2,048, 4,096 and 8,192 tokens respectively, including
-short inputs starting at one token. This is variable length within a fixed
-capacity. CP continuation across chunks, arbitrary CP subgroups and 1M context
-extension are not implemented by this change.
-
-The standalone runner accepts `--cp 1` or `--cp <ep>`; the default is the full
-EP world. CP=1 disables context parallelism while retaining the configured
-expert and LM-head groups, so it does not imply one-device serving support.
-The EP2/EP4 harnesses use a reduced expert count and are not full-checkpoint
-strong-scaling configurations.
-The standalone runner reserves `(2, 2, 1, 2)` GiB for CP2/CP4 and
-`(2, 2, 2, 2)` GiB for CP8 across runtime heap levels 0 through 3;
-CP=1 keeps `(1, 1, 1, 1)` GiB. These capacities cover packed root,
-attention, MoE transport, and sparse-reader workspaces. Serving callers must
-configure their runtime heaps accordingly; the unchanged tensor ABI does not
-size them. The CP request epilogue retires its attention communication credits,
-so serving may retain windows with `reset_persistent_windows=False`.
+[prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
+that structure for a packed prompt: the same per-rank kernel shape, the same
+per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
+orchestrations, and the same `hc_head → rms_norm → lm_head` tail over selected
+hidden rows.
 
 ### `decode_fwd_mtp`
 
@@ -173,11 +145,9 @@ decode_csa   hc_pre → rmsnorm → qkv_proj_rope
 
 ### MoE stage
 
-[moe.py](../../../models/deepseek_v4_flash_mtp/moe.py) owns the shared MoE
-primitives. `PrefillMoELayout` and `make_prefill_moe` produce immutable
-layout-specific prefill programs: ordinary prefill and MTP use 128 rows, while
-CP uses its 1,024-row local capacity. These programs coexist without mutating
-a global token-count configuration. Decode retains its eight-row program. `gate` is RMSNorm + router + top-k + normalize and
+[moe.py](../../../models/deepseek_v4_flash_mtp/moe.py) is one distributed
+single-layer program that `decode_fwd`, `prefill_fwd`, the layer harnesses, and
+the MTP entries all call. `gate` is RMSNorm + router + top-k + normalize and
 also produces the per-token INT8 view; `dispatch` and `combine` are the EP
 collectives (per-source lanes with folded notifies); `expert_shared` and
 `expert_routed` are the two FFN paths.
@@ -189,25 +159,6 @@ collectives (per-source lanes with folded notifies); `expert_shared` and
 owners, projects them against this card's vocab shard, then all-to-alls the
 logits so each owner ends with its own rows over the full vocabulary. Greedy
 sampling is fused into the same program.
-
-### Shared prefill attention
-
-Each attention kind owns its local and context-parallel cache adapters in
-`prefill_swa.py`, `prefill_hca.py`, or `prefill_csa.py`. There are no separate
-`prefill_cp_swa.py`, `prefill_cp_hca.py`, or `prefill_cp_csa.py` implementations.
-All adapters use the same HC mixing, RMS normalization, Q projection, and
-RoPE preparation in `prefill_attention_prolog`. SWA shares its staged
-attention and residual-update composition; paged HCA and CSA share the
-physical-cache attention and residual-update composition with CP CSA.
-CP HCA retains its contiguous augmented-cache reader. Projection and
-attention arithmetic remain in the common kernel modules.
-
-CP changes sequence ownership, hidden-tail exchange, and cache transport.
-The local adapter retains paged-prefix continuation and performs no CP
-communication. CP size one means context parallelism is disabled; it does
-not remove the independent expert/tensor-parallel topology requirements.
-The public `prefill_fwd` calling convention and serving integration are
-unchanged by the attention-module consolidation.
 
 ### MTP path
 
@@ -249,11 +200,10 @@ serving-level residency and lowering — with the limit measured at each step.
 | Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
 | Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_flash_mtp/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/decode_indexer_compressor.py) |
 | Prefill attention and cache | [prefill_swa.py](../../../models/deepseek_v4_flash_mtp/prefill_swa.py), [prefill_csa.py](../../../models/deepseek_v4_flash_mtp/prefill_csa.py), [prefill_hca.py](../../../models/deepseek_v4_flash_mtp/prefill_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_flash_mtp/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer_compressor.py) |
-| CP prefill scheduling | [prefill_cp.py](../../../models/deepseek_v4_flash_mtp/prefill_cp.py), [prefill_cp_exchange.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_exchange.py), [prefill_cp_zigzag.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_zigzag.py) |
 | Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_flash_mtp/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_flash_mtp/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_flash_mtp/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_flash_mtp/hc_post.py), [hc_head.py](../../../models/deepseek_v4_flash_mtp/hc_head.py), [rope_interleave.py](../../../models/deepseek_v4_flash_mtp/rope_interleave.py), [lookup_embedding.py](../../../models/deepseek_v4_flash_mtp/lookup_embedding.py) |
 | MoE and output | [moe.py](../../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_mtp/lm_head.py) |
 | Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../../models/deepseek_v4_flash_mtp/utils.py) |
 
-`config.py`, `utils.py`, `rope_interleave.py`, `decode_prepare.py`, and
-`prefill_cp.py` have no `__main__` block: they are imported rather than run. Every other file,
+`config.py`, `utils.py`, `rope_interleave.py`, and `decode_prepare.py` have
+no `__main__` block: they are imported rather than run. Every other file,
 including `decode_fwd_mtp.py`, is an executable composition.
