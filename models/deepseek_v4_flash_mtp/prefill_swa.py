@@ -7,8 +7,23 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4 SWA prefill with shared math and local/CP cache adapters."""
+# ci: devices=2
 
 import sys
+
+# Standalone CI passes its borrowed device list without a --cp argument.
+# Resolve fixture topology before importing modules that freeze CP shapes.
+if __name__ == "__main__":
+    import argparse
+
+    fixture_parser = argparse.ArgumentParser(add_help=False)
+    fixture_parser.add_argument("-d", "--device", default="0")
+    fixture_parser.add_argument("--cp", type=int, default=None)
+    fixture_args, _ = fixture_parser.parse_known_args()
+    _run_cp_fixture = fixture_args.cp is not None or "," in fixture_args.device
+    if fixture_args.cp is None and _run_cp_fixture:
+        sys.argv += ["--cp", str(len(fixture_args.device.split(",")))]
+
 import torch
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
@@ -1604,7 +1619,7 @@ def golden_prefill_cp_swa(tensors):
             tensors["kv_cache"][rank].copy_(final_cache[rank])
 
 
-if __name__ == "__main__" and "--cp" not in sys.argv:
+if __name__ == "__main__" and not _run_cp_fixture:
     import argparse
     from golden import ratio_allclose, ratio_reldiff, run
 
@@ -1652,7 +1667,7 @@ if __name__ == "__main__" and "--cp" not in sys.argv:
         raise SystemExit(1)
 
 
-if __name__ == "__main__" and "--cp" in sys.argv:
+if __name__ == "__main__" and _run_cp_fixture:
     import argparse
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel SWA test.")

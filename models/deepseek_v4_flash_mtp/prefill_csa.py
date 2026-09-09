@@ -7,10 +7,25 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
+# ci: devices=2
 
 import functools
 
 import sys
+
+# Standalone CI passes its borrowed device list without a --cp argument.
+# Resolve fixture topology before importing modules that freeze CP shapes.
+if __name__ == "__main__":
+    import argparse
+
+    fixture_parser = argparse.ArgumentParser(add_help=False)
+    fixture_parser.add_argument("-d", "--device", default="0")
+    fixture_parser.add_argument("--cp", type=int, default=None)
+    fixture_args, _ = fixture_parser.parse_known_args()
+    _run_cp_fixture = fixture_args.cp is not None or "," in fixture_args.device
+    if fixture_args.cp is None and _run_cp_fixture:
+        sys.argv += ["--cp", str(len(fixture_args.device.split(",")))]
+
 import argparse
 import torch
 import pypto.language.distributed as pld
@@ -1006,7 +1021,6 @@ def _quant_w_per_output_channel_local(w):
     return w_i32.to(torch.float16).to(torch.int8), (1.0 / scale_quant).float()
 
 
-# ci: devices=2
 
 
 # model config
@@ -4649,7 +4663,7 @@ def golden_prefill_cp_csa(tensors):
     tensors["x_out"][:] = x_out
 
 
-if __name__ == "__main__" and "--cp" not in sys.argv:
+if __name__ == "__main__" and not _run_cp_fixture:
     import argparse
     from golden import ratio_allclose, ratio_reldiff, run
 
@@ -4705,7 +4719,7 @@ if __name__ == "__main__" and "--cp" not in sys.argv:
         raise SystemExit(1)
 
 
-if __name__ == "__main__" and "--cp" in sys.argv:
+if __name__ == "__main__" and _run_cp_fixture:
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel CSA test.")
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
