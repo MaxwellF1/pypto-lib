@@ -150,14 +150,7 @@ def prefill_attention_swa(
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-    )
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
 
     # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -186,15 +179,11 @@ def prefill_attention_swa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor(
-        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
-    )
+    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
         for idx_t in pl.range(T):
             idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full(
-                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
-            )
+            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -209,15 +198,9 @@ def prefill_attention_swa(
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(idx_row, [0, win_col], row)
                             if win_col < SPARSE_BIAS_COLS:
-                                pl.write(
-                                    mask_row,
-                                    [0, win_col // PREFILL_ATTN_TILE],
-                                    pl.cast(1, pl.INT32),
-                                )
+                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
             swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
-            valid_block_mask = pl.assemble(
-                valid_block_mask, mask_row, [idx_t, 0]
-            )
+            valid_block_mask = pl.assemble(valid_block_mask, mask_row, [idx_t, 0])
 
     # Cache layout is local to this caller; attention math is shared with CP.
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
@@ -517,8 +500,7 @@ def build_tensor_specs(
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
-                   init_value=init_kv_cache),
+        TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [BLOCK_NUM], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
@@ -840,22 +822,11 @@ def _cp_swa_stage_sources(
         # physical SWA columns below.  The remaining sparse blocks stay masked.
         sparse_bias[
             bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:PREFILL_SPARSE_PAD
-        ] = pl.full(
-            [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD],
-            dtype=pl.FP32,
-            value=FP32_NEG_INF,
-        )
+        ] = pl.full([BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
         valid_block_mask[
             bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:VALID_BLOCK_MASK_COLS
-        ] = pl.full(
-            [BIAS_TOKEN_TILE, VALID_BLOCK_MASK_COLS],
-            dtype=pl.INT32,
-            value=0,
-        )
-        bias_idx = pl.cast(
-            swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN],
-            target_type=pl.FP32,
-        )
+        ] = pl.full([BIAS_TOKEN_TILE, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+        bias_idx = pl.cast(swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
         flags = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
         sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = pl.mul(pl.sub(flags, 1.0), -FP32_NEG_INF)
     return gather_tid, bias_tid
@@ -995,10 +966,7 @@ def prefill_cp_swa_core(
                         part * TAIL_ROWS + row + 1
                     ] = normed[src:src + 1]
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_swa_tail_exchange",
-    ) as tail_exchange_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_tail_exchange") as tail_exchange_tid:
         _prefill_cp_hidden_tail_exchange_wave(
             local_hidden_tail,
             reverse_index,
@@ -1016,11 +984,7 @@ def prefill_cp_swa_core(
     # then projects KV locally after the normalized hidden-tail exchange.
     augmented_hidden = pl.create_tensor([LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16)
     augmented_positions = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT32)
-    with pl.spmd(
-        LOCAL_PARTS,
-        name_hint="cp_swa_augmented_hidden_lowering",
-        deps=[tail_exchange_tid],
-    ) as augmented_lowering_tid:
+    with pl.spmd(LOCAL_PARTS, name_hint="cp_swa_augmented_hidden_lowering", deps=[tail_exchange_tid]) as augmented_lowering_tid:
         part = pl.tile.get_block_idx()
         augmented_row0 = part * ROWS_PER_AUGMENTED_PART
         predecessor = pl.read(predecessor_segments, [part])
@@ -1110,11 +1074,7 @@ def prefill_cp_swa_core(
     # projected locally; it may span more than one logical segment.
     final_hidden = pl.create_tensor([TAIL_ROWS, D], dtype=pl.BF16)
     final_positions = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_swa_final_hidden_lowering",
-        deps=[tail_exchange_tid],
-    ) as final_hidden_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_final_hidden_lowering", deps=[tail_exchange_tid]) as final_hidden_tid:
         for row in pl.range(TAIL_ROWS):
             final_hidden[row:row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
             pl.write(final_positions, [row], pl.cast(0, pl.INT32))
@@ -1170,10 +1130,7 @@ def prefill_cp_swa_core(
     )
     stage_ready_tid = pl.system.task_dummy(deps=[gather_tid, bias_tid])
     cache_commit_flat = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_swa_cache_commit",
-    ) as raw_commit_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_cache_commit") as raw_commit_tid:
         for row in pl.range(TAIL_ROWS):
             seg = final_win_seg_src[row]
             src_row = final_win_row_src[row]
@@ -1231,14 +1188,8 @@ def prefill_cp_swa_core(
         part1_active, part0_attn_tid,
     )
 
-    resource_done_tid = pl.system.task_dummy(
-        deps=[tail_exchange_tid, raw_commit_tid, attention_done_tid]
-    )
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="cp_swa_rank_complete",
-        deps=[resource_done_tid],
-    ):
+    resource_done_tid = pl.system.task_dummy(deps=[tail_exchange_tid, raw_commit_tid, attention_done_tid])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_rank_complete", deps=[resource_done_tid]):
         for tile in pl.range(NUM_LOCAL_TILES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(
                 x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0]
@@ -1314,9 +1265,7 @@ def prefill_cp_swa_rank(
 ):
     """Standalone CP-SWA rank child. Delegates to the inline core so the
     standalone test preserves the original @pl.jit entry point."""
-    completion_token = pl.create_tensor(
-        [NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32
-    )
+    completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
     return prefill_cp_swa_core(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
@@ -1376,20 +1325,14 @@ def prefill_cp_swa_test(
     x_out: pl.Out[pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32]],
 ):
     """Launch one CP-SWA child per rank."""
-    window_buf = pld.alloc_window_buffer(
-        [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
-    )
+    window_buf = pld.alloc_window_buffer([CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
     ready_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
     consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
-        window = pld.window(
-            window_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16
-        )
+        window = pld.window(window_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
         ready = pld.window(ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
-        consumed = pld.window(
-            consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
-        )
+        consumed = pld.window(consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
         prefill_cp_swa_rank(
             x_hc[rank],
             hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
@@ -1432,9 +1375,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     base["hc_attn_scale"] = torch.randn(3)
     base["hc_attn_base"] = torch.randn(MIX_HC)
     base["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
-    base["freqs_cos"], base["freqs_sin"] = build_rope_tables(
-        M, 0, dtype=torch.bfloat16
-    )
+    base["freqs_cos"], base["freqs_sin"] = build_rope_tables(M, 0, dtype=torch.bfloat16)
     max_pos = max(ctx["starts"][s] + ctx["lengths"][s] for s in range(2 * cp_size))
     all_x = torch.empty(max_pos + TAIL_ROWS, HC_MULT, D).uniform_(-1, 1)
     x = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D)
@@ -1640,10 +1581,7 @@ if __name__ == "__main__" and not _run_cp_fixture:
 
     result = run(
         fn=prefill_attention_swa_test,
-        specs=build_tensor_specs(
-            args.start_pos,
-            args.num_tokens,
-        ),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_attention_swa,
         config=dict(
             dump_passes=args.dump_passes,
@@ -1707,8 +1645,7 @@ if __name__ == "__main__" and _run_cp_fixture:
         save_data=args.save_data,
         compile_only=args.compile_only,
         config=dict(
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:args.cp], num_sub_workers=0),
+            distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
             dump_passes=args.dump_passes,
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,

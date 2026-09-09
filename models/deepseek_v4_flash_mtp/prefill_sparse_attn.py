@@ -444,11 +444,7 @@ def _physical_sparse_wave(
 
     # This is the post-0.60 DSpark donor contract: ``swa_indices`` already
     # contains physical rows in a page-128 root, with -1 for invalid entries.
-    with pl.spmd(
-        gather_blocks,
-        name_hint="physical_sparse_gather_ori",
-        deps=[raw_ready_tid],
-    ) as gather_ori_tid:
+    with pl.spmd(gather_blocks, name_hint="physical_sparse_gather_ori", deps=[raw_ready_tid]) as gather_ori_tid:
         gather_schedule_block = pl.tile.get_block_idx()
         gather_token_block = gather_blocks - 1 - gather_schedule_block
         gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
@@ -469,11 +465,7 @@ def _physical_sparse_wave(
                         ]
                 source_view[block_base : block_base + PREFILL_ATTN_TILE, 0:HEAD_DIM] = stage
 
-    with pl.spmd(
-        gather_cmp_blocks,
-        name_hint="physical_sparse_gather_cmp",
-        deps=[compressed_ready_tid],
-    ) as gather_cmp_tid:
+    with pl.spmd(gather_cmp_blocks, name_hint="physical_sparse_gather_cmp", deps=[compressed_ready_tid]) as gather_cmp_tid:
         gather_block = pl.tile.get_block_idx()
         gather_schedule_block = (gather_block // (PREFILL_ATTN_BLOCKS - 1))
         gather_token_block = gather_blocks - 1 - gather_schedule_block
@@ -586,10 +578,7 @@ def _physical_sparse_heads(
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = packed_init_tid
     with pl.scope():
-        sparse_kv = pl.create_tensor(
-            [source_rows, HEAD_DIM],
-            dtype=pl.BF16,
-        )
+        sparse_kv = pl.create_tensor([source_rows, HEAD_DIM], dtype=pl.BF16)
         sparse_bias = pl.create_tensor([token_rows, PREFILL_SPARSE_PAD], dtype=pl.FP32)
         sparse_blk_mi = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
         sparse_blk_li = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
@@ -672,9 +661,7 @@ def _staged_attn_o_proj(
                     pa_rb = pl.tile.get_block_idx()
                     pa_r0 = pa_rb * STAGED_SWA_PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor(
-                        [1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32
-                    )
+                    acc_a = pl.create_tensor([1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
                     for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
                         k0 = kb * A_K_TILE
                         xa_k_chunk = o_packed[
@@ -717,11 +704,7 @@ def _staged_attn_o_proj(
             d0 = dc * STAGED_SWA_PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):
                 col_g = g * O_LORA
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="staged_swa_proj_b_mm",
-                    deps=[quant_tids[g]],
-                ) as pb_tid:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="staged_swa_proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                     for nf in pl.range(STAGED_SWA_PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
                         for pb_rb in pl.range(projection_rows // STAGED_SWA_PROJ_B_ROW_TILE):
@@ -971,11 +954,7 @@ def _hca_segment_heads(
                             ]
 
     attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    with pl.spmd(
-        token_rows,
-        name_hint="native_hca_merge_rope_pack",
-        deps=[raw_heads_tid, cmp_qk_tid],
-    ) as merge_tid:
+    with pl.spmd(token_rows, name_hint="native_hca_merge_rope_pack", deps=[raw_heads_tid, cmp_qk_tid]) as merge_tid:
         # At MTP's one-work-tile extent, token parallelism alone saturates the
         # device.  Fold the head tiles into each token block so position/RoPE
         # rows stay live and the merge does not fan out four tiny blocks.
@@ -1105,16 +1084,8 @@ def _hca_heads(
             pl.write(tile_cmp_visible_rows, [0], pl.cast(plan_visible_rows, pl.INT32))
 
         cmp_work_kv = pl.create_tensor([HCA_CMP_PAD_ROWS, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        cmp_work_valid = pl.create_tensor(
-            [HCA_CMP_WORK_COUNT, HCA_ATTN_TILE],
-            dtype=pl.FP32,
-            manual_dep=True,
-        )
-        with pl.spmd(
-            HCA_CMP_WORK_COUNT,
-            name_hint="native_hca_cmp_gather",
-            deps=[cmp_plan_tid],
-        ) as cmp_gather_tid:
+        cmp_work_valid = pl.create_tensor([HCA_CMP_WORK_COUNT, HCA_ATTN_TILE], dtype=pl.FP32, manual_dep=True)
+        with pl.spmd(HCA_CMP_WORK_COUNT, name_hint="native_hca_cmp_gather", deps=[cmp_plan_tid]) as cmp_gather_tid:
             gather_work = pl.tile.get_block_idx()
             gather_dst0 = gather_work * HCA_ATTN_TILE
             gather_visible = pl.cast(pl.read(tile_cmp_visible_rows, [0]), pl.INDEX)
@@ -1215,11 +1186,7 @@ def hca_attn(
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = cache_ready_dep
     with pl.scope():
-        o_packed_heads = pl.create_tensor(
-            [packed_head_rows, HEAD_DIM],
-            dtype=pl.BF16,
-            manual_dep=True,
-        )
+        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         with pl.spmd(
             packed_head_rows // STAGED_SWA_QUERY_TILE,
             name_hint="native_hca_packed_init",
@@ -1229,11 +1196,7 @@ def hca_attn(
             o_packed_heads[
                 packed_row:packed_row + STAGED_SWA_QUERY_TILE,
                 0:HEAD_DIM,
-            ] = pl.full(
-                [STAGED_SWA_QUERY_TILE, HEAD_DIM],
-                dtype=pl.BF16,
-                value=0.0,
-            )
+            ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
         o_packed_heads, heads_dep = _hca_heads(
             q,
@@ -1251,14 +1214,7 @@ def hca_attn(
             cache_ready_dep,
         )
         o_proj_dep = pl.system.task_dummy(deps=[heads_dep, o_proj_weight_dep])
-        _attn_out, act_tid = _staged_attn_o_proj(
-            o_packed_heads,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            attn_out,
-            o_proj_dep,
-        )
+        _attn_out, act_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, o_proj_dep)
         completion[0] = act_tid
 
     return completion[0]
@@ -1293,11 +1249,7 @@ def physical_sparse_attn(
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = compressed_ready_dep
     with pl.scope():
-        o_packed_heads = pl.create_tensor(
-            [packed_head_rows, HEAD_DIM],
-            dtype=pl.BF16,
-            manual_dep=True,
-        )
+        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         with pl.spmd(
             packed_head_rows // STAGED_SWA_QUERY_TILE,
             name_hint="physical_sparse_packed_init",
@@ -1307,11 +1259,7 @@ def physical_sparse_attn(
             o_packed_heads[
                 packed_row : packed_row + STAGED_SWA_QUERY_TILE,
                 0:HEAD_DIM,
-            ] = pl.full(
-                [STAGED_SWA_QUERY_TILE, HEAD_DIM],
-                dtype=pl.BF16,
-                value=0.0,
-            )
+            ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
         o_packed_heads, heads_tid = _physical_sparse_heads(
             q,
@@ -1342,11 +1290,7 @@ def physical_sparse_attn(
 
     # PR #1073 publishes the final output dependency after leaving the
     # tile-local scope.  Keep that exact post-0.60 lifetime pattern here.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="physical_sparse_publish",
-        deps=[completion[0]],
-    ) as publish_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="physical_sparse_publish", deps=[completion[0]]) as publish_tid:
         completion_anchor = pl.read(attn_out, [0, 0])
         pl.write(attn_out, [0, 0], completion_anchor)
     return publish_tid
@@ -1382,11 +1326,7 @@ def staged_sparse_attn(
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = prior_dep
     with pl.scope():
-        o_packed_heads = pl.create_tensor(
-            [packed_head_rows, HEAD_DIM],
-            dtype=pl.BF16,
-            manual_dep=True,
-        )
+        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         with pl.spmd(
             packed_head_rows // STAGED_SWA_QUERY_TILE,
             name_hint="staged_swa_packed_init",
@@ -1409,14 +1349,7 @@ def staged_sparse_attn(
             packed_init_tid,
             prior_dep,
         )
-        _attn_out, act_tid = _staged_attn_o_proj(
-            o_packed_heads,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            attn_out,
-            heads_dep,
-        )
+        _attn_out, act_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
         completion[0] = act_tid
 
     # ``attn_out`` is caller-owned GM storage written by the projection tasks.
@@ -1833,8 +1766,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128,
-                                       valid_rows=args.num_tokens, zero_tail=True),
+            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, valid_rows=args.num_tokens, zero_tail=True),
         },
     )
     if not result.passed:

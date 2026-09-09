@@ -772,9 +772,7 @@ def qkv_proj_rope(
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
-    rope_prepare(
-        rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
-    )
+    rope_prepare(rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx)
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
