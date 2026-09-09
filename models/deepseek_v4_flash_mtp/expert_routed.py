@@ -285,6 +285,9 @@ def make_prefill_expert_grouped(grouped_capacity: int):
         # Host orchestration reads these bases immediately after the layout task.
         # Keep automatic dependency tracking so that read waits for this writer.
         expert_bases = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+        # Keep the aligned A8 workspace in the caller's MoE stage scope.
+        h_i8 = pl.create_tensor([grouped_capacity, MOE_INTER], dtype=pl.INT8)
+        h_scale_dq = pl.create_tensor([grouped_capacity, 1], dtype=pl.FP32, manual_dep=True)
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="prefill_exp_group_layout",
@@ -302,11 +305,6 @@ def make_prefill_expert_grouped(grouped_capacity: int):
         expert_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
 
         with pl.scope():
-            # The intermediate A8 tensor follows the same aligned expert layout as
-            # the prefill MoE receive/output tensors.
-            h_i8 = pl.create_tensor([grouped_capacity, MOE_INTER], dtype=pl.INT8)
-            h_scale_dq = pl.create_tensor([grouped_capacity, 1], dtype=pl.FP32, manual_dep=True)
-
             # Gate/up projections share one dispatch and intermediate layout while
             # reading the same separate resident weight roots as decode.
             for local_i in pl.parallel(N_LOCAL_EXPERTS):

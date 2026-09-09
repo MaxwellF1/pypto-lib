@@ -1864,6 +1864,21 @@ def _cp_csa_compress_pack_part(
     main_state = pl.reshape(main_state_workspace, [main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM])
     inner_state = pl.reshape(inner_state_workspace, [inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM])
 
+    # Alternate the input workspace and one scratch pair across serial leaves.
+    # Keep full-state copies and physical page IDs unchanged.
+    main_state_scratch = pl.create_tensor(
+        [main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM],
+        dtype=pl.FP32,
+    )
+    inner_state_scratch = pl.create_tensor(
+        [
+            inner_state_blocks,
+            INNER_STATE_BLOCK_SIZE,
+            INNER_STATE_DIM,
+        ],
+        dtype=pl.FP32,
+    )
+
     # Each compressor leaf is a coarse stage.
     for leaf in pl.unroll(MAX_COMPRESS_LEAVES):
         row0 = leaf * T
@@ -1895,18 +1910,18 @@ def _cp_csa_compress_pack_part(
             inner_completion,
         )
 
-        main_state_next = pl.create_tensor(
-            [main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM],
-            dtype=pl.FP32,
-        )
-        inner_state_next = pl.create_tensor(
-            [
-                inner_state_blocks,
-                INNER_STATE_BLOCK_SIZE,
-                INNER_STATE_DIM,
-            ],
-            dtype=pl.FP32,
-        )
+        # The materialization task completes both compressors before recycling
+        # the buffer last used two leaves earlier.
+        if leaf % 2 == 0:
+            main_state_next = main_state_scratch
+            inner_state_next = inner_state_scratch
+        else:
+            main_state_next = pl.reshape(
+                main_state_workspace, [main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM]
+            )
+            inner_state_next = pl.reshape(
+                inner_state_workspace, [inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM]
+            )
         main_cache_flat = pl.reshape(main_cache_written, [MAIN_LEAF_CACHE_ROWS, HEAD_DIM])
         idx_cache_flat = pl.reshape(idx_cache_written, [idx_cache_rows, IDX_HEAD_DIM])
         idx_scale_flat = pl.reshape(idx_scale_written, [idx_cache_rows, 1])

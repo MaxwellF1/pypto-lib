@@ -136,23 +136,24 @@ def gate(
     # cancels here (symmetric quant is invariant to a positive per-token scalar),
     # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
     # pre-stage before dispatch_push.
-    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="x_norm_quant",
-            deps=[seed_dummy],
-            allow_early_resolve=True,
-        ):
-            xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
-            for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-                xn_q_scaled = pl.row_expand_mul(
-                    xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
-                    xn_sq_col,
-                )
-                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-                x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
-                    pl.cast(xn_q_half, pl.INT8, mode="trunc")
+    # One SPMD submission keeps downstream readers from depending on every tile.
+    for quant_block in pl.spmd(
+        (active_gate_tokens + T_TILE - 1) // T_TILE,
+        name_hint="x_norm_quant",
+        deps=[seed_dummy],
+        allow_early_resolve=True,
+    ):
+        t0 = quant_block * T_TILE
+        xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
+        for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+            xn_q_scaled = pl.row_expand_mul(
+                xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
+                xn_sq_col,
+            )
+            xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+            xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+            x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
+                pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
     # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
     # columns so the sort ranks pad experts last. Route write-backs are guarded to

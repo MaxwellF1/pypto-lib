@@ -525,11 +525,10 @@ NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 ROWS_PER_AUGMENTED_PART = (MAX_SEGMENT_TILES + 1) * TAIL_ROWS
 LOCAL_AUGMENTED_ROWS = LOCAL_PARTS * ROWS_PER_AUGMENTED_PART
-LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
 SEGMENT_ROWS = MAX_SEGMENT_TILES * TAIL_ROWS
 
-# The two caller-staged 512-row sparse-KV segments exceed the runtime's
-# 256 MiB default output heap.  Match the production MTP prefill allocation;
+# Segment staging and projection scratch exceed the runtime's 256 MiB
+# default output heap. Match the production MTP prefill allocation;
 # this is a standalone L3 harness setting and does not change the model ABI.
 PREFILL_CP_SWA_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
@@ -750,28 +749,31 @@ def _cp_swa_stage_sources(
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     swa_indices: pl.Tensor[[LOCAL_ROWS, WIN], pl.INT32],
-    sparse_kv: pl.Tensor[[LOCAL_SPARSE_ROWS, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[NUM_LOCAL_TILES * TAIL_ROWS, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[NUM_LOCAL_TILES * TAIL_ROWS, VALID_BLOCK_MASK_COLS], pl.INT32],
+    sparse_kv: pl.Tensor[[SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[SEGMENT_ROWS, PREFILL_SPARSE_PAD], pl.FP32],
+    valid_block_mask: pl.Tensor[[SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], pl.INT32],
     overlay_active_lengths: pl.Tensor[[NUM_LOCAL_TILES, OVERLAY_SOURCES], pl.INT32],
+    segment_offset: pl.Scalar[pl.INDEX],
+    prior_dep: pl.Scalar[pl.TASK_ID],
 ):
-    """Stage the accepted persistent/predecessor/current source ABI."""
+    """Stage one logical segment from persistent/predecessor/current sources."""
     raw_blocks = pl.tensor.dim(kv_cache, 0)
     raw_rows = raw_blocks * BLOCK_ROWS
     cache_flat = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
     prefix = pl.read(segment_starts_t, [0])
-    with pl.spmd((LOCAL_ROWS // 2) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv") as gather_tid:
+    with pl.spmd((SEGMENT_ROWS // 2) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv", deps=[prior_dep]) as gather_tid:
         block = pl.tile.get_block_idx()
         schedule = block // PREFILL_ATTN_BLOCKS
         sb = block - schedule * PREFILL_ATTN_BLOCKS
-        token_block = (LOCAL_ROWS // 2) - 1 - schedule
+        token_block = (SEGMENT_ROWS // 2) - 1 - schedule
         t0 = token_block * 2
         k0 = sb * PREFILL_ATTN_TILE
         for dt in pl.range(2):
-            row = t0 + dt
+            stage_row = t0 + dt
+            row = segment_offset + stage_row
             if row < LOCAL_ROWS:
                 stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                out_base = row * PREFILL_SPARSE_PAD + k0
+                out_base = stage_row * PREFILL_SPARSE_PAD + k0
                 for ki in pl.range(PREFILL_ATTN_TILE):
                     col = k0 + ki
                     if col < WIN:
@@ -814,9 +816,10 @@ def _cp_swa_stage_sources(
                                             src = (tile - 1) * TAIL_ROWS + src_row
                                             stage[ki:ki + 1, :] = local_kv[src:src + 1, :]
                 sparse_kv[out_base:out_base + PREFILL_ATTN_TILE, :] = stage
-    with pl.spmd(LOCAL_ROWS // BIAS_TOKEN_TILE, name_hint="build_bias") as bias_tid:
+    with pl.spmd(SEGMENT_ROWS // BIAS_TOKEN_TILE, name_hint="build_bias", deps=[prior_dep]) as bias_tid:
         bias_blk = pl.tile.get_block_idx()
         bias_t0 = bias_blk * BIAS_TOKEN_TILE
+        source_t0 = segment_offset + bias_t0
         # PyPTO 0.60 removed orchestration-side ``create_tensor(init_value=...)``.
         # Seed the whole staged row in the writer kernel, then overwrite the
         # physical SWA columns below.  The remaining sparse blocks stay masked.
@@ -826,7 +829,7 @@ def _cp_swa_stage_sources(
         valid_block_mask[
             bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:VALID_BLOCK_MASK_COLS
         ] = pl.full([BIAS_TOKEN_TILE, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
-        bias_idx = pl.cast(swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
+        bias_idx = pl.cast(swa_indices[source_t0:source_t0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
         flags = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
         sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = pl.mul(pl.sub(flags, 1.0), -FP32_NEG_INF)
     return gather_tid, bias_tid
@@ -915,8 +918,8 @@ def prefill_cp_swa_core(
     rope_sin_signed = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([LOCAL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     logical_hidden = pl.create_tensor([CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-    sparse_kv = pl.create_tensor([LOCAL_SPARSE_ROWS, HEAD_DIM], dtype=pl.BF16)
-    sparse_bias = pl.create_tensor([LOCAL_ROWS, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+    sparse_kv = pl.create_tensor([SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_bias = pl.create_tensor([SEGMENT_ROWS, PREFILL_SPARSE_PAD], dtype=pl.FP32)
     x_flat = pl.reshape(x_hc, [NUM_LOCAL_TILES * TAIL_ROWS, HC_MULT, D])
     qr = pl.create_tensor([NUM_LOCAL_TILES * TAIL_ROWS, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([NUM_LOCAL_TILES * TAIL_ROWS, 1], dtype=pl.FP32)
@@ -1121,23 +1124,14 @@ def prefill_cp_swa_core(
 
     raw_blocks = pl.tensor.dim(kv_cache, 0)
     raw_rows = raw_blocks * BLOCK_ROWS
-    valid_mask = pl.create_tensor([LOCAL_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    valid_mask = pl.create_tensor([SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     gather_tid, bias_tid = _cp_swa_stage_sources(
         kv_cache, local_kv, predecessor_kv, q_pos_flat, q_req_flat,
         ov_pos_flat, ov_req_flat, predecessor_segments, segment_starts_t, swa_flat,
         sparse_kv, sparse_bias, valid_mask,
-        ov_active_flat,
+        ov_active_flat, pl.const(0, pl.INDEX), tail_exchange_tid,
     )
     stage_ready_tid = pl.system.task_dummy(deps=[gather_tid, bias_tid])
-    cache_commit_flat = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_cache_commit") as raw_commit_tid:
-        for row in pl.range(TAIL_ROWS):
-            seg = final_win_seg_src[row]
-            src_row = final_win_row_src[row]
-            dst = final_slot_mapping[row]
-            if my_rank == cache_owner_rank and seg >= 0 and src_row >= 0 and dst >= 0 and dst < raw_rows:
-                cache_commit_flat[dst:dst + 1] = final_kv[row:row + 1]
-
     # Each CP rank owns two logical segments. Tensor extents follow their
     # runtime lengths; storage offsets retain the rank-local capacity layout.
     # Completion dependencies serialize scoped scratch reuse across segments.
@@ -1171,10 +1165,27 @@ def prefill_cp_swa_core(
         residual_part0, post_part0, comb_part0, out_part0,
         part0_active, stage_ready_tid,
     )
+    gather1_tid, bias1_tid = _cp_swa_stage_sources(
+        kv_cache, local_kv, predecessor_kv, q_pos_flat, q_req_flat,
+        ov_pos_flat, ov_req_flat, predecessor_segments, segment_starts_t, swa_flat,
+        sparse_kv, sparse_bias, valid_mask,
+        ov_active_flat, pl.const(SEGMENT_ROWS, pl.INDEX), part0_attn_tid,
+    )
+    stage1_ready_tid = pl.system.task_dummy(deps=[gather1_tid, bias1_tid])
+    # Both segments have consumed the old cache before its final window is committed.
+    cache_commit_flat = pl.reshape(kv_cache, [raw_rows, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_cache_commit", deps=[stage1_ready_tid]) as raw_commit_tid:
+        for row in pl.range(TAIL_ROWS):
+            seg = final_win_seg_src[row]
+            src_row = final_win_row_src[row]
+            dst = final_slot_mapping[row]
+            if my_rank == cache_owner_rank and seg >= 0 and src_row >= 0 and dst >= 0 and dst < raw_rows:
+                cache_commit_flat[dst:dst + 1] = final_kv[row:row + 1]
+
     q_part1 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [SEGMENT_ROWS, 0, 0])
-    kv_part1 = pl.slice(sparse_kv, [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], [SEGMENT_ROWS * PREFILL_SPARSE_PAD, 0])
-    bias_part1 = pl.slice(sparse_bias, [SEGMENT_ROWS, PREFILL_SPARSE_PAD], [SEGMENT_ROWS, 0])
-    mask_part1 = pl.slice(valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [SEGMENT_ROWS, 0])
+    kv_part1 = pl.slice(sparse_kv, [SEGMENT_ROWS * PREFILL_SPARSE_PAD, HEAD_DIM], [0, 0])
+    bias_part1 = pl.slice(sparse_bias, [SEGMENT_ROWS, PREFILL_SPARSE_PAD], [0, 0])
+    mask_part1 = pl.slice(valid_mask, [SEGMENT_ROWS, VALID_BLOCK_MASK_COLS], [0, 0])
     cos_part1 = pl.slice(rope_cos_flat, [SEGMENT_ROWS, ROPE_DIM], [SEGMENT_ROWS, 0])
     sin_part1 = pl.slice(rope_sin_flat, [SEGMENT_ROWS, ROPE_DIM], [SEGMENT_ROWS, 0])
     residual_part1 = pl.slice(x_flat, [SEGMENT_ROWS, HC_MULT, D], [SEGMENT_ROWS, 0, 0])
@@ -1185,7 +1196,7 @@ def prefill_cp_swa_core(
         q_part1, kv_part1, bias_part1, mask_part1, attn_sink,
         cos_part1, sin_part1, wo_a, wo_b, wo_b_scale,
         residual_part1, post_part1, comb_part1, out_part1,
-        part1_active, part0_attn_tid,
+        part1_active, stage1_ready_tid,
     )
 
     resource_done_tid = pl.system.task_dummy(deps=[tail_exchange_tid, raw_commit_tid, attention_done_tid])

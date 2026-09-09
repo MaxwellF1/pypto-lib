@@ -390,10 +390,6 @@ def prefill_fwd(
             moe_ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
             moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
             moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-            moe_grouped_x = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.INT8)
-            moe_grouped_scale = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-            moe_grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
-            moe_dense_y = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
             moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
             # Epoch numbering continues across tiles; arrival counters are monotonic.
             epoch_base: pl.Scalar[pl.INT32] = pl.cast(tile_base // T * LAST_MOE_EPOCH, pl.INT32)
@@ -523,7 +519,7 @@ def prefill_fwd(
                         routed_w2_scale_layer, shared_w1_layer, shared_w1_scale_layer, shared_w3_layer,
                         shared_w3_scale_layer, shared_w2_layer, shared_w2_scale_layer, pre_hc_hidden_tile,
                         moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out, moe_dense_x, moe_dense_scale,
-                        moe_grouped_x, moe_grouped_scale, moe_grouped_y, moe_dense_y, moe_returned_y,
+                        moe_returned_y,
                         count_target, count_signal, x_target, x_signal, scale_target, reverse_target,
                         reverse_signal, attention_ready, layer_index,
                         epoch_base + layer_index + pl.cast(1, pl.INT32), nt,

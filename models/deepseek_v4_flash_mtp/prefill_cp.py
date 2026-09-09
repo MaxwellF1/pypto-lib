@@ -276,14 +276,7 @@ def _fwd_moe_tail(
     moe_post_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT], pl.FP32]],
     moe_comb_ffn: pl.InOut[pl.Tensor[[MOE_ROWS, HC_MULT * HC_MULT], pl.FP32]],
     moe_ffn_out: pl.InOut[pl.Tensor[[MOE_ROWS, D], pl.BF16]],
-    moe_dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
     moe_dense_scale: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
-    moe_grouped_x: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
-    moe_grouped_scale: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
-    ],
-    moe_grouped_y: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
-    moe_dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
     moe_returned_y: pl.InOut[pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
     count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -315,6 +308,7 @@ def _fwd_moe_tail(
         x_attn_flat, input_ids_flat, active_flat, packed_x, packed_ids, attention_done_tid
     )
 
+    moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
     moe_tid = prefill_moe(
         packed_x,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -327,8 +321,8 @@ def _fwd_moe_tail(
         x_next_work,
         moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out,
         moe_dense_x, moe_dense_scale,
-        moe_grouped_x, moe_grouped_scale, moe_grouped_y,
-        moe_dense_y, moe_returned_y,
+
+        moe_returned_y,
         count_target, count_signal,
         prefill_moe_x_target, prefill_moe_x_signal,
         prefill_moe_scale_target,
@@ -925,12 +919,7 @@ def prefill_cp_fwd(
     moe_post_ffn = pl.create_tensor([MOE_ROWS, HC_MULT], dtype=pl.FP32)
     moe_comb_ffn = pl.create_tensor([MOE_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
     moe_ffn_out = pl.create_tensor([MOE_ROWS, D], dtype=pl.BF16)
-    moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
     moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-    moe_grouped_x = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.INT8)
-    moe_grouped_scale = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-    moe_grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
-    moe_dense_y = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
 
     swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
@@ -990,6 +979,9 @@ def prefill_cp_fwd(
     # protocol epochs. Empty ranks retain the explicit previous-MoE fence.
     layer_output = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
     moe_completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
+    x_attn = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
+    # Carry the stage dependency beyond the attention scope, as in DSpark HCA.
+    attention_stage_deps = pl.array.create(1, pl.TASK_ID)
     layer_hidden = x_hc
     for layer_id in pl.range(FWD_NUM_LAYERS):
         layer_index: pl.Scalar[pl.INT32] = pl.cast(layer_id, pl.INT32)
@@ -1064,8 +1056,7 @@ def prefill_cp_fwd(
         shared_w2_layer: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [layer_index * D, 0] )
         shared_w2_scale_layer: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [layer_index * D] )
         with pl.scope():
-            x_attn = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
-            attention_completion = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32 )
+            attention_completion = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32)
             if layer_index < 2:
                 prefill_cp_swa_core(
                     layer_hidden,
@@ -1362,66 +1353,61 @@ def prefill_cp_fwd(
                     type_index,
                 )
             if layer_index < 2:
-                attention_done = _fwd_attention_stage_barrier_from_completion(
-                    attention_completion
-                )
+                attention_tid = _fwd_attention_stage_barrier_from_completion(attention_completion)
+                attention_stage_deps[0] = attention_tid
             elif layer_index % 2 == 0:
-                attention_done = _fwd_attention_stage_barrier_from_completion(
-                    attention_completion
-                )
+                attention_tid = _fwd_attention_stage_barrier_from_completion(attention_completion)
+                attention_stage_deps[0] = attention_tid
             else:
-                attention_done = _fwd_attention_stage_barrier_from_x_attn(x_attn)
-            if layer_index > 0:
-                moe_ready = _fwd_wait_previous_moe(attention_done, moe_completion)
-            else:
-                moe_ready = attention_done
-            with pl.scope():
-                _fwd_moe_tail(
-                    x_attn,
-                    overlay_active_lengths,
-                    input_ids,
-                    hc_ffn_fn_layer,
-                    hc_ffn_scale_layer,
-                    hc_ffn_base_layer,
-                    norm_w_layer,
-                    gate_w_layer,
-                    gate_bias_layer,
-                    tid2eid_layer,
-                    routed_w1_layer,
-                    routed_w1_scale_layer,
-                    routed_w3_layer,
-                    routed_w3_scale_layer,
-                    routed_w2_layer,
-                    routed_w2_scale_layer,
-                    shared_w1_layer,
-                    shared_w1_scale_layer,
-                    shared_w3_layer,
-                    shared_w3_scale_layer,
-                    shared_w2_layer,
-                    shared_w2_scale_layer,
-                    moe_x_mixed,
-                    moe_post_ffn,
-                    moe_comb_ffn,
-                    moe_ffn_out,
-                    moe_dense_x,
-                    moe_dense_scale,
-                    moe_grouped_x,
-                    moe_grouped_scale,
-                    moe_grouped_y,
-                    moe_dense_y,
-                    moe_returned_y,
-                    count_target,
-                    count_signal,
-                    prefill_moe_x_target,
-                    prefill_moe_x_signal,
-                    prefill_moe_scale_target,
-                    prefill_moe_reverse_target,
-                    prefill_moe_reverse_signal,
-                    layer_output,
-                    moe_completion,
-                    moe_ready,
-                    layer_index,
-                )
+                attention_tid = _fwd_attention_stage_barrier_from_x_attn(x_attn)
+                attention_stage_deps[0] = attention_tid
+        attention_done = attention_stage_deps[0]
+        if layer_index > 0:
+            moe_ready = _fwd_wait_previous_moe(attention_done, moe_completion)
+        else:
+            moe_ready = attention_done
+        with pl.scope():
+            _fwd_moe_tail(
+                x_attn,
+                overlay_active_lengths,
+                input_ids,
+                hc_ffn_fn_layer,
+                hc_ffn_scale_layer,
+                hc_ffn_base_layer,
+                norm_w_layer,
+                gate_w_layer,
+                gate_bias_layer,
+                tid2eid_layer,
+                routed_w1_layer,
+                routed_w1_scale_layer,
+                routed_w3_layer,
+                routed_w3_scale_layer,
+                routed_w2_layer,
+                routed_w2_scale_layer,
+                shared_w1_layer,
+                shared_w1_scale_layer,
+                shared_w3_layer,
+                shared_w3_scale_layer,
+                shared_w2_layer,
+                shared_w2_scale_layer,
+                moe_x_mixed,
+                moe_post_ffn,
+                moe_comb_ffn,
+                moe_ffn_out,
+                moe_dense_scale,
+                moe_returned_y,
+                count_target,
+                count_signal,
+                prefill_moe_x_target,
+                prefill_moe_x_signal,
+                prefill_moe_scale_target,
+                prefill_moe_reverse_target,
+                prefill_moe_reverse_signal,
+                layer_output,
+                moe_completion,
+                moe_ready,
+                layer_index,
+            )
         layer_hidden = layer_output
 
     active_flat = pl.reshape(overlay_active_lengths, [NUM_ATTN_TILES, OVERLAY_SOURCES])
