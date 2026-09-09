@@ -61,7 +61,8 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: hw-native-sys/pypto-serving
-        ref: main
+        # CP prefill requires the 2 GiB serving-test heap profile.
+        ref: ${{ inputs.model-name == 'deepseek-v4' && 'b19197b81b06528294791a45bcc942b1abb8cbba' || 'main' }}
         path: ${{ inputs.pypto-serving-checkout-path }}
         submodules: recursive
         persist-credentials: false
