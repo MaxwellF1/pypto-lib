@@ -27,6 +27,7 @@ from config import (
     PREFILL_SEQ,
 )
 from prefill_indexer import INDEXER_TOPK_CAP
+from hc_post import hc_post_prefill
 
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
@@ -50,6 +51,8 @@ B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
 D = M.hidden_size
+HC_MULT = M.hc_mult
+HC_COMB = HC_MULT * HC_MULT
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -1421,6 +1424,99 @@ def staged_sparse_attn(
     # an inner-scope alias after that scope has ended.  Only the completion
     # token needs to cross this boundary.
     return completion[0]
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_staged_attention(
+    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
+    x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+    active_rows: pl.Scalar[pl.INT32],
+    prior_dep: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Shared staged attention, output projection, and HC residual update."""
+    rows = pl.tensor.dim(q, 0)
+    active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
+    compute_rows = pl.max(active, 1)
+    source_rows = compute_rows * PREFILL_SPARSE_PAD
+    q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
+    kv_active = pl.slice(sparse_kv, [source_rows, HEAD_DIM], [0, 0])
+    bias_active = pl.slice(sparse_bias, [compute_rows, PREFILL_SPARSE_PAD], [0, 0])
+    mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
+    cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
+    sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
+    attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
+    attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
+    attention_done = staged_sparse_attn(
+        q_active, kv_active, bias_active, mask_active, attn_sink,
+        cos_active, sin_active, wo_a, wo_b, wo_b_scale,
+        attn_active, active_rows, prior_dep,
+    )
+    residual_view = pl.reshape(residual, [rows, HC_MULT, D])
+    post_view = pl.reshape(post, [rows, HC_MULT])
+    comb_view = pl.reshape(comb, [rows, HC_COMB])
+    output_view = pl.reshape(x_out, [rows, HC_MULT, D])
+    hc_post_prefill(attn_out, residual_view, post_view, comb_view, output_view, active_rows)
+    return attention_done
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_physical_attention(
+    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+    post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
+    x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+    active_rows: pl.Scalar[pl.INT32],
+    raw_ready_dep: pl.Scalar[pl.TASK_ID],
+    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Shared physical-cache attention, output projection, and HC residual update."""
+    rows = pl.tensor.dim(q, 0)
+    active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
+    compute_rows = pl.max(active, 1)
+    q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
+    raw_indices = pl.slice(swa_indices, [compute_rows, WIN], [0, 0])
+    compressed_indices = pl.slice(cmp_indices, [compute_rows, IDX_TOPK], [0, 0])
+    mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
+    cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
+    sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
+    attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
+    attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
+    attention_done = physical_sparse_attn(
+        q_active, ori_kv, raw_indices, cmp_kv, cmp_block_table, compressed_indices, mask_active, attn_sink,
+        cos_active, sin_active, wo_a, wo_b, wo_b_scale,
+        attn_active, active_rows, raw_ready_dep, compressed_ready_dep,
+    )
+    residual_view = pl.reshape(residual, [rows, HC_MULT, D])
+    post_view = pl.reshape(post, [rows, HC_MULT])
+    comb_view = pl.reshape(comb, [rows, HC_COMB])
+    output_view = pl.reshape(x_out, [rows, HC_MULT, D])
+    hc_post_prefill(attn_out, residual_view, post_view, comb_view, output_view, active_rows)
+    return attention_done
 
 
 @pl.jit.inline

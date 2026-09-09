@@ -11,6 +11,9 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
+from hc_pre import hc_pre
+from rmsnorm import rms_norm
+
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -107,14 +110,16 @@ def materialize_rope_rows(
     rope_sin_t: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
 ):
     t_dim = pl.tensor.dim(position_ids, 0)
+    cos_rows = pl.reshape(rope_cos_t, [t_dim, ROPE_DIM])
+    sin_rows = pl.reshape(rope_sin_t, [t_dim, ROPE_DIM])
     for rope_t0 in pl.spmd(t_dim // KV_RMS_T_TILE, name_hint="qkv_rope_rows"):
         t0 = rope_t0 * KV_RMS_T_TILE
         for rope_dt in pl.range(KV_RMS_T_TILE):
             rope_t = t0 + rope_dt
             if rope_t < num_tokens:
                 rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
-                rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
-                rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                cos_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                sin_rows[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
 
 @pl.jit.inline
@@ -988,6 +993,39 @@ def qkv_proj_rope(
         kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
 
     return q
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_attention_prolog(
+    x_hc: pl.Tensor[[T_DYN, M.hc_mult, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[M.mix_hc, M.hc_dim], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[M.mix_hc], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, M.hc_mult], pl.FP32],
+    comb: pl.Tensor[[T_DYN, M.hc_mult * M.hc_mult], pl.FP32],
+    cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+):
+    """Shared HC mixing, attention normalization, and query projection."""
+    rows = pl.tensor.dim(x_hc, 0)
+    mixed = pl.create_tensor([rows, D], dtype=pl.BF16)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, mixed, post, comb)
+    rms_tid = rms_norm(mixed, attn_norm_w, normed)
+    rope_prepare(rope_cos, rope_sin, cos_il, sin_signed, swap_idx)
+    q_proj_rope(normed, wq_a, wq_b, wq_b_scale, gamma_cq, cos_il, sin_signed, swap_idx, q, qr, qr_scale)
+    return rms_tid
 
 
 @pl.jit

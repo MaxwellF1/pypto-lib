@@ -137,7 +137,7 @@ else:
 def test_swa_varlen_indices_restore_global_causal_windows():
     _run('''
 import torch
-import prefill_cp_swa as swa
+import prefill_swa as swa
 
 torch.set_num_threads(1)
 for length in (1, 127, 128, 129, 2047, 2048, 2049, 4096, 8191, 8192):
@@ -175,8 +175,8 @@ for length in (1, 127, 128, 129, 2047, 2048, 2049, 4096, 8191, 8192):
 def test_hca_varlen_compressed_boundaries_and_final_state():
     _run('''
 import torch
-import prefill_cp_hca as hca
-import prefill_cp_swa as swa
+import prefill_hca as hca
+import prefill_swa as swa
 
 torch.set_num_threads(1)
 for length in (1, 127, 128, 129, 2049, 8192):
@@ -209,8 +209,8 @@ for length in (1, 127, 128, 129, 2049, 8192):
 def test_csa_varlen_seeds_candidates_and_final_state():
     _run('''
 import torch
-import prefill_cp_csa as csa
-import prefill_cp_swa as swa
+import prefill_csa as csa
+import prefill_swa as swa
 
 torch.set_num_threads(1)
 for length in (1, 3, 4, 5, 129, 2049, 8192):

@@ -37,7 +37,7 @@ prefill_moe = make_prefill_moe(PREFILL_MOE_LAYOUT)
 PREFILL_MOE_ROUTES_PER_SRC = PREFILL_MOE_LAYOUT.routes_per_source
 PREFILL_MOE_TOTAL_CAP = PREFILL_MOE_LAYOUT.total_capacity
 PREFILL_MOE_GROUPED_TOTAL_CAP = PREFILL_MOE_LAYOUT.grouped_capacity
-from prefill_cp_swa import (
+from prefill_swa import (
     BLOCK_ROWS, CP_CHOICES, CP_SIZE, CP_TAIL_WINDOW_ROWS, H, HEAD_DIM, LOCAL_PARTS, MAX_SEQ_LEN, NUM_SEGMENTS,
     O_GROUPS, O_GROUP_IN, O_LORA, ORI_MAX_BLOCKS, OVERLAY_BASE, OVERLAY_ROWS, OVERLAY_SOURCES, Q_LORA,
     ROPE_HEAD_DIM, TAIL_ROWS, WIN, prefill_cp_swa_core,
@@ -47,12 +47,12 @@ from prefill_cp_zigzag import CP_PREFILL_CMP_BLOCK_NUM as PREFILL_CMP_BLOCK_NUM
 # HCA / CSA inline cores and their type-specific constants. The FWD child
 # calls the cores directly (never @pl.jit children); the constants are used
 # only for static child-side shape annotations and typed pl.slice offsets.
-from prefill_cp_hca import (
+from prefill_hca import (
     CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM, HCA_STATE_BLOCK_SIZE, HCA_STATE_MAX_BLOCKS, IDX_TOPK,
     prefill_cp_hca_core,
 )
-from prefill_cp_csa import (
+from prefill_csa import (
     CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as CSA_COMPRESS_RATIO, IDX_HEAD_DIM,
     IDX_N_HEADS, INNER_OUT_DIM as CSA_INNER_OUT_DIM, INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE,
     INNER_STATE_DIM as CSA_INNER_STATE_DIM, INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS,

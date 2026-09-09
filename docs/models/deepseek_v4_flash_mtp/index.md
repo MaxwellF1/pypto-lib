@@ -190,6 +190,25 @@ owners, projects them against this card's vocab shard, then all-to-alls the
 logits so each owner ends with its own rows over the full vocabulary. Greedy
 sampling is fused into the same program.
 
+### Shared prefill attention
+
+Each attention kind owns its local and context-parallel cache adapters in
+`prefill_swa.py`, `prefill_hca.py`, or `prefill_csa.py`. There are no separate
+`prefill_cp_swa.py`, `prefill_cp_hca.py`, or `prefill_cp_csa.py` implementations.
+All adapters use the same HC mixing, RMS normalization, Q projection, and
+RoPE preparation in `prefill_attention_prolog`. SWA shares its staged
+attention and residual-update composition; paged HCA and CSA share the
+physical-cache attention and residual-update composition with CP CSA.
+CP HCA retains its contiguous augmented-cache reader. Projection and
+attention arithmetic remain in the common kernel modules.
+
+CP changes sequence ownership, hidden-tail exchange, and cache transport.
+The local adapter retains paged-prefix continuation and performs no CP
+communication. CP size one means context parallelism is disabled; it does
+not remove the independent expert/tensor-parallel topology requirements.
+The public `prefill_fwd` calling convention and serving integration are
+unchanged by the attention-module consolidation.
+
 ### MTP path
 
 ```
@@ -230,7 +249,7 @@ serving-level residency and lowering — with the limit measured at each step.
 | Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
 | Decode compressors and indexer | [decode_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio4.py), [decode_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/decode_compressor_ratio128.py), [decode_indexer.py](../../../models/deepseek_v4_flash_mtp/decode_indexer.py), [decode_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/decode_indexer_compressor.py) |
 | Prefill attention and cache | [prefill_swa.py](../../../models/deepseek_v4_flash_mtp/prefill_swa.py), [prefill_csa.py](../../../models/deepseek_v4_flash_mtp/prefill_csa.py), [prefill_hca.py](../../../models/deepseek_v4_flash_mtp/prefill_hca.py), [prefill_sparse_attn.py](../../../models/deepseek_v4_flash_mtp/prefill_sparse_attn.py), [prefill_compressor_ratio4.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio4.py), [prefill_compressor_ratio128.py](../../../models/deepseek_v4_flash_mtp/prefill_compressor_ratio128.py), [prefill_indexer.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer.py), [prefill_indexer_compressor.py](../../../models/deepseek_v4_flash_mtp/prefill_indexer_compressor.py) |
-| CP prefill scheduling | [prefill_cp.py](../../../models/deepseek_v4_flash_mtp/prefill_cp.py), [prefill_cp_swa.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_swa.py), [prefill_cp_hca.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_hca.py), [prefill_cp_csa.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_csa.py), [prefill_cp_exchange.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_exchange.py), [prefill_cp_zigzag.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_zigzag.py) |
+| CP prefill scheduling | [prefill_cp.py](../../../models/deepseek_v4_flash_mtp/prefill_cp.py), [prefill_cp_exchange.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_exchange.py), [prefill_cp_zigzag.py](../../../models/deepseek_v4_flash_mtp/prefill_cp_zigzag.py) |
 | Shared transforms | [rmsnorm.py](../../../models/deepseek_v4_flash_mtp/rmsnorm.py), [qkv_proj_rope.py](../../../models/deepseek_v4_flash_mtp/qkv_proj_rope.py), [hc_pre.py](../../../models/deepseek_v4_flash_mtp/hc_pre.py), [hc_post.py](../../../models/deepseek_v4_flash_mtp/hc_post.py), [hc_head.py](../../../models/deepseek_v4_flash_mtp/hc_head.py), [rope_interleave.py](../../../models/deepseek_v4_flash_mtp/rope_interleave.py), [lookup_embedding.py](../../../models/deepseek_v4_flash_mtp/lookup_embedding.py) |
 | MoE and output | [moe.py](../../../models/deepseek_v4_flash_mtp/moe.py), [gate.py](../../../models/deepseek_v4_flash_mtp/gate.py), [expert_shared.py](../../../models/deepseek_v4_flash_mtp/expert_shared.py), [expert_routed.py](../../../models/deepseek_v4_flash_mtp/expert_routed.py), [lm_head.py](../../../models/deepseek_v4_flash_mtp/lm_head.py) |
 | Metadata and host helpers | [decode_prepare.py](../../../models/deepseek_v4_flash_mtp/decode_prepare.py), [config.py](../../../models/deepseek_v4_flash_mtp/config.py), [utils.py](../../../models/deepseek_v4_flash_mtp/utils.py) |
