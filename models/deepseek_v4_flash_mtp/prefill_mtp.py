@@ -17,9 +17,6 @@ import pypto.language.distributed as pld
 from golden import ratio_allclose, ratio_reldiff, run
 from pypto.ir import DistributedConfig
 
-import config
-
-config.MOE_TOKENS = config.PREFILL_TOKENS
 
 from config import FLASH as M, PREFILL_TOKENS
 from hc_head import (
@@ -40,24 +37,23 @@ from lm_head import (
     lm_head_test,
 )
 from moe import (
-    AUX_PAD,
+    PrefillMoELayout,
+    make_prefill_moe,
+    clear_prefill_moe_signals,
+    PREFILL_MOE_EXPERT_SCALE_PAD,
+    PREFILL_MOE_SCALE_PAD,
     D,
     HC_DIM,
     HC_MULT,
-    IDX_PAD,
     MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
-    N_ROUTES,
-    RECV_MAX,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
-    clear_moe_signals,
     golden_moe,
-    moe,
 )
 from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
 from prefill_swa import (
@@ -81,6 +77,11 @@ from rmsnorm import golden_rms_norm, rms_norm
 
 # model config
 T = PREFILL_TOKENS
+PREFILL_MOE_LAYOUT = PrefillMoELayout(T)
+prefill_moe = make_prefill_moe(PREFILL_MOE_LAYOUT)
+PREFILL_MOE_ROUTES_PER_SRC = PREFILL_MOE_LAYOUT.routes_per_source
+PREFILL_MOE_TOTAL_CAP = PREFILL_MOE_LAYOUT.total_capacity
+PREFILL_MOE_GROUPED_TOTAL_CAP = PREFILL_MOE_LAYOUT.grouped_capacity
 MTP_LAYER_ID = M.num_hidden_layers
 
 # communication
@@ -172,14 +173,13 @@ def mtp_prefill_fwd(
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
@@ -221,23 +221,42 @@ def mtp_prefill_fwd(
             x_attn, nt,
         )
 
+    moe_x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    moe_post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    moe_comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    moe_ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
+    moe_grouped_x = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.INT8)
+    moe_grouped_scale = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
+    moe_grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
+    moe_dense_y = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+    moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
+    completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
     with pl.scope():
-        moe(
-            x_attn,
-            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-            norm_w, gate_w, gate_bias,
-            tid2eid, input_ids,
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_attention_ready",
+                   allow_early_resolve=False) as attention_ready:
+            _attention_ready = pl.read(x_attn, [0, 0, 0])
+        moe_tid = prefill_moe(
+            x_attn, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias, tid2eid, input_ids,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            pre_hc_hidden_out,
-            recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
-            pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+            shared_w2, shared_w2_scale, pre_hc_hidden_out,
+            moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out,
+            moe_dense_x, moe_dense_scale, moe_grouped_x, moe_grouped_scale,
+            moe_grouped_y, moe_dense_y, moe_returned_y,
+            count_target, count_signal, x_target, x_signal,
+            scale_target, reverse_target, reverse_signal,
+            attention_ready, pl.cast(MTP_LAYER_ID, pl.INT32),
+            pl.cast(MTP_MOE_EPOCH, pl.INT32), nt,
         )
 
-    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_moe_complete",
+                   deps=[moe_tid], allow_early_resolve=False):
+            completion[0:1, 0:1, 0:8] = pl.slice(pre_hc_hidden_out, [1, 1, 8], [0, 0, 0])
+    clear_prefill_moe_signals(completion, count_signal, x_signal, reverse_signal)
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
@@ -308,24 +327,22 @@ def l3_mtp_prefill_fwd(
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    count_target_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    count_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    x_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    x_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    scale_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+    reverse_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+    reverse_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        count_target = pld.window(count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        count_signal = pld.window(count_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        x_target = pld.window(x_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        x_signal = pld.window(x_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        scale_target = pld.window(scale_target_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+        reverse_target = pld.window(reverse_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+        reverse_signal = pld.window(reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_prefill_fwd(
             hidden_states[r], prev_hidden_states[r],
             enorm_w[r], hnorm_w[r],
@@ -348,8 +365,8 @@ def l3_mtp_prefill_fwd(
             shared_w2[r], shared_w2_scale[r],
             mtp_hc_head_fn[r], mtp_hc_head_scale[r], mtp_hc_head_base[r], mtp_norm_w[r],
             hidden_out[r], pre_hc_hidden_out[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            count_target, count_signal, x_target, x_signal, scale_target,
+            reverse_target, reverse_signal,
             r, num_tokens,
             device=r,
         )
@@ -498,7 +515,7 @@ def build_tensor_specs(
 
     projection = {spec.name: spec for spec in _projection_specs()}
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
-    moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
+    moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens, token_capacity=T)
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
 
     ordered_names = [

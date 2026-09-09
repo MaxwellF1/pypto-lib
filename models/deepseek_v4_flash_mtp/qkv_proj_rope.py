@@ -756,8 +756,6 @@ def qkv_proj_rope(
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
-    rope_cos_view = pl.reshape(rope_cos, [t_dim, ROPE_DIM])
-    rope_sin_view = pl.reshape(rope_sin, [t_dim, ROPE_DIM])
     kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
     qr_view = pl.reshape(qr, [t_dim, Q_LORA])
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
@@ -769,32 +767,9 @@ def qkv_proj_rope(
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
-    for qrp_idx in pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare", allow_early_resolve=True):
-        qrp_t0 = qrp_idx * Q_ROPE_T_TILE
-        qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
-        qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
-        qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
-        qrp_half = pl.mul(qrp_col, 0.5)
-        qrp_dup_i32 = pl.cast(qrp_half, target_type=pl.INT32, mode="trunc")
-        qrp_dup_f = pl.cast(qrp_dup_i32, target_type=pl.FP32)
-        qrp_dup_idx = pl.cast(qrp_dup_f, target_type=pl.INT32)
-        qrp_lane = pl.sub(qrp_col, pl.mul(qrp_dup_f, 2.0))
-        qrp_next_col = pl.add(qrp_col, 1.0)
-        qrp_lane_offset = pl.mul(qrp_lane, 2.0)
-        qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
-        qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
-        qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
-        qrp_cos_rows = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_sin_rows = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_cos = pl.cast(qrp_cos_rows, target_type=pl.FP32)
-        qrp_sin = pl.cast(qrp_sin_rows, target_type=pl.FP32)
-        qrp_cos_il = pl.gather(qrp_cos, dim=-1, index=qrp_dup_idx)
-        qrp_sin_il = pl.gather(qrp_sin, dim=-1, index=qrp_dup_idx)
-        qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
-        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
-        q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
-        q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+    rope_prepare(
+        rope_cos, rope_sin, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+    )
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
@@ -997,7 +972,7 @@ def qkv_proj_rope(
         #   out[j] = n[j]*cos_il[j] + n[j^1]*sin_il_signed[j]
         #
         # q_rope_prepare above already built cos_il / sign-folded sin / swap_idx over the
-        # full [t_dim, ROPE_DIM] token rows from the same rope_cos_view -- slice them here
+        # full [t_dim, ROPE_DIM] token rows from the same RoPE inputs -- slice them here
         # instead of re-running the arange chain and re-gathering the same two tables.
         # Values are bit-identical: same source rows, same j>>1 index, and folding the
         # +/-1 sign into sin only flips a sign bit, so (n[j^1]*sign)*sin == n[j^1]*(sin*sign).

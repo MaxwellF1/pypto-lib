@@ -519,7 +519,8 @@ def int8_quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     rows = x.float().reshape(-1, x.shape[-1])
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
+    # Explicit division preserves half-amax ties as in device pl.div.
+    scale_quant = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
     scaled = rows * scale_quant
     out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant

@@ -22,7 +22,7 @@ TAIL_ROWS = 128
 HEAD_DIM = M.head_dim
 
 # CP layout
-CP_CHOICES = (2, 4, 8)
+CP_CHOICES = (1, 2, 4, 8)
 CP_DEFAULT = 2
 MAX_SEGMENT_TILES = 4
 EPOCHS = 1
@@ -41,12 +41,34 @@ def _parse_static_int(name: str, default: int) -> int:
     return default
 
 
-CP_SIZE = _parse_static_int("cp", CP_DEFAULT)
+CP_SIZE = _parse_static_int("cp", _parse_static_int("ep", CP_DEFAULT))
 NUM_SEGMENTS = 2 * CP_SIZE
 CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 
 # Rank-major tail-window rows.
 CP_TAIL_WINDOW_ROWS = NUM_SEGMENTS * TAIL_ROWS
+
+
+def cp_segment_layout(num_tokens: int, cp_size: int = CP_SIZE):
+    """Return padded segment span, logical starts and real lengths for one request.
+
+    Distributed Recipes ownership uses 2*CP equal segments of at least one
+    SWA window each. CP=1 keeps the same local storage layout without peers.
+    The returned lengths exclude padding; starts use the padded segment span,
+    independently of the kernel's fixed backing capacity.
+    """
+    if type(num_tokens) is not int or type(cp_size) is not int:
+        raise TypeError("num_tokens and cp_size must be an int")
+    if cp_size not in CP_CHOICES:
+        raise ValueError(f"cp_size must be one of {CP_CHOICES}, got {cp_size}")
+    nseg = 2 * cp_size
+    capacity = nseg * MAX_SEGMENT_TILES * TAIL_ROWS
+    if not 1 <= num_tokens <= capacity:
+        raise ValueError(f"num_tokens must be in [1, {capacity}], got {num_tokens}")
+    span = max(TAIL_ROWS, (num_tokens + nseg - 1) // nseg)
+    starts = [segment * span for segment in range(nseg)]
+    lengths = [max(0, min(span, num_tokens - start)) for start in starts]
+    return span, starts, lengths
 
 
 def cp_owner_rank(segment: int, cp_size: int = CP_SIZE) -> int:

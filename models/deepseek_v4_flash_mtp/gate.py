@@ -17,6 +17,7 @@ from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
 
 # model config
 T = MOE_TOKENS
+GATE_T_DYN = pl.dynamic("GATE_T_DYN")
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
 # Routing space: every rank routes over the full global expert set so dispatch
@@ -49,19 +50,21 @@ assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
 def gate(
-    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
+    x_norm_i8: pl.Tensor[[GATE_T_DYN, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[GATE_T_DYN, 1], pl.FP32],
+    indices: pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32],
+    weights: pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32],
 ):
+    token_rows = pl.tensor.dim(x_mixed, 0)
+    padded_rows = ((token_rows + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
     # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
     # the per-token positive scalar inv_rms factors out of everything downstream:
     #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
@@ -69,22 +72,22 @@ def gate(
     #                  inv_rms rides only x_norm_scale (= inv_rms * amax(xg)/127).
     # This lets sq_sum (needs raw x) and xg share ONE pass over x_mixed instead of
     # a sqsum pass followed by a separate normalize pass.
-    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    xg_buf = pl.create_tensor([padded_rows, D], dtype=pl.FP32)
+    inv_rms_buf = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
     # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
     # and consumed by x_norm_quant so quant skips its own amax pass.
-    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
-    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+    if active_tokens > token_rows:
+        active_tokens = pl.cast(token_rows, pl.INDEX)
     active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
     active_gate_tokens = active_gate_tiles * GATE_M_TILE
-    if active_gate_tokens > T:
-        active_gate_tokens = pl.cast(T, pl.INDEX)
+    if active_gate_tokens > token_rows:
+        active_gate_tokens = pl.cast(token_rows, pl.INDEX)
 
     # One token per core with two-level full-row reductions.
     norm_w_2d = pl.reshape(norm_w, [1, D])
@@ -155,18 +158,18 @@ def gate(
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-        for zt in pl.range(T):
+        for zt in pl.range(token_rows):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                 for zk in pl.range(TOPK):
                     pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                     pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
         if N_EXPERTS < SCORE_PAD:
-            # A one-shot pl.full over T_PAD rows materializes the whole tile in
-            # the Vec buffer, so its cost grows with T_PAD: at the CP forward's
+            # A one-shot pl.full over all padded rows materializes the whole tile in
+            # the Vec buffer: at the CP forward's
             # 1024 rows an EP2 pad is 768 KiB against a 184 KiB budget. Fill the
             # same columns a row block at a time; the bytes stored are the same.
-            for pad_block in pl.range(T_PAD // GATE_M_TILE):
+            for pad_block in pl.range(padded_rows // GATE_M_TILE):
                 pad_t0 = pad_block * GATE_M_TILE
                 biased_scores_buf[
                     pad_t0 : pad_t0 + GATE_M_TILE, N_EXPERTS:SCORE_PAD
@@ -288,19 +291,26 @@ def gate(
 
 @pl.jit
 def gate_test(
-    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
-    x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
-    indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
-    weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
+    input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
+    x_norm_i8: pl.Out[pl.Tensor[[GATE_T_DYN, D], pl.INT8]],
+    x_norm_scale: pl.Out[pl.Tensor[[GATE_T_DYN, 1], pl.FP32]],
+    indices: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32]],
+    weights: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32]],
 ):
+    x_mixed.bind_dynamic(0, GATE_T_DYN)
+    input_ids.bind_dynamic(0, GATE_T_DYN)
+    x_norm_i8.bind_dynamic(0, GATE_T_DYN)
+    x_norm_scale.bind_dynamic(0, GATE_T_DYN)
+    indices.bind_dynamic(0, GATE_T_DYN)
+    weights.bind_dynamic(0, GATE_T_DYN)
+
     gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
@@ -315,7 +325,9 @@ def _per_token_int8_quant(x_bf16):
     import torch
     x_f32 = x_bf16.float()
     amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_q = INT8_SCALE_MAX / amax
+    # Match device pl.div: scalar / tensor can lower to reciprocal * scalar,
+    # moving exact half-amax ties below 63.5 before round-to-nearest-even.
+    scale_q = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
     scaled = x_f32 * scale_q
     x_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq = (1.0 / scale_q).reshape(-1)  # [T]
@@ -325,20 +337,21 @@ def _per_token_int8_quant(x_bf16):
 def golden_gate_core(tensors):
     import torch
 
-    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
+    token_rows = tensors["x_mixed"].shape[0]
+    num_tokens = max(0, min(token_rows, int(tensors.get("num_tokens", token_rows))))
 
     # FFN RMSNorm, deferred (qwen3-style): xg = bf16(x * gamma), with the
     # per-token inv_rms scalar folded downstream instead of applied per-element.
-    x_f = tensors["x_mixed"].float().view(T, D)
+    x_f = tensors["x_mixed"].float().view(token_rows, D)
     norm_w = tensors["norm_w"].float()
     sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
-    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)   # [T,1]
+    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)   # [token_rows,1]
     xg = x_f * norm_w.view(1, D)
 
     # Symmetric INT8 quant of xg: inv_rms cancels in the int8 values (a positive
     # per-token scalar), so it rides only the dequant scale.
     x_norm_i8, scale_dq_g = _per_token_int8_quant(xg)
-    x_norm_scale = scale_dq_g.reshape(T, 1) * inv_rms   # inv_rms * amax(xg)/127
+    x_norm_scale = scale_dq_g.reshape(token_rows, 1) * inv_rms   # inv_rms * amax(xg)/127
 
     # Gate matmul + sqrtsoftplus router score. logits = inv_rms * (xg @ gate_w.T).
     # Use the log1p stable form, which equals F.softplus while keeping the
@@ -365,13 +378,13 @@ def golden_gate_core(tensors):
     topk_vals = torch.gather(scores, dim=-1, index=indices.long())
     denom = topk_vals.sum(dim=-1, keepdim=True)
     weights = (topk_vals / denom) * ROUTE_SCALE
-    if num_tokens < T:
+    if num_tokens < token_rows:
         x_norm_scale[num_tokens:] = 0
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0
 
     tensors["x_norm_i8"][:] = x_norm_i8
-    tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
+    tensors["x_norm_scale"][:] = x_norm_scale.reshape(token_rows, 1)
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
 

@@ -18,33 +18,37 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-# The prefill path routes PREFILL_TOKENS tokens. Set MOE_TOKENS before importing
-# moe (which freezes recv shapes and derives RECV_MAX = EP * MOE_TOKENS at import).
+# Prefill owns its token/window capacity independently of the decode slab.
 import config
-config.MOE_TOKENS = config.PREFILL_TOKENS
 # Import moe first. It applies the EP2 FLASH override before dependent
 # modules bake config-derived MoE shapes.
 from moe import (
-    AUX_PAD,
+    PrefillMoELayout,
+    make_prefill_moe,
     D,
     HC_DIM,
     HC_MULT,
-    IDX_PAD,
     MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
-    N_ROUTES,
-    RECV_MAX,
-    T,
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
-    clear_moe_signals,
+    clear_prefill_moe_signals,
+    check_prefill_moe_slab,
     golden_moe,
-    moe,
+    PREFILL_MOE_EXPERT_SCALE_PAD,
+    PREFILL_MOE_SCALE_PAD,
 )
+
+T = config.PREFILL_TOKENS
+PREFILL_MOE_LAYOUT = PrefillMoELayout(T)
+prefill_moe = make_prefill_moe(PREFILL_MOE_LAYOUT)
+PREFILL_MOE_ROUTES_PER_SRC = PREFILL_MOE_LAYOUT.routes_per_source
+PREFILL_MOE_TOTAL_CAP = PREFILL_MOE_LAYOUT.total_capacity
+PREFILL_MOE_GROUPED_TOTAL_CAP = PREFILL_MOE_LAYOUT.grouped_capacity
 from config import FLASH as MODEL_CONFIG, PREFILL_BATCH, PREFILL_SEQ
 from prefill_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
@@ -120,6 +124,9 @@ IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
 # Per-ring runtime output heap, 1 GiB on each of the 4 rings. The 256 MiB
 # compile-time default deadlocks the ring allocator on this layer.
 PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
+check_prefill_moe_slab(T)
+
 
 @pl.jit
 def prefill_layer_core(
@@ -215,14 +222,13 @@ def prefill_layer_core(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+    reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
@@ -315,23 +321,44 @@ def prefill_layer_core(
                 )
 
             x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
-            moe(
-                x_attn_tile,
-                hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-                norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
-                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-                routed_w2, routed_w2_scale,
-                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-                shared_w2, shared_w2_scale,
-                x_next_tile,
-                recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-                routed_y_buf, combine_arrived,
-                layer_id, valid_n, my_rank, moe_epoch,
+            moe_x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+            moe_post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+            moe_comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+            moe_ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+            moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+            moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
+            moe_grouped_x = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.INT8)
+            moe_grouped_scale = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
+            moe_grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
+            moe_dense_y = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+            moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attention_ready",
+                       allow_early_resolve=False) as ready:
+                _attention_ready = pl.read(x_attn_tile, [0, 0, 0])
+            prefill_moe(
+                x_attn_tile, hc_ffn_fn, hc_ffn_scale,
+                hc_ffn_base, norm_w, gate_w,
+                gate_bias, tid2eid, input_ids_tile,
+                routed_w1, routed_w1_scale, routed_w3,
+                routed_w3_scale, routed_w2, routed_w2_scale,
+                shared_w1, shared_w1_scale, shared_w3,
+                shared_w3_scale, shared_w2, shared_w2_scale,
+                x_next_tile, moe_x_mixed, moe_post_ffn,
+                moe_comb_ffn, moe_ffn_out, moe_dense_x,
+                moe_dense_scale, moe_grouped_x, moe_grouped_scale,
+                moe_grouped_y, moe_dense_y, moe_returned_y,
+                count_target, count_signal, x_target,
+                x_signal, scale_target, reverse_target,
+                reverse_signal, ready, layer_id,
+                moe_epoch, valid_n,
             )
 
             # Write the one full tile to the fixed output.
             x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
-    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
+    completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_final_anchor"):
+        completion[0:1, 0:1, 0:8] = pl.slice(x_next, [1, 1, 8], [0, 0, 0])
+    clear_prefill_moe_signals(completion, count_signal, x_signal, reverse_signal)
     return x_next
 
 
@@ -437,56 +464,51 @@ def l3_prefill_layer(
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
 ):
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    count_target_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    count_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    x_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    x_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    scale_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+    reverse_target_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+    reverse_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        count_target = pld.window(count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        count_signal = pld.window(count_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        x_target = pld.window(x_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        x_signal = pld.window(x_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        scale_target = pld.window(scale_target_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+        reverse_target = pld.window(reverse_target_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+        reverse_signal = pld.window(reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         prefill_layer_core(
-            x_hc[rank],
-            hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
-            hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank], hca_cmp_norm_w[rank],
-            hca_compress_state[rank], hca_compress_state_block_table[rank],
-            csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank], csa_cmp_norm_w[rank],
-            csa_compress_state[rank], csa_compress_state_block_table[rank],
-            csa_hadamard_idx[rank],
-            csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank], csa_weights_proj[rank],
-            csa_inner_wkv[rank], csa_inner_wgate[rank], csa_inner_ape[rank], csa_inner_norm_w[rank],
-            csa_inner_compress_state[rank],
-            csa_inner_compress_state_block_table[rank],
-            kv_cache[rank], ori_block_table[rank], ori_slot_mapping[rank],
-            hca_cmp_kv[rank], csa_cmp_kv[rank],
-            hca_cmp_block_table[rank], csa_cmp_block_table[rank],
+            x_hc[rank], hc_attn_fn[rank], hc_attn_scale[rank],
+            hc_attn_base[rank], attn_norm_w[rank], wq_a[rank],
+            wq_b[rank], wq_b_scale[rank], wkv[rank],
+            gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank],
+            freqs_sin[rank], hca_cmp_wkv[rank], hca_cmp_wgate[rank],
+            hca_cmp_ape[rank], hca_cmp_norm_w[rank], hca_compress_state[rank],
+            hca_compress_state_block_table[rank], csa_cmp_wkv[rank], csa_cmp_wgate[rank],
+            csa_cmp_ape[rank], csa_cmp_norm_w[rank], csa_compress_state[rank],
+            csa_compress_state_block_table[rank], csa_hadamard_idx[rank], csa_idx_wq_b[rank],
+            csa_idx_wq_b_scale[rank], csa_weights_proj[rank], csa_inner_wkv[rank],
+            csa_inner_wgate[rank], csa_inner_ape[rank], csa_inner_norm_w[rank],
+            csa_inner_compress_state[rank], csa_inner_compress_state_block_table[rank], kv_cache[rank],
+            ori_block_table[rank], ori_slot_mapping[rank], hca_cmp_kv[rank],
+            csa_cmp_kv[rank], hca_cmp_block_table[rank], csa_cmp_block_table[rank],
             idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
-            position_ids[rank],
-            hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
-            csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank],
-            csa_state_slot_mapping[rank], csa_inner_state_slot_mapping[rank],
-            attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
-            hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
-            norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank], input_ids[rank],
-            routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
-            routed_w2[rank], routed_w2_scale[rank],
-            shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
-            shared_w2[rank], shared_w2_scale[rank],
-            x_next[rank],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
+            position_ids[rank], hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
+            csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank], csa_state_slot_mapping[rank],
+            csa_inner_state_slot_mapping[rank], attn_sink[rank], wo_a[rank],
+            wo_b[rank], wo_b_scale[rank], hc_ffn_fn[rank],
+            hc_ffn_scale[rank], hc_ffn_base[rank], norm_w[rank],
+            gate_w[rank], gate_bias[rank], tid2eid[rank],
+            input_ids[rank], routed_w1[rank], routed_w1_scale[rank],
+            routed_w3[rank], routed_w3_scale[rank], routed_w2[rank],
+            routed_w2_scale[rank], shared_w1[rank], shared_w1_scale[rank],
+            shared_w3[rank], shared_w3_scale[rank], shared_w2[rank],
+            shared_w2_scale[rank], x_next[rank], count_target,
+            count_signal, x_target, x_signal,
+            scale_target, reverse_target, reverse_signal,
             layer_id, rank,
             device=rank,
         )
@@ -850,7 +872,7 @@ def build_tensor_specs(layer_id=2):
         )
 
     # MoE weight tensors (per rank). tid2eid keeps its hash-table init.
-    for spec in build_moe_tensor_specs(layer_id=layer_id):
+    for spec in build_moe_tensor_specs(layer_id=layer_id, token_capacity=T):
         if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids"}:
             continue
         if spec.name == "tid2eid":

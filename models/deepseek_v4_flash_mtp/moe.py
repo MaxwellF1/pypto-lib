@@ -46,7 +46,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import expert_routed, prefill_expert_grouped
+from expert_routed import expert_routed, make_prefill_expert_grouped
 
 
 T = MOE_TOKENS
@@ -81,17 +81,13 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
 # receiver owns one such lane per source.  Only live rows cross the wire via
 # all_to_all_v; the static capacity is the dropless upper bound, not padding
 # that should be computed over.
-PREFILL_MOE_ROUTES_PER_SRC = T * TOPK
-PREFILL_MOE_PEER_CAP = PREFILL_MOE_ROUTES_PER_SRC
-PREFILL_MOE_TOTAL_CAP = N_RANKS * PREFILL_MOE_PEER_CAP
-PREFILL_MOE_SCALE_PAD = 8  # one 32-byte FP32 transport row; col 0 is the scale
+PREFILL_MOE_SCALE_PAD = 8  # one 32-byte FP32 row; cols 0/1 are dequant scale/routing weight
 PREFILL_MOE_EXPERT_SCALE_PAD = 16  # one 64-byte line per receiver expert row
 PREFILL_MOE_ROUTE_MAP_PAD = 16  # one 64-byte INT32 line per source-side route
-PREFILL_MOE_WEIGHT_PAD = 16  # one 32-byte BF16 finalize-routing weight row
 PREFILL_MOE_RETURN_ROWS_PER_BLOCK = 128
 PREFILL_MOE_FINALIZE_TOKEN_TILE = 16
+PREFILL_MOE_GATE_ZERO_TILE = 16
 PREFILL_MOE_GROUPED_EXPERT_TILE = 16
-PREFILL_MOE_GROUPED_TOTAL_CAP = (PREFILL_MOE_TOTAL_CAP + N_LOCAL * (PREFILL_MOE_GROUPED_EXPERT_TILE - 1))
 
 PREFILL_INPUT_ID_TILE = 4
 
@@ -100,19 +96,35 @@ assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
-def check_prefill_moe_slab() -> None:
-    """Shape preconditions of the prefill MoE transport.
+@dataclasses.dataclass(frozen=True)
+class PrefillMoELayout:
+    """Per-rank token capacity and the corresponding dropless EP storage."""
 
-    T is the importing entry's MoE slab, and a decode entry carries a slab
-    these prefill tiles do not divide. Importing this module must therefore
-    stay free of them; an entry that builds the prefill MoE graph calls this at
-    its own module scope instead.
-    """
+    tokens: int
+
+    @property
+    def routes_per_source(self) -> int:
+        return self.tokens * TOPK
+
+    @property
+    def total_capacity(self) -> int:
+        return N_RANKS * self.routes_per_source
+
+    @property
+    def grouped_capacity(self) -> int:
+        return self.total_capacity + N_LOCAL * (PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
+
+
+def check_prefill_moe_slab(token_capacity: int) -> None:
+    """Validate a prefill layout without changing the decode module's shape."""
+    layout = PrefillMoELayout(token_capacity)
+    assert token_capacity > 0
     assert TOPK == 6
     assert N_LOCAL == 32
-    assert PREFILL_MOE_PEER_CAP % PREFILL_MOE_RETURN_ROWS_PER_BLOCK == 0
-    assert T % PREFILL_MOE_FINALIZE_TOKEN_TILE == 0
-    assert PREFILL_MOE_GROUPED_TOTAL_CAP % PREFILL_MOE_GROUPED_EXPERT_TILE == 0
+    assert layout.routes_per_source % PREFILL_MOE_RETURN_ROWS_PER_BLOCK == 0
+    assert token_capacity % PREFILL_MOE_FINALIZE_TOKEN_TILE == 0
+    assert token_capacity % PREFILL_MOE_GATE_ZERO_TILE == 0
+    assert layout.grouped_capacity % PREFILL_MOE_GROUPED_EXPERT_TILE == 0
 
 
 @pl.jit.inline
@@ -355,770 +367,771 @@ def dispatch(
 
 
 # === Prefill MoE dispatch ===================================================
-@pl.jit.inline
-def prefill_moe_dispatch(
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
-    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-    # Receiver-side expert-major tensors.  Only sum(expert_counts_out) leading
-    # rows are live; consumers must never compute over the static tail.
-    expert_x_out: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    expert_scale_out: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
-    expert_counts_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    recv_expert_counts_out: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
-    # Source-side state retained for the reverse exchange/combine.  The
-    # top-k weights remain source-local and are deliberately not transported.
-    send_counts_out: pl.Tensor[[N_RANKS, 1], pl.INT32],
-    route_to_packed_out: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD], pl.INT32],
-    # Counts and the INT8/FP32 payload rails use independent transport windows.
-    # The scale rail shares the payload's credit bank, so it needs no signal of
-    # its own.
-    count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    # Monotonic per-forward epoch for the manual transport's barriers, shared
-    # with the reverse exchange's convention.
-    epoch: pl.Scalar[pl.INT32],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Recipe-compatible count/payload dispatch and receiver expert re-sort.
+def make_prefill_moe(layout: PrefillMoELayout):
+    """Build the shared prefill MoE for a caller-owned token/window capacity."""
+    check_prefill_moe_slab(layout.tokens)
+    T = layout.tokens
+    PREFILL_MOE_ROUTES_PER_SRC = layout.routes_per_source
+    PREFILL_MOE_PEER_CAP = layout.routes_per_source
+    PREFILL_MOE_TOTAL_CAP = layout.total_capacity
+    PREFILL_MOE_GROUPED_TOTAL_CAP = layout.grouped_capacity
+    prefill_expert_grouped = make_prefill_expert_grouped(layout.grouped_capacity)
 
-    Stable destination/expert packing plus the exchanged ``[source, expert]``
-    count matrix makes expert-id and route-id payload rails unnecessary.  The
-    only data crossing EP are INT8 hidden rows and their FP32 dequant scales.
-    ``route_to_packed_out`` stays on the source for the reverse combine.
-    """
+    @pl.jit.inline
+    def prefill_moe_dispatch(
+        indices: pl.Tensor[[T, TOPK], pl.INT32],
+        x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+        x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+        weights: pl.Tensor[[T, TOPK], pl.FP32],
+        # Receiver-side expert-major tensors.  Only sum(expert_counts_out) leading
+        # rows are live; consumers must never compute over the static tail.
+        expert_x_out: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+        expert_scale_out: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
+        expert_counts_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+        recv_expert_counts_out: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+        # Source-side state retained for the reverse exchange/combine. Routing
+        # weights travel in the existing padded FP32 scale payload's column one.
+        send_counts_out: pl.Tensor[[N_RANKS, 1], pl.INT32],
+        route_to_packed_out: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD], pl.INT32],
+        # Counts and the INT8/FP32 payload rails use independent transport windows.
+        # The scale rail shares the payload's credit bank, so it needs no signal of
+        # its own.
+        count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+        count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+        x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+        num_tokens: pl.Scalar[pl.INT32],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+        # Monotonic per-forward epoch for the manual transport's barriers, shared
+        # with the reverse exchange's convention.
+        epoch: pl.Scalar[pl.INT32],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Count/payload dispatch with MTP FP32 routing weights and expert re-sort.
 
-    send_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
+        Stable destination/expert packing plus the exchanged ``[source, expert]``
+        count matrix makes expert-id and route-id payload rails unnecessary.  The
+        payload carries INT8 hidden rows, FP32 dequant scales, and routing weights.
+        ``route_to_packed_out`` stays on the source for the reverse combine.
+        """
 
-    # Static scratch is capacity-sized for dropless routing, but only the
-    # runtime counts are transferred and later consumed.
-    x_send = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8, manual_dep=True)
-    scale_send = pl.create_tensor(
-        [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD],
-        dtype=pl.FP32,
-        manual_dep=True,
-    )
+        send_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
 
-    # Count once in a single InCore task.  This avoids cache-line lost updates
-    # on the INT32 count rows and gives packing stable expert prefixes.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_dispatch_count",
-        allow_early_resolve=True,
-    ) as count_tid:
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
+        # Static scratch is capacity-sized for dropless routing, but only the
+        # runtime counts are transferred and later consumed.
+        x_send = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8, manual_dep=True)
+        scale_send = pl.create_tensor(
+            [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD],
+            dtype=pl.FP32,
+            manual_dep=True,
+        )
 
-        counts = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for dst in pl.range(N_RANKS):
-            for local_e in pl.range(N_LOCAL):
-                counts[dst * N_LOCAL + local_e] = 0
+        # Count once in a single InCore task.  This avoids cache-line lost updates
+        # on the INT32 count rows and gives packing stable expert prefixes.
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_dispatch_count",
+            allow_early_resolve=True,
+        ) as count_tid:
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > T:
+                active_tokens = pl.cast(T, pl.INDEX)
 
-        for token in pl.range(active_tokens):
-            for topk in pl.range(TOPK):
-                expert = pl.read(indices, [token, topk])
-                dst = expert // N_LOCAL
-                local_e = expert - dst * N_LOCAL
-                lane = dst * N_LOCAL + local_e
-                counts[lane] = counts[lane] + 1
+            counts = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+            for dst in pl.range(N_RANKS):
+                for local_e in pl.range(N_LOCAL):
+                    counts[dst * N_LOCAL + local_e] = 0
 
-        for dst in pl.range(N_RANKS):
-            rank_total = pl.const(0, pl.INT32)
-            for local_e in pl.range(N_LOCAL):
-                count = counts[dst * N_LOCAL + local_e]
-                pl.write(send_expert_counts, [dst, local_e], count)
-                rank_total = rank_total + count
-            pl.write(send_counts_out, [dst, 0], rank_total)
-
-    # One task per destination builds the source's packed lane in
-    # destination->expert->token/topk stable order.  Every route is also mapped
-    # to its row in the Recipe-style concatenation of the live rank splits.
-    with pl.spmd(
-        N_RANKS,
-        name_hint="prefill_moe_dispatch_pack",
-        deps=[count_tid],
-        allow_early_resolve=True,
-    ) as pack_tid:
-        dst_block = pl.tile.get_block_idx()
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
-
-        cursor = pl.array.create(N_LOCAL, pl.INT32)
-        scale_row = pl.tile.full([1, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32, value=0.0)
-        route_map_row = pl.tile.full([1, PREFILL_MOE_ROUTE_MAP_PAD], dtype=pl.INT32, value=0)
-        dest_rank_base = pl.const(0, pl.INT32)
-        for prior_dst in pl.range(dst_block):
-            dest_rank_base = dest_rank_base + pl.read(send_counts_out, [prior_dst, 0])
-        prefix = pl.const(0, pl.INT32)
-        for local_e in pl.range(N_LOCAL):
-            cursor[local_e] = prefix
-            prefix = prefix + pl.read(send_expert_counts, [dst_block, local_e])
-
-        lane_base = dst_block * PREFILL_MOE_PEER_CAP
-        for token in pl.range(active_tokens):
-            for topk in pl.range(TOPK):
-                expert = pl.read(indices, [token, topk])
-                dst = expert // N_LOCAL
-                if dst == dst_block:
-                    local_e = expert - dst * N_LOCAL
-                    slot_i32 = cursor[local_e]
-                    slot = pl.cast(slot_i32, pl.INDEX)
-                    packed_row = lane_base + slot
-                    x_send[packed_row : packed_row + 1, :] = x_norm_i8[token : token + 1, :]
-                    pl.tile.write(scale_row, [0, 0], pl.read(x_norm_scale, [token, 0]))
-                    pl.tile.store(scale_row, [packed_row, 0], scale_send)
-                    route = token * TOPK + topk
-                    pl.tile.write(route_map_row, [0, 0], dest_rank_base + slot_i32)
-                    pl.tile.store(route_map_row, [route, 0], route_to_packed_out)
-                    cursor[local_e] = slot_i32 + 1
-
-    # Counts and both payload rails ride the same hand-written transport the
-    # reverse exchange uses: per-destination puts into the peer's own lane,
-    # then a monotonic-epoch notify/wait. Serialize count -> payload like
-    # Recipes: besides providing the authoritative receive splits, completing
-    # the small count exchange before the payload prevents its scalar consumer
-    # from racing a capacity-sized payload rail on CP8.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_dispatch_count_exchange",
-        # prior_dep (the caller's attention-done anchor) transitively
-        # post-dominates the PREVIOUS layer's combine on this rank. Without it
-        # the scheduler may start this layer's exchange on the shared
-        # count/payload signal banks while the previous layer's credit barrier
-        # is still in flight on a peer — a cross-rank deadlock invisible to
-        # local dataflow (cf. #1076).
-        deps=[count_tid, prior_dep],
-    ) as count_exchange_tid:
-        my_rank = pld.system.rank(pld.system.get_comm_ctx(count_target))
-        count_row = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
-        for dest in pl.range(N_RANKS):
-            for local_e in pl.range(N_LOCAL):
-                pl.tile.write(count_row, [0, local_e], pl.read(send_expert_counts, [dest, local_e]))
-            pld.tile.remote_store(count_row, target=count_target, peer=dest, offsets=[my_rank, 0])
-            if dest != my_rank:
-                pld.system.notify(
-                    target=count_signal,
-                    peer=dest,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(signal=count_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
-
-        for local_e in pl.range(N_LOCAL):
-            expert_total = pl.const(0, pl.INT32)
-            for src in pl.range(N_RANKS):
-                count = pl.read(count_target, [src, local_e])
-                pl.write(recv_expert_counts_out, [src, local_e], count)
-                expert_total = expert_total + count
-            pl.write(expert_counts_out, [local_e, 0], expert_total)
-
-    # One SPMD block per destination pushes its live rows into peer dest's
-    # lane, one static row-sized put per rail per row. The scale rail rides the
-    # same credit as the payload: it is stored before the notify in program
-    # order, exactly as dispatch()'s aux/route rails ride data_arrived.
-    with pl.spmd(
-        N_RANKS,
-        name_hint="prefill_moe_dispatch_payload_put",
-        deps=[pack_tid, count_exchange_tid],
-        allow_early_resolve=False,
-    ) as payload_put_tid:
-        dest = pl.tile.get_block_idx()
-        my_rank = pld.system.rank(pld.system.get_comm_ctx(x_target))
-        n_rows = pl.cast(pl.read(send_counts_out, [dest, 0]), pl.INDEX)
-        if n_rows < 0:
-            n_rows = pl.cast(0, pl.INDEX)
-        if n_rows > PREFILL_MOE_PEER_CAP:
-            n_rows = pl.cast(PREFILL_MOE_PEER_CAP, pl.INDEX)
-        src_base = dest * PREFILL_MOE_PEER_CAP
-        dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
-        for row in pl.range(n_rows):
-            pld.tensor.put(
-                dst=x_target,
-                peer=dest,
-                src=x_send,
-                dst_offsets=[dst_base + row, 0],
-                src_offsets=[src_base + row, 0],
-                shape=[1, D],
-            )
-            pld.tensor.put(
-                dst=scale_target,
-                peer=dest,
-                src=scale_send,
-                dst_offsets=[dst_base + row, 0],
-                src_offsets=[src_base + row, 0],
-                shape=[1, PREFILL_MOE_SCALE_PAD],
-            )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_dispatch_payload_wait",
-        deps=[payload_put_tid],
-    ) as payload_exchange_tid:
-        my_rank = pld.system.rank(pld.system.get_comm_ctx(x_target))
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=x_signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(signal=x_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
-
-    # Count-driven copies trim every source block before reading the transport
-    # windows.  Output order is expert-major, then source-major, preserving the
-    # source's token/topk order inside each expert.
-    with pl.spmd(
-        N_LOCAL,
-        name_hint="prefill_moe_dispatch_resort",
-        deps=[count_exchange_tid, payload_exchange_tid],
-        allow_early_resolve=False,
-    ) as resort_tid:
-        local_e = pl.tile.get_block_idx()
-        expert_scale_row = pl.tile.full([1, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32, value=0.0)
-
-        expert_base = pl.cast(0, pl.INDEX)
-        for prior_e in pl.range(local_e):
-            expert_base = expert_base + pl.cast(pl.read(expert_counts_out, [prior_e, 0]), pl.INDEX)
-
-        source_prefix = pl.cast(0, pl.INDEX)
-        for src in pl.range(N_RANKS):
-            source_expert_base = pl.cast(0, pl.INDEX)
-            for prior_e in pl.range(local_e):
-                source_expert_base = source_expert_base + pl.cast(
-                    pl.read(recv_expert_counts_out, [src, prior_e]),
-                    pl.INDEX,
-                )
-            n_rows = pl.cast(pl.read(recv_expert_counts_out, [src, local_e]), pl.INDEX)
-            input_base = src * PREFILL_MOE_PEER_CAP + source_expert_base
-            output_base = expert_base + source_prefix
-            for row in pl.range(n_rows):
-                input_row = input_base + row
-                output_row = output_base + row
-                expert_x_out[output_row : output_row + 1, :] = x_target[input_row : input_row + 1, :]
-                pl.tile.write(expert_scale_row, [0, 0], pl.read(scale_target, [input_row, 0]))
-                pl.tile.store(expert_scale_row, [output_row, 0], expert_scale_out)
-            source_prefix = source_prefix + n_rows
-
-    return resort_tid
-
-
-@pl.jit.inline
-def _prefill_moe_reverse_exchange(
-    reverse_send: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    reverse_send_counts: pl.Tensor[[N_RANKS, 1], pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
-    resort_tid: pl.Scalar[pl.TASK_ID],
-    counts_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    # One SPMD block per destination: block dest pushes its live rows back to
-    # peer dest's lane, one static [1, D] put per row, then a monotonic-epoch
-    # notify/wait publishes the whole grid.
-    # pypto all_to_all_v sizes its transfer by the runtime row count, and a
-    # partial extent deadlocks 8 ranks under skewed counts (pypto#2536).
-    with pl.spmd(
-        N_RANKS,
-        name_hint="prefill_moe_combine_y_put",
-        deps=[resort_tid, counts_tid],
-        allow_early_resolve=False,
-    ) as reverse_put_tid:
-        dest = pl.tile.get_block_idx()
-        my_rank = pld.system.rank(pld.system.get_comm_ctx(reverse_target))
-        n_rows = pl.cast(pl.read(reverse_send_counts, [dest, 0]), pl.INDEX)
-        if n_rows < 0:
-            n_rows = pl.cast(0, pl.INDEX)
-        if n_rows > PREFILL_MOE_PEER_CAP:
-            n_rows = pl.cast(PREFILL_MOE_PEER_CAP, pl.INDEX)
-        src_base = dest * PREFILL_MOE_PEER_CAP
-        dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
-        for row in pl.range(n_rows):
-            pld.tensor.put(
-                dst=reverse_target,
-                peer=dest,
-                src=reverse_send,
-                dst_offsets=[dst_base + row, 0],
-                src_offsets=[src_base + row, 0],
-                shape=[1, D],
-            )
-
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_combine_y_wait",
-        deps=[reverse_put_tid],
-    ) as reverse_exchange_tid:
-        my_rank = pld.system.rank(pld.system.get_comm_ctx(reverse_target))
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=reverse_signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(signal=reverse_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
-    return reverse_exchange_tid
-
-
-@pl.jit.inline
-def prefill_moe_combine(
-    expert_y: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    recv_expert_counts: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
-    route_to_packed: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD], pl.INT32],
-    forward_send_counts: pl.Tensor[[N_RANKS, 1], pl.INT32],
-    # Recipe casts the source-local FP32 top-k weights to hidden dtype before
-    # finalize-routing.  PTOAS 0.60 needs an aligned row for the later tile
-    # load, so cols [0:TOPK] are live and the padded tail is ignored.
-    weights_bf16: pl.Tensor[[T, PREFILL_MOE_WEIGHT_PAD], pl.BF16],
-    shared_y: pl.Tensor[[T, D], pl.BF16],
-    ffn_out: pl.Tensor[[T, D], pl.BF16],
-    returned_y: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16],
-    reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    dispatch_tid: pl.Scalar[pl.TASK_ID],
-    expert_tid: pl.Scalar[pl.TASK_ID],
-    # Monotonic per-forward epoch for the manual transport's barrier (the
-    # collective's own barrier is self-clearing and ignores it).
-    epoch: pl.Scalar[pl.INT32],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Recipe-compatible reverse exchange and source-side finalize routing.
-
-    ``expert_y`` is expert-major, then source-major within each expert.  It is
-    restored to the forward collective's source-major order before the reverse
-    exchange returns each row to the rank that routed it.  Its fixed peer lanes
-    are compacted to the Recipe's concatenated live output splits, then the
-    source-local packed route map selects rows for the final top-k weighted
-    sum.  No route, expert, or weight metadata crosses EP.
-    """
-
-    reverse_send = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16, manual_dep=True)
-    reverse_send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32, manual_dep=True)
-
-    # Row count per reverse destination: on an expert rank each destination is
-    # one original source, so it receives the sum across this rank's local
-    # experts.  The exchange below walks exactly these counts.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_combine_counts",
-        deps=[dispatch_tid],
-        allow_early_resolve=True,
-    ) as reverse_counts_tid:
-        for src in pl.range(N_RANKS):
-            source_total = pl.const(0, pl.INT32)
-            for local_e in pl.range(N_LOCAL):
-                source_total = source_total + pl.read(recv_expert_counts, [src, local_e])
-            pl.write(reverse_send_counts, [src, 0], source_total)
-
-    # Invert prefill_moe_dispatch's receiver re-sort.  Each task owns the complete
-    # fixed-capacity lane for one original source; only its live prefix is
-    # written and subsequently transferred.
-    with pl.spmd(
-        N_RANKS,
-        name_hint="prefill_moe_combine_inverse_resort",
-        deps=[dispatch_tid, expert_tid],
-        allow_early_resolve=False,
-    ) as inverse_resort_tid:
-        src = pl.tile.get_block_idx()
-        send_base = src * PREFILL_MOE_PEER_CAP
-        send_prefix = pl.cast(0, pl.INDEX)
-        expert_base = pl.cast(0, pl.INDEX)
-        for local_e in pl.range(N_LOCAL):
-            source_prefix = pl.cast(0, pl.INDEX)
-            for prior_src in pl.range(src):
-                source_prefix = source_prefix + pl.cast(
-                    pl.read(recv_expert_counts, [prior_src, local_e]),
-                    pl.INDEX,
-                )
-            n_rows = pl.cast(pl.read(recv_expert_counts, [src, local_e]), pl.INDEX)
-            input_base = expert_base + source_prefix
-            output_base = send_base + send_prefix
-            for row in pl.range(n_rows):
-                input_row = input_base + row
-                output_row = output_base + row
-                reverse_send[output_row : output_row + 1, :] = expert_y[input_row : input_row + 1, :]
-            send_prefix = send_prefix + n_rows
-            expert_base = expert_base + pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
-
-    reverse_exchange_tid = _prefill_moe_reverse_exchange(
-        reverse_send,
-        reverse_target,
-        reverse_signal,
-        reverse_send_counts,
-        epoch,
-        inverse_resort_tid,
-        reverse_counts_tid,
-    )
-
-    # PTO all_to_all_v receives into fixed peer-capacity lanes.  Recipe's
-    # all_to_all_single instead returns the known output splits concatenated
-    # into exactly T*TOPK rows.  Narrow the communication staging window to
-    # that source-local layout before finalize-routing.
-    return_blocks_per_rank = (PREFILL_MOE_PEER_CAP // PREFILL_MOE_RETURN_ROWS_PER_BLOCK)
-    with pl.spmd(
-        N_RANKS * return_blocks_per_rank,
-        name_hint="prefill_moe_combine_return",
-        deps=[reverse_exchange_tid],
-        allow_early_resolve=False,
-    ) as return_rows_tid:
-        block = pl.tile.get_block_idx()
-        expert_rank = block // return_blocks_per_rank
-        chunk = block - expert_rank * return_blocks_per_rank
-        row0 = chunk * PREFILL_MOE_RETURN_ROWS_PER_BLOCK
-        live_row_base = pl.cast(0, pl.INDEX)
-        for prior_rank in pl.range(expert_rank):
-            live_row_base = live_row_base + pl.cast(pl.read(forward_send_counts, [prior_rank, 0]), pl.INDEX)
-        n_rows = pl.cast(pl.read(forward_send_counts, [expert_rank, 0]), pl.INDEX)
-        staging_base = expert_rank * PREFILL_MOE_PEER_CAP
-        if row0 < n_rows:
-            chunk_rows = n_rows - row0
-            if chunk_rows > PREFILL_MOE_RETURN_ROWS_PER_BLOCK:
-                chunk_rows = PREFILL_MOE_RETURN_ROWS_PER_BLOCK
-            for row in pl.range(chunk_rows):
-                returned_y[
-                    live_row_base + row0 + row : live_row_base + row0 + row + 1,
-                    :,
-                ] = reverse_target[
-                    staging_base + row0 + row : staging_base + row0 + row + 1,
-                    :,
-                ]
-
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    if active_tokens < 0:
-        active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
-
-    # Recipe finalize-routing semantics: source-local shared expert plus the
-    # six returned expert rows weighted in FP32, rounded once to BF16.
-    with pl.spmd(
-        T // PREFILL_MOE_FINALIZE_TOKEN_TILE,
-        name_hint="prefill_moe_combine_finalize",
-        deps=[return_rows_tid],
-    ) as finalize_tid:
-        token0 = pl.tile.get_block_idx() * PREFILL_MOE_FINALIZE_TOKEN_TILE
-        for lane in pl.range(PREFILL_MOE_FINALIZE_TOKEN_TILE):
-            token = token0 + lane
-            if token < active_tokens:
-                acc = pl.cast(shared_y[token : token + 1, :], pl.FP32)
-                weight_row = pl.cast(
-                    pl.tile.load(weights_bf16, [token, 0], [1, PREFILL_MOE_WEIGHT_PAD]),
-                    pl.FP32,
-                )
+            for token in pl.range(active_tokens):
                 for topk in pl.range(TOPK):
-                    route = token * TOPK + topk
-                    packed_row = pl.cast(pl.read(route_to_packed, [route, 0]), pl.INDEX)
-                    route_y = pl.cast(returned_y[packed_row : packed_row + 1, 0:D], pl.FP32)
-                    route_weight = pl.tile.read(weight_row, [0, topk])
-                    acc = pl.add(acc, pl.mul(route_y, route_weight))
-                ffn_out[token : token + 1, :] = pl.cast(acc, pl.BF16, mode="rint")
-            else:
-                ffn_out[token : token + 1, :] = shared_y[token : token + 1, :]
+                    expert = pl.read(indices, [token, topk])
+                    dst = expert // N_LOCAL
+                    local_e = expert - dst * N_LOCAL
+                    lane = dst * N_LOCAL + local_e
+                    counts[lane] = counts[lane] + 1
 
-    return finalize_tid
+            for dst in pl.range(N_RANKS):
+                rank_total = pl.const(0, pl.INT32)
+                for local_e in pl.range(N_LOCAL):
+                    count = counts[dst * N_LOCAL + local_e]
+                    pl.write(send_expert_counts, [dst, local_e], count)
+                    rank_total = rank_total + count
+                pl.write(send_counts_out, [dst, 0], rank_total)
+
+        # One task per destination builds the source's packed lane in
+        # destination->expert->token/topk stable order.  Every route is also mapped
+        # to its row in the Recipe-style concatenation of the live rank splits.
+        with pl.spmd(
+            N_RANKS,
+            name_hint="prefill_moe_dispatch_pack",
+            deps=[count_tid],
+            allow_early_resolve=True,
+        ) as pack_tid:
+            dst_block = pl.tile.get_block_idx()
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > T:
+                active_tokens = pl.cast(T, pl.INDEX)
+
+            cursor = pl.array.create(N_LOCAL, pl.INT32)
+            scale_row = pl.tile.full([1, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32, value=0.0)
+            route_map_row = pl.tile.full([1, PREFILL_MOE_ROUTE_MAP_PAD], dtype=pl.INT32, value=0)
+            dest_rank_base = pl.const(0, pl.INT32)
+            for prior_dst in pl.range(dst_block):
+                dest_rank_base = dest_rank_base + pl.read(send_counts_out, [prior_dst, 0])
+            prefix = pl.const(0, pl.INT32)
+            for local_e in pl.range(N_LOCAL):
+                cursor[local_e] = prefix
+                prefix = prefix + pl.read(send_expert_counts, [dst_block, local_e])
+
+            lane_base = dst_block * PREFILL_MOE_PEER_CAP
+            for token in pl.range(active_tokens):
+                for topk in pl.range(TOPK):
+                    expert = pl.read(indices, [token, topk])
+                    dst = expert // N_LOCAL
+                    if dst == dst_block:
+                        local_e = expert - dst * N_LOCAL
+                        slot_i32 = cursor[local_e]
+                        slot = pl.cast(slot_i32, pl.INDEX)
+                        packed_row = lane_base + slot
+                        x_send[packed_row : packed_row + 1, :] = x_norm_i8[token : token + 1, :]
+                        pl.tile.write(scale_row, [0, 0], pl.read(x_norm_scale, [token, 0]))
+                        pl.tile.write(scale_row, [0, 1], pl.read(weights, [token, topk]))
+                        pl.tile.store(scale_row, [packed_row, 0], scale_send)
+                        route = token * TOPK + topk
+                        pl.tile.write(route_map_row, [0, 0], dest_rank_base + slot_i32)
+                        pl.tile.store(route_map_row, [route, 0], route_to_packed_out)
+                        cursor[local_e] = slot_i32 + 1
+
+        # Counts and both payload rails ride the same hand-written transport the
+        # reverse exchange uses: per-destination puts into the peer's own lane,
+        # then a monotonic-epoch notify/wait. Serialize count -> payload like
+        # Recipes: besides providing the authoritative receive splits, completing
+        # the small count exchange before the payload prevents its scalar consumer
+        # from racing a capacity-sized payload rail on CP8.
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_dispatch_count_exchange",
+            # prior_dep (the caller's attention-done anchor) transitively
+            # post-dominates the PREVIOUS layer's combine on this rank. Without it
+            # the scheduler may start this layer's exchange on the shared
+            # count/payload signal banks while the previous layer's credit barrier
+            # is still in flight on a peer — a cross-rank deadlock invisible to
+            # local dataflow (cf. #1076).
+            deps=[count_tid, prior_dep],
+        ) as count_exchange_tid:
+            my_rank = pld.system.rank(pld.system.get_comm_ctx(count_target))
+            count_row = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
+            for dest in pl.range(N_RANKS):
+                for local_e in pl.range(N_LOCAL):
+                    pl.tile.write(count_row, [0, local_e], pl.read(send_expert_counts, [dest, local_e]))
+                pld.tile.remote_store(count_row, target=count_target, peer=dest, offsets=[my_rank, 0])
+                if dest != my_rank:
+                    pld.system.notify(
+                        target=count_signal,
+                        peer=dest,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(signal=count_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+
+            for local_e in pl.range(N_LOCAL):
+                expert_total = pl.const(0, pl.INT32)
+                for src in pl.range(N_RANKS):
+                    count = pl.read(count_target, [src, local_e])
+                    pl.write(recv_expert_counts_out, [src, local_e], count)
+                    expert_total = expert_total + count
+                pl.write(expert_counts_out, [local_e, 0], expert_total)
+
+        # One SPMD block per destination pushes its live rows into peer dest's
+        # lane, one static row-sized put per rail per row. The scale rail rides the
+        # same credit as the payload: it is stored before the notify in program
+        # order, exactly as dispatch()'s aux/route rails ride data_arrived.
+        with pl.spmd(
+            N_RANKS,
+            name_hint="prefill_moe_dispatch_payload_put",
+            deps=[pack_tid, count_exchange_tid],
+            allow_early_resolve=False,
+        ) as payload_put_tid:
+            dest = pl.tile.get_block_idx()
+            my_rank = pld.system.rank(pld.system.get_comm_ctx(x_target))
+            n_rows = pl.cast(pl.read(send_counts_out, [dest, 0]), pl.INDEX)
+            if n_rows < 0:
+                n_rows = pl.cast(0, pl.INDEX)
+            if n_rows > PREFILL_MOE_PEER_CAP:
+                n_rows = pl.cast(PREFILL_MOE_PEER_CAP, pl.INDEX)
+            src_base = dest * PREFILL_MOE_PEER_CAP
+            dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
+            for row in pl.range(n_rows):
+                pld.tensor.put(
+                    dst=x_target,
+                    peer=dest,
+                    src=x_send,
+                    dst_offsets=[dst_base + row, 0],
+                    src_offsets=[src_base + row, 0],
+                    shape=[1, D],
+                )
+                pld.tensor.put(
+                    dst=scale_target,
+                    peer=dest,
+                    src=scale_send,
+                    dst_offsets=[dst_base + row, 0],
+                    src_offsets=[src_base + row, 0],
+                    shape=[1, PREFILL_MOE_SCALE_PAD],
+                )
+
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_dispatch_payload_wait",
+            deps=[payload_put_tid],
+        ) as payload_exchange_tid:
+            my_rank = pld.system.rank(pld.system.get_comm_ctx(x_target))
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=x_signal,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(signal=x_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+
+        # Count-driven copies trim every source block before reading the transport
+        # windows.  Output order is expert-major, then source-major, preserving the
+        # source's token/topk order inside each expert.
+        with pl.spmd(
+            N_LOCAL,
+            name_hint="prefill_moe_dispatch_resort",
+            deps=[count_exchange_tid, payload_exchange_tid],
+            allow_early_resolve=False,
+        ) as resort_tid:
+            local_e = pl.tile.get_block_idx()
+            expert_scale_row = pl.tile.full([1, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32, value=0.0)
+
+            expert_base = pl.cast(0, pl.INDEX)
+            for prior_e in pl.range(local_e):
+                expert_base = expert_base + pl.cast(pl.read(expert_counts_out, [prior_e, 0]), pl.INDEX)
+
+            source_prefix = pl.cast(0, pl.INDEX)
+            for src in pl.range(N_RANKS):
+                source_expert_base = pl.cast(0, pl.INDEX)
+                for prior_e in pl.range(local_e):
+                    source_expert_base = source_expert_base + pl.cast(
+                        pl.read(recv_expert_counts_out, [src, prior_e]),
+                        pl.INDEX,
+                    )
+                n_rows = pl.cast(pl.read(recv_expert_counts_out, [src, local_e]), pl.INDEX)
+                input_base = src * PREFILL_MOE_PEER_CAP + source_expert_base
+                output_base = expert_base + source_prefix
+                for row in pl.range(n_rows):
+                    input_row = input_base + row
+                    output_row = output_base + row
+                    expert_x_out[output_row : output_row + 1, :] = x_target[input_row : input_row + 1, :]
+                    pl.tile.write(expert_scale_row, [0, 0], pl.read(scale_target, [input_row, 0]))
+                    pl.tile.write(expert_scale_row, [0, 1], pl.read(scale_target, [input_row, 1]))
+                    pl.tile.store(expert_scale_row, [output_row, 0], expert_scale_out)
+                source_prefix = source_prefix + n_rows
+
+        return resort_tid
 
 
-@pl.jit.inline
-def _prefill_moe_pack_grouped_experts(
-    dense_x: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    dense_scale: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
-    expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    grouped_x: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8],
-    grouped_scale: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
-    dispatch_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Pad each dense expert slab to a private 16-row compute boundary."""
-    with pl.spmd(
-        N_LOCAL,
-        name_hint="prefill_moe_grouped_pack",
-        deps=[dispatch_tid],
-        allow_early_resolve=False,
-    ) as pack_tid:
-        local_e = pl.tile.get_block_idx()
-        dense_base = pl.cast(0, pl.INDEX)
-        grouped_base = pl.cast(0, pl.INDEX)
-        for prior_e in pl.range(local_e):
-            prior_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
-            dense_base = dense_base + prior_rows
-            grouped_base = grouped_base + (
-                (prior_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
+    @pl.jit.inline
+    def _prefill_moe_reverse_exchange(
+        reverse_send: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        reverse_send_counts: pl.Tensor[[N_RANKS, 1], pl.INT32],
+        epoch: pl.Scalar[pl.INT32],
+        resort_tid: pl.Scalar[pl.TASK_ID],
+        counts_tid: pl.Scalar[pl.TASK_ID],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        # One SPMD block per destination: block dest pushes its live rows back to
+        # peer dest's lane, one static [1, D] put per row, then a monotonic-epoch
+        # notify/wait publishes the whole grid.
+        # pypto all_to_all_v sizes its transfer by the runtime row count, and a
+        # partial extent deadlocks 8 ranks under skewed counts (pypto#2536).
+        with pl.spmd(
+            N_RANKS,
+            name_hint="prefill_moe_combine_y_put",
+            deps=[resort_tid, counts_tid],
+            allow_early_resolve=False,
+        ) as reverse_put_tid:
+            dest = pl.tile.get_block_idx()
+            my_rank = pld.system.rank(pld.system.get_comm_ctx(reverse_target))
+            n_rows = pl.cast(pl.read(reverse_send_counts, [dest, 0]), pl.INDEX)
+            if n_rows < 0:
+                n_rows = pl.cast(0, pl.INDEX)
+            if n_rows > PREFILL_MOE_PEER_CAP:
+                n_rows = pl.cast(PREFILL_MOE_PEER_CAP, pl.INDEX)
+            src_base = dest * PREFILL_MOE_PEER_CAP
+            dst_base = pl.cast(my_rank, pl.INDEX) * PREFILL_MOE_PEER_CAP
+            for row in pl.range(n_rows):
+                pld.tensor.put(
+                    dst=reverse_target,
+                    peer=dest,
+                    src=reverse_send,
+                    dst_offsets=[dst_base + row, 0],
+                    src_offsets=[src_base + row, 0],
+                    shape=[1, D],
+                )
+
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_combine_y_wait",
+            deps=[reverse_put_tid],
+        ) as reverse_exchange_tid:
+            my_rank = pld.system.rank(pld.system.get_comm_ctx(reverse_target))
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=reverse_signal,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(signal=reverse_signal, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+        return reverse_exchange_tid
+
+
+    @pl.jit.inline
+    def prefill_moe_combine(
+        expert_y: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+        recv_expert_counts: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
+        route_to_packed: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD], pl.INT32],
+        forward_send_counts: pl.Tensor[[N_RANKS, 1], pl.INT32],
+        shared_y: pl.Tensor[[T, D], pl.BF16],
+        ffn_out: pl.Tensor[[T, D], pl.BF16],
+        returned_y: pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16],
+        reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+        dispatch_tid: pl.Scalar[pl.TASK_ID],
+        expert_tid: pl.Scalar[pl.TASK_ID],
+        # Monotonic per-forward epoch for the manual transport's barrier (the
+        # collective's own barrier is self-clearing and ignores it).
+        epoch: pl.Scalar[pl.INT32],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Reverse exchange and MTP combine of weighted BF16 expert outputs.
+
+        ``expert_y`` is expert-major, then source-major within each expert.  It is
+        restored to the forward collective's source-major order before the reverse
+        exchange returns each row to the rank that routed it.  Its fixed peer lanes
+        are compacted to the Recipe's concatenated live output splits, then the
+        source-local packed route map selects already weighted BF16 rows for the
+        final top-k sum. No route or expert metadata crosses EP.
+        """
+
+        reverse_send = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16, manual_dep=True)
+        reverse_send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32, manual_dep=True)
+
+        # Row count per reverse destination: on an expert rank each destination is
+        # one original source, so it receives the sum across this rank's local
+        # experts.  The exchange below walks exactly these counts.
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_combine_counts",
+            deps=[dispatch_tid],
+            allow_early_resolve=True,
+        ) as reverse_counts_tid:
+            for src in pl.range(N_RANKS):
+                source_total = pl.const(0, pl.INT32)
+                for local_e in pl.range(N_LOCAL):
+                    source_total = source_total + pl.read(recv_expert_counts, [src, local_e])
+                pl.write(reverse_send_counts, [src, 0], source_total)
+
+        # Invert prefill_moe_dispatch's receiver re-sort.  Each task owns the complete
+        # fixed-capacity lane for one original source; only its live prefix is
+        # written and subsequently transferred.
+        with pl.spmd(
+            N_RANKS,
+            name_hint="prefill_moe_combine_inverse_resort",
+            deps=[dispatch_tid, expert_tid],
+            allow_early_resolve=False,
+        ) as inverse_resort_tid:
+            src = pl.tile.get_block_idx()
+            send_base = src * PREFILL_MOE_PEER_CAP
+            send_prefix = pl.cast(0, pl.INDEX)
+            expert_base = pl.cast(0, pl.INDEX)
+            for local_e in pl.range(N_LOCAL):
+                source_prefix = pl.cast(0, pl.INDEX)
+                for prior_src in pl.range(src):
+                    source_prefix = source_prefix + pl.cast(
+                        pl.read(recv_expert_counts, [prior_src, local_e]),
+                        pl.INDEX,
+                    )
+                n_rows = pl.cast(pl.read(recv_expert_counts, [src, local_e]), pl.INDEX)
+                input_base = expert_base + source_prefix
+                output_base = send_base + send_prefix
+                for row in pl.range(n_rows):
+                    input_row = input_base + row
+                    output_row = output_base + row
+                    reverse_send[output_row : output_row + 1, :] = expert_y[input_row : input_row + 1, :]
+                send_prefix = send_prefix + n_rows
+                expert_base = expert_base + pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
+
+        reverse_exchange_tid = _prefill_moe_reverse_exchange(
+            reverse_send,
+            reverse_target,
+            reverse_signal,
+            reverse_send_counts,
+            epoch,
+            inverse_resort_tid,
+            reverse_counts_tid,
+        )
+
+        # PTO all_to_all_v receives into fixed peer-capacity lanes.  Recipe's
+        # all_to_all_single instead returns the known output splits concatenated
+        # into exactly T*TOPK rows.  Narrow the communication staging window to
+        # that source-local layout before finalize-routing.
+        return_blocks_per_rank = (PREFILL_MOE_PEER_CAP // PREFILL_MOE_RETURN_ROWS_PER_BLOCK)
+        with pl.spmd(
+            N_RANKS * return_blocks_per_rank,
+            name_hint="prefill_moe_combine_return",
+            deps=[reverse_exchange_tid],
+            allow_early_resolve=False,
+        ) as return_rows_tid:
+            block = pl.tile.get_block_idx()
+            expert_rank = block // return_blocks_per_rank
+            chunk = block - expert_rank * return_blocks_per_rank
+            row0 = chunk * PREFILL_MOE_RETURN_ROWS_PER_BLOCK
+            live_row_base = pl.cast(0, pl.INDEX)
+            for prior_rank in pl.range(expert_rank):
+                live_row_base = live_row_base + pl.cast(pl.read(forward_send_counts, [prior_rank, 0]), pl.INDEX)
+            n_rows = pl.cast(pl.read(forward_send_counts, [expert_rank, 0]), pl.INDEX)
+            staging_base = expert_rank * PREFILL_MOE_PEER_CAP
+            if row0 < n_rows:
+                chunk_rows = n_rows - row0
+                if chunk_rows > PREFILL_MOE_RETURN_ROWS_PER_BLOCK:
+                    chunk_rows = PREFILL_MOE_RETURN_ROWS_PER_BLOCK
+                for row in pl.range(chunk_rows):
+                    returned_y[
+                        live_row_base + row0 + row : live_row_base + row0 + row + 1,
+                        :,
+                    ] = reverse_target[
+                        staging_base + row0 + row : staging_base + row0 + row + 1,
+                        :,
+                    ]
+
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > T:
+            active_tokens = pl.cast(T, pl.INDEX)
+
+        # Match ordinary MTP combine: add shared and already weighted BF16 expert
+        # rows in FP32 in top-k order, then round the final sum to BF16.
+        with pl.spmd(
+            T // PREFILL_MOE_FINALIZE_TOKEN_TILE,
+            name_hint="prefill_moe_combine_finalize",
+            deps=[return_rows_tid],
+        ) as finalize_tid:
+            token0 = pl.tile.get_block_idx() * PREFILL_MOE_FINALIZE_TOKEN_TILE
+            for lane in pl.range(PREFILL_MOE_FINALIZE_TOKEN_TILE):
+                token = token0 + lane
+                if token < active_tokens:
+                    acc = pl.cast(shared_y[token : token + 1, :], pl.FP32)
+                    for topk in pl.range(TOPK):
+                        route = token * TOPK + topk
+                        packed_row = pl.cast(pl.read(route_to_packed, [route, 0]), pl.INDEX)
+                        route_y = pl.cast(returned_y[packed_row : packed_row + 1, 0:D], pl.FP32)
+                        acc = pl.add(acc, route_y)
+                    ffn_out[token : token + 1, :] = pl.cast(acc, pl.BF16, mode="rint")
+                else:
+                    ffn_out[token : token + 1, :] = shared_y[token : token + 1, :]
+
+        return finalize_tid
+
+
+    @pl.jit.inline
+    def _prefill_moe_pack_grouped_experts(
+        dense_x: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+        dense_scale: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
+        expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+        grouped_x: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8],
+        grouped_scale: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32],
+        dispatch_tid: pl.Scalar[pl.TASK_ID],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Pad each dense expert slab to a private 16-row compute boundary."""
+        with pl.spmd(
+            N_LOCAL,
+            name_hint="prefill_moe_grouped_pack",
+            deps=[dispatch_tid],
+            allow_early_resolve=False,
+        ) as pack_tid:
+            local_e = pl.tile.get_block_idx()
+            dense_base = pl.cast(0, pl.INDEX)
+            grouped_base = pl.cast(0, pl.INDEX)
+            for prior_e in pl.range(local_e):
+                prior_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
+                dense_base = dense_base + prior_rows
+                grouped_base = grouped_base + (
+                    (prior_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
+                    // PREFILL_MOE_GROUPED_EXPERT_TILE
+                ) * PREFILL_MOE_GROUPED_EXPERT_TILE
+
+            n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
+            grouped_rows = (
+                (n_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
                 // PREFILL_MOE_GROUPED_EXPERT_TILE
             ) * PREFILL_MOE_GROUPED_EXPERT_TILE
-
-        n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
-        grouped_rows = (
-            (n_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
-            // PREFILL_MOE_GROUPED_EXPERT_TILE
-        ) * PREFILL_MOE_GROUPED_EXPERT_TILE
-        zero_x = pl.cast(pl.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
-        zero_scale = pl.full([1, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32, value=0.0)
-        for row in pl.range(grouped_rows):
-            grouped_row = grouped_base + row
-            if row < n_rows:
-                dense_row = dense_base + row
-                grouped_x[grouped_row : grouped_row + 1, :] = dense_x[dense_row : dense_row + 1, :]
-                grouped_scale[grouped_row : grouped_row + 1, :] = dense_scale[dense_row : dense_row + 1, :]
-            else:
-                grouped_x[grouped_row : grouped_row + 1, :] = zero_x
-                grouped_scale[grouped_row : grouped_row + 1, :] = zero_scale
-    return pack_tid
+            zero_x = pl.cast(pl.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
+            zero_scale = pl.full([1, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32, value=0.0)
+            for row in pl.range(grouped_rows):
+                grouped_row = grouped_base + row
+                if row < n_rows:
+                    dense_row = dense_base + row
+                    grouped_x[grouped_row : grouped_row + 1, :] = dense_x[dense_row : dense_row + 1, :]
+                    grouped_scale[grouped_row : grouped_row + 1, :] = dense_scale[dense_row : dense_row + 1, :]
+                else:
+                    grouped_x[grouped_row : grouped_row + 1, :] = zero_x
+                    grouped_scale[grouped_row : grouped_row + 1, :] = zero_scale
+        return pack_tid
 
 
-@pl.jit.inline
-def _prefill_moe_unpack_grouped_experts(
-    grouped_y: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16],
-    expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    dense_y: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    expert_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Remove compute-only row padding before the reverse exchange."""
-    with pl.spmd(
-        N_LOCAL,
-        name_hint="prefill_moe_grouped_unpack",
-        deps=[expert_tid],
-        allow_early_resolve=False,
-    ) as unpack_tid:
-        local_e = pl.tile.get_block_idx()
-        dense_base = pl.cast(0, pl.INDEX)
-        grouped_base = pl.cast(0, pl.INDEX)
-        for prior_e in pl.range(local_e):
-            prior_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
-            dense_base = dense_base + prior_rows
-            grouped_base = grouped_base + (
-                (prior_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
-                // PREFILL_MOE_GROUPED_EXPERT_TILE
-            ) * PREFILL_MOE_GROUPED_EXPERT_TILE
+    @pl.jit.inline
+    def _prefill_moe_unpack_grouped_experts(
+        grouped_y: pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16],
+        expert_counts: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+        dense_y: pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        expert_tid: pl.Scalar[pl.TASK_ID],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Remove compute-only row padding before the reverse exchange."""
+        with pl.spmd(
+            N_LOCAL,
+            name_hint="prefill_moe_grouped_unpack",
+            deps=[expert_tid],
+            allow_early_resolve=False,
+        ) as unpack_tid:
+            local_e = pl.tile.get_block_idx()
+            dense_base = pl.cast(0, pl.INDEX)
+            grouped_base = pl.cast(0, pl.INDEX)
+            for prior_e in pl.range(local_e):
+                prior_rows = pl.cast(pl.read(expert_counts, [prior_e, 0]), pl.INDEX)
+                dense_base = dense_base + prior_rows
+                grouped_base = grouped_base + (
+                    (prior_rows + PREFILL_MOE_GROUPED_EXPERT_TILE - 1)
+                    // PREFILL_MOE_GROUPED_EXPERT_TILE
+                ) * PREFILL_MOE_GROUPED_EXPERT_TILE
 
-        n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
-        for row in pl.range(n_rows):
-            dense_y[dense_base + row : dense_base + row + 1, :] = grouped_y[
-                grouped_base + row : grouped_base + row + 1, :
-            ]
-    return unpack_tid
+            n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
+            for row in pl.range(n_rows):
+                dense_y[dense_base + row : dense_base + row + 1, :] = grouped_y[
+                    grouped_base + row : grouped_base + row + 1, :
+                ]
+        return unpack_tid
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_moe(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
-    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w13: pl.Tensor[[N_LOCAL, 2 * MOE_INTER, D], pl.INT8],
-    routed_w13_scale: pl.Tensor[[N_LOCAL, 2 * MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    # Caller-owned, layer-reused workspaces.  The multi-layer forward keeps
-    # these resident, matching the DSpark prefill ownership contract instead
-    # of allocating capacity-sized tensors in every per-layer scope.
-    x_mixed: pl.InOut[pl.Tensor[[T, D], pl.BF16]],
-    post_ffn: pl.InOut[pl.Tensor[[T, HC_MULT], pl.FP32]],
-    comb_ffn: pl.InOut[pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32]],
-    ffn_out: pl.InOut[pl.Tensor[[T, D], pl.BF16]],
-    dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
-    dense_scale: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
-    grouped_x: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
-    grouped_scale: pl.InOut[
-        pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
-    ],
-    grouped_y: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
-    dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
-    returned_y: pl.InOut[pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
-    count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
-    x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
-    reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
-    reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    layer_id: pl.Scalar[pl.INT32],
-    # 1-based MoE call id within this forward, like the wave path's moe_epoch:
-    # the reverse exchange waits for `>= moe_epoch` credits on a window shared
-    # by every call, so it counts calls, not layers.
-    moe_epoch: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run one shape-configured production prefill MoE slab.
+    @pl.jit.inline(auto_scope=False)
+    def prefill_moe(
+        x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+        hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+        hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+        hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+        norm_w: pl.Tensor[[D], pl.BF16],
+        gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+        gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+        tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+        input_ids: pl.Tensor[[T], pl.INT64],
+        routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+        routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+        routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+        routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+        routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+        shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+        shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+        shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+        shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+        shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+        shared_w2_scale: pl.Tensor[[D], pl.FP32],
+        x_next: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+        # Caller-owned, layer-reused workspaces.  The multi-layer forward keeps
+        # these resident, matching the DSpark prefill ownership contract instead
+        # of allocating capacity-sized tensors in every per-layer scope.
+        x_mixed: pl.InOut[pl.Tensor[[T, D], pl.BF16]],
+        post_ffn: pl.InOut[pl.Tensor[[T, HC_MULT], pl.FP32]],
+        comb_ffn: pl.InOut[pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32]],
+        ffn_out: pl.InOut[pl.Tensor[[T, D], pl.BF16]],
+        dense_x: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8]],
+        dense_scale: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]],
+        grouped_x: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.INT8]],
+        grouped_scale: pl.InOut[
+            pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], pl.FP32]
+        ],
+        grouped_y: pl.InOut[pl.Tensor[[PREFILL_MOE_GROUPED_TOTAL_CAP, D], pl.BF16]],
+        dense_y: pl.InOut[pl.Tensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16]],
+        returned_y: pl.InOut[pl.Tensor[[PREFILL_MOE_ROUTES_PER_SRC, D], pl.BF16]],
+        count_target: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+        count_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        x_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+        x_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
+        reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
+        reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+        layer_id: pl.Scalar[pl.INT32],
+        # 1-based MoE call id within this forward, like the wave path's moe_epoch:
+        # the reverse exchange waits for `>= moe_epoch` credits on a window shared
+        # by every call, so it counts calls, not layers.
+        moe_epoch: pl.Scalar[pl.INT32],
+        num_tokens: pl.Scalar[pl.INT32],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Run one production prefill MoE slab.
 
-    The strict CP8/EP8 production caller configures ``config.MOE_TOKENS`` to
-    its 1024 local rows before importing this module. EP2/EP4 and T=128 remain
-    valid compile/correctness gates because all capacities are shape-derived.
-    The production contract routes the complete physical slab, so callers pass
-    ``num_tokens == T``; an inactive physical tail is not initialized here.
+        Ordinary and CP callers select their token/window capacity explicitly,
+        without changing decode or another prefill caller through import order.
+        The CP caller packs its two real segment prefixes into this capacity.
+        Empty ranks retain the same transport; HC and shared-expert stages still
+        execute at the configured capacity.
 
-    This path implements count-driven A2Av transport, 16-row-aligned grouped
-    routed experts and source-side BF16 top-k weighting. It deliberately still
-    shares one token-wise INT8 input/scale across the six routes. Recipes'
-    expert-specific ``smooth_scale_1`` input quantization is therefore a
-    follow-up quantization-protocol gap, not claimed as aligned here.
-    """
-    hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
+        This path implements count-driven A2Av transport and 16-row-aligned
+        grouped routed experts with ordinary MTP quantization semantics. One
+        token-wise INT8 input/scale is shared across the six routes; each FP32
+        routing weight is applied during W2 dequantization before the expert
+        output is rounded to BF16. Source combine sums those weighted BF16 rows.
+        """
+        hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
 
-    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
-    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
-    weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    gate(
-        x_mixed,
-        norm_w,
-        gate_w,
-        gate_bias,
-        layer_id,
-        num_tokens,
-        tid2eid,
-        input_ids,
-        x_norm_i8,
-        x_norm_scale,
-        indices,
-        weights,
-    )
+        x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
+        x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+        indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
+        weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
+        if num_tokens > 0:
+            gate(
+                x_mixed,
+                norm_w,
+                gate_w,
+                gate_bias,
+                layer_id,
+                num_tokens,
+                tid2eid,
+                input_ids,
+                x_norm_i8,
+                x_norm_scale,
+                indices,
+                weights,
+            )
+        else:
+            for block in pl.spmd(T // PREFILL_MOE_GATE_ZERO_TILE, name_hint="prefill_moe_empty_gate"):
+                zero_x = pl.cast(pl.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
+                for lane in pl.range(PREFILL_MOE_GATE_ZERO_TILE):
+                    token = block * PREFILL_MOE_GATE_ZERO_TILE + lane
+                    x_norm_i8[token : token + 1, 0:D] = zero_x
+                    pl.write(x_norm_scale, [token, 0], pl.cast(0.0, pl.FP32))
+                    for topk in pl.range(TOPK):
+                        pl.write(indices, [token, topk], pl.cast(0, pl.INT32))
+                        pl.write(weights, [token, topk], pl.cast(0.0, pl.FP32))
 
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    if active_tokens < 0:
-        active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+        shared_y = pl.create_tensor([T, D], dtype=pl.BF16)
+        expert_shared(
+            x_norm_i8,
+            x_norm_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w3,
+            shared_w3_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_y,
+        )
 
-    shared_y = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared(
-        x_norm_i8,
-        x_norm_scale,
-        shared_w1,
-        shared_w1_scale,
-        shared_w3,
-        shared_w3_scale,
-        shared_w2,
-        shared_w2_scale,
-        shared_y,
-    )
+        expert_counts = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+        recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
+        send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32, manual_dep=True)
+        route_to_packed = pl.create_tensor(
+            [PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD],
+            dtype=pl.INT32,
+            manual_dep=True,
+        )
+        dispatch_tid = prefill_moe_dispatch(
+            indices,
+            x_norm_i8,
+            x_norm_scale,
+            weights,
+            dense_x,
+            dense_scale,
+            expert_counts,
+            recv_expert_counts,
+            send_counts,
+            route_to_packed,
+            count_target,
+            count_signal,
+            x_target,
+            x_signal,
+            scale_target,
+            num_tokens,
+            prior_dep,
+            moe_epoch,
+        )
 
-    # Recipes casts source-local top-k weights to hidden dtype immediately
-    # before finalize-routing. Keep the weights local and pad each row only for
-    # the PTOAS 0.60 aligned load used by prefill_moe_combine.
-    weights_bf16 = pl.create_tensor([T, PREFILL_MOE_WEIGHT_PAD], dtype=pl.BF16)
-    with pl.spmd(T, name_hint="prefill_moe_grouped_weight_pack"):
-        token = pl.tile.get_block_idx()
-        weight_row_fp32 = pl.tile.full([1, PREFILL_MOE_WEIGHT_PAD], dtype=pl.FP32, value=0.0)
-        if token < active_tokens:
-            for topk in pl.range(TOPK):
-                pl.tile.write(weight_row_fp32, [0, topk], pl.read(weights, [token, topk]))
-        # PTOAS 0.60 can lower the vector FP32->BF16 conversion, while the
-        # equivalent scalar cast reaches an unsupported AscendC backend path.
-        weight_row = pl.cast(weight_row_fp32, pl.BF16, mode="rint")
-        pl.tile.store(weight_row, [token, 0], weights_bf16)
+        _prefill_moe_pack_grouped_experts(
+            dense_x,
+            dense_scale,
+            expert_counts,
+            grouped_x,
+            grouped_scale,
+            dispatch_tid,
+        )
 
-    expert_counts = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
-    send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32, manual_dep=True)
-    route_to_packed = pl.create_tensor(
-        [PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD],
-        dtype=pl.INT32,
-        manual_dep=True,
-    )
-    dispatch_tid = prefill_moe_dispatch(
-        indices,
-        x_norm_i8,
-        x_norm_scale,
-        dense_x,
-        dense_scale,
-        expert_counts,
-        recv_expert_counts,
-        send_counts,
-        route_to_packed,
-        count_target,
-        count_signal,
-        x_target,
-        x_signal,
-        scale_target,
-        num_tokens,
-        prior_dep,
-        moe_epoch,
-    )
+        grouped_expert_tid = prefill_expert_grouped(
+            grouped_x,
+            grouped_scale,
+            expert_counts,
+            routed_w1,
+            routed_w1_scale,
+            routed_w3,
+            routed_w3_scale,
+            routed_w2,
+            routed_w2_scale,
+            grouped_y,
+        )
 
-    _prefill_moe_pack_grouped_experts(
-        dense_x,
-        dense_scale,
-        expert_counts,
-        grouped_x,
-        grouped_scale,
-        dispatch_tid,
-    )
+        unpack_tid = _prefill_moe_unpack_grouped_experts(grouped_y, expert_counts, dense_y, grouped_expert_tid)
 
-    grouped_expert_tid = prefill_expert_grouped(
-        grouped_x,
-        grouped_scale,
-        expert_counts,
-        routed_w13,
-        routed_w13_scale,
-        routed_w2,
-        routed_w2_scale,
-        grouped_y,
-    )
+        combine_tid = prefill_moe_combine(
+            dense_y,
+            expert_counts,
+            recv_expert_counts,
+            route_to_packed,
+            send_counts,
+            shared_y,
+            ffn_out,
+            returned_y,
+            reverse_target,
+            reverse_signal,
+            num_tokens,
+            dispatch_tid,
+            unpack_tid,
+            moe_epoch,
+        )
 
-    unpack_tid = _prefill_moe_unpack_grouped_experts(grouped_y, expert_counts, dense_y, grouped_expert_tid)
+        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="prefill_moe_grouped_complete",
+            deps=[combine_tid],
+            allow_early_resolve=False,
+        ) as completion_tid:
+            # The RAW edge on x_next joins the HC-post SPMD before exposing a
+            # reusable completion token to the enclosing production forward.
+            _completion_anchor = pl.read(x_next, [0, 0, 0])
+        return completion_tid
 
-    combine_tid = prefill_moe_combine(
-        dense_y,
-        expert_counts,
-        recv_expert_counts,
-        route_to_packed,
-        send_counts,
-        weights_bf16,
-        shared_y,
-        ffn_out,
-        returned_y,
-        reverse_target,
-        reverse_signal,
-        num_tokens,
-        dispatch_tid,
-        unpack_tid,
-        moe_epoch,
-    )
 
-    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="prefill_moe_grouped_complete",
-        deps=[combine_tid],
-        allow_early_resolve=False,
-    ) as completion_tid:
-        # The RAW edge on x_next joins the HC-post SPMD before exposing a
-        # reusable completion token to the enclosing production forward.
-        _completion_anchor = pl.read(x_next, [0, 0, 0])
-    return completion_tid
+    return prefill_moe
 
 
 @pl.jit.inline
@@ -1440,6 +1453,9 @@ def golden_moe(tensors):
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
 
+    T = tensors["x_hc"].shape[1]
+    RECV_MAX = N_RANKS * T
+    N_ROUTES = T * TOPK
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
@@ -1606,7 +1622,10 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next_out
 
 
-def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
+def build_tensor_specs(layer_id=0, num_tokens=None, balanced_routing=False, *, token_capacity=T):
+    T = token_capacity
+    if num_tokens is None:
+        num_tokens = T
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_weight

@@ -13,6 +13,7 @@ import pypto.language as pl
 from config import (
     BLOCK_SIZE,
     FLASH as M,
+    FP32_NEG_INF,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
@@ -28,10 +29,11 @@ from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
     PREFILL_ATTN_TILE,
+    PREFILL_SPARSE_PAD,
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    sparse_attn,
+    staged_sparse_attn,
 )
 
 
@@ -180,29 +182,29 @@ def prefill_attention_swa(
                 valid_block_mask, mask_row, [idx_t, 0]
             )
 
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    cmp_block_table_dummy_2d = pl.reshape(
-        cmp_block_table_dummy, [1, SPARSE_CMP_MAX_BLOCKS]
-    )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cmp_dummy_init"):
-        cmp_block_table_dummy_2d[:, :] = pl.full(
-            [1, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=0
-        )
-    for dummy_t in pl.spmd(T, name_hint="prefill_swa_cmp_indices_dummy_init"):
-        cmp_indices_dummy[dummy_t : dummy_t + 1, :] = pl.full(
-            [1, IDX_TOPK], dtype=pl.INT32, value=-1
-        )
+    # Cache layout is local to this caller; attention math is shared with CP.
+    sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+    with pl.spmd(T, name_hint="prefill_swa_stage_sources") as stage_tid:
+        stage_t = pl.tile.get_block_idx()
+        stage = pl.full([WIN, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        bias = pl.full([1, PREFILL_SPARSE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
+        if stage_t < num_tokens:
+            for stage_col in pl.range(WIN):
+                source_row = pl.read(swa_indices, [stage_t, stage_col])
+                if source_row >= 0:
+                    source = pl.cast(source_row, pl.INDEX)
+                    stage[stage_col:stage_col + 1, :] = kv_cache_flat[source:source + 1, :]
+                    pl.write(bias, [0, stage_col], pl.cast(0.0, pl.FP32))
+        stage_base = stage_t * PREFILL_SPARSE_PAD
+        sparse_kv[stage_base:stage_base + WIN, :] = stage
+        sparse_bias[stage_t:stage_t + 1, :] = bias
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn(
-        q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy, pl.cast(BLOCK_SIZE, pl.INT32),
-        cmp_indices_dummy,
-        valid_block_mask,
-        attn_sink, num_tokens,
+    staged_sparse_attn(
+        q, sparse_kv, sparse_bias, valid_block_mask, attn_sink,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
+        num_tokens, stage_tid,
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)

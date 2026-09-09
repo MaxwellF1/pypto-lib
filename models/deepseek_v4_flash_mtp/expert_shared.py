@@ -26,6 +26,7 @@ from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 # model config
 T = MOE_TOKENS
+SHARED_T_DYN = pl.dynamic("SHARED_T_DYN")
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
@@ -34,15 +35,7 @@ SWIGLU_LIMIT = M.swiglu_limit
 SH_M_TILE = 16
 SH_ROW_PAD = 8
 SH_ROWS_PER_BLOCK = 2
-T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
-assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
-    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-N_MTILES = T_PAD // SH_M_TILE
-assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
+# Activation blocks contain two rows; callers provide an even backing capacity.
 
 K_TILE = 512
 INTER_K = 512
@@ -57,20 +50,22 @@ W2_ACT_INNER = 8
 
 @pl.jit.inline
 def expert_shared(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[SHARED_T_DYN, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SHARED_T_DYN, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[T, D], pl.BF16],
+    sh: pl.Tensor[[SHARED_T_DYN, D], pl.BF16],
 ):
-    # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
-    # prefill: T_PAD/SH_M_TILE fully-valid tiles).
-    for mt in pl.parallel(N_MTILES):
+    token_rows = pl.tensor.dim(x_local_i8, 0)
+    # One fixed Cube tile per iteration; its valid rows come from the input
+    # capacity, including the decode tile and a final partial prefill tile.
+    for mt in pl.parallel((token_rows + SH_M_TILE - 1) // SH_M_TILE):
         ts0 = mt * SH_M_TILE
+        valid_rows = pl.min(pl.cast(SH_M_TILE, pl.INDEX), token_rows - ts0)
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
@@ -84,7 +79,7 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_rows, K_TILE])
                 sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True, init_cond=(k0 == 0))
             gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
@@ -98,7 +93,7 @@ def expert_shared(
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_rows, K_TILE])
                 sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                 up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True, init_cond=(k0 == 0))
             up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
@@ -118,7 +113,7 @@ def expert_shared(
                 mode="trunc",
             )
         for row_block in pl.spmd(
-            SH_VALID_M // SH_ROWS_PER_BLOCK,
+            valid_rows // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
         ):
             row0 = row_block * SH_ROWS_PER_BLOCK
@@ -257,7 +252,8 @@ def expert_shared(
                 # Write valid rows straight to the (unpadded) output, mirroring
                 # expert_routed's direct recv_y store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+                y_valid = pl.set_validshape(y_bf16, valid_rows, D_OUT_TILE_ACT)
+                sh = pl.assemble(sh, y_valid, [ts0, d0])
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
@@ -266,16 +262,20 @@ def expert_shared(
 
 @pl.jit
 def expert_shared_test(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[SHARED_T_DYN, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SHARED_T_DYN, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    sh: pl.Out[pl.Tensor[[SHARED_T_DYN, D], pl.BF16]],
 ):
+    x_local_i8.bind_dynamic(0, SHARED_T_DYN)
+    x_local_scale_dq.bind_dynamic(0, SHARED_T_DYN)
+    sh.bind_dynamic(0, SHARED_T_DYN)
+
     expert_shared(
         x_local_i8, x_local_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,

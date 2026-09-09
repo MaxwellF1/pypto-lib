@@ -294,10 +294,7 @@ def golden_prefill_compressor_ratio128(tensors):
     num_tokens = int(tensors["num_tokens"])
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()    # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    compress_state_flat = tensors["compress_state"].view(
-        HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE,
-        COMPRESS_STATE_DIM,
-    )
+    compress_state_flat = tensors["compress_state"].view(-1, COMPRESS_STATE_DIM)
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
