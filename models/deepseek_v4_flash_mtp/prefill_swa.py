@@ -1251,7 +1251,6 @@ def prefill_cp_swa_test(
 
 def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
     meta, ctx = build_metadata(cp_size, num_tokens=num_tokens)
-    torch.manual_seed(4100 + cp_size * 31)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, TAIL_ROWS)}
     sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(0, TAIL_ROWS) }
     qkv_names = ("wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv")

@@ -560,8 +560,7 @@ def build_tensor_specs(temperature=None, top_k=None):
     from golden import TensorSpec
 
     def init_logits():
-        generator = torch.Generator().manual_seed(20260821)
-        logits = torch.randn(SAMPLE_ROWS, VOCAB, generator=generator, dtype=torch.float32)
+        logits = torch.randn(SAMPLE_ROWS, VOCAB, dtype=torch.float32)
         logits[0, 7] = 20.0
         if SAMPLE_ROWS > 4:
             logits[4, 42] = 20.0

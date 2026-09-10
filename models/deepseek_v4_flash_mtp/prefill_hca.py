@@ -1203,7 +1203,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         raise ValueError(f"runtime cp_size={cp_size} does not match static CP_SIZE={CP_SIZE}")
     metadata = build_hca_metadata(cp_size, num_tokens=num_tokens)
     raw_metadata = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens)
-    torch.manual_seed(4100 + cp_size * 31)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, TAIL_ROWS)}
     sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, TAIL_ROWS) }
     compressor_specs = { spec.name: spec for spec in build_compressor_tensor_specs(0) }
@@ -1223,14 +1222,13 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     hca_values["hc_attn_base"] = torch.randn(MIX_HC)
     hca_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
     hca_values["freqs_cos"], hca_values["freqs_sin"] = (build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16))
-    x_generator = torch.Generator().manual_seed(4100 + cp_size * 31)
     x_hc = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D, dtype=torch.float32)
     for rank in range(cp_size):
         for part in range(LOCAL_PARTS):
             for tile in range(MAX_SEGMENT_TILES):
                 active = int(raw_metadata["overlay_active_lengths"][rank, part, tile, 1])
                 if active:
-                    x_hc[rank, part, tile, :active].uniform_(-1.0, 1.0, generator=x_generator)
+                    x_hc[rank, part, tile, :active].uniform_(-1.0, 1.0)
     kv_cache = torch.zeros(cp_size, ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     common_names = (
@@ -1257,7 +1255,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
 
     state_tables = metadata["compress_state_block_table"]
-    generator = torch.Generator().manual_seed(20260731 + cp_size * 101)
     state = torch.zeros(
         cp_size,
         HCA_STATE_PHYSICAL_BLOCKS,
@@ -1269,7 +1266,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     if prefix:
         logical_values = {
             position: (
-                torch.rand(COMPRESS_STATE_DIM, generator=generator) - 0.5
+                torch.rand(COMPRESS_STATE_DIM) - 0.5
             )
             * 0.05
             for position in range(max(0, prefix - COMPRESS_RATIO), prefix)
@@ -1291,7 +1288,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     )
     completed_prefix = prefix // COMPRESS_RATIO
     if completed_prefix:
-        logical_cmp = (torch.rand(completed_prefix, HEAD_DIM, generator=generator) - 0.5).to(torch.bfloat16) * 0.1
+        logical_cmp = (torch.rand(completed_prefix, HEAD_DIM) - 0.5).to(torch.bfloat16) * 0.1
         for rank in range(cp_size):
             flat = cmp_cache[rank].view(-1, HEAD_DIM)
             for slot in range(completed_prefix):

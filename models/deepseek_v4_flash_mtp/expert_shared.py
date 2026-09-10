@@ -308,7 +308,6 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    import torch
     from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
@@ -318,8 +317,6 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    # Keep the activation requantization boundary case reproducible.
-    torch.manual_seed(5)
     result = run(
         fn=expert_shared_test,
         specs=build_tensor_specs(),

@@ -695,7 +695,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         raise ValueError(f"runtime cp_size={cp_size} does not match static CP_SIZE={CP_SIZE}")
     metadata, ctx = _build_metadata_tensors(cp_size, num_tokens=num_tokens)
     raw, raw_ctx = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens)
-    torch.manual_seed(4100 + cp_size * 31)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, T)}
     sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, T) }
     compressor_specs = { spec.name: spec for spec in build_compressor_tensor_specs(0) }
@@ -727,7 +726,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     csa_values["hc_attn_base"] = torch.randn(MIX_HC)
     csa_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
     csa_values["freqs_cos"], csa_values["freqs_sin"] = (build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16))
-    x_generator = torch.Generator().manual_seed(4100 + cp_size * 31)
     x_hc = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D, dtype=torch.float32)
     for rank in range(cp_size):
         for part in range(LOCAL_PARTS):
@@ -735,7 +733,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
             for tile in range(MAX_SEGMENT_TILES):
                 tile_active = _active_tile(active, tile)
                 if tile_active:
-                    x_hc[rank, part, tile, :tile_active].uniform_(-1.0, 1.0, generator=x_generator)
+                    x_hc[rank, part, tile, :tile_active].uniform_(-1.0, 1.0)
     kv_cache = torch.zeros(cp_size, ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
 
     shared_names = (
@@ -773,7 +771,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         value = csa_values[name]
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
 
-    generator = torch.Generator().manual_seed(20260802 + cp_size * 101)
     main_state = torch.zeros(
         cp_size,
         CSA_STATE_PHYSICAL_BLOCKS,
@@ -790,11 +787,11 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     )
     prefix = int(raw_ctx["prefix"])
     logical_main_state = {
-        position: (torch.rand(MAIN_STATE_DIM, generator=generator) - 0.5) * 0.05
+        position: (torch.rand(MAIN_STATE_DIM) - 0.5) * 0.05
         for position in range(max(0, prefix - STATE_LEN), prefix)
     }
     logical_inner_state = {
-        position: (torch.rand(INNER_STATE_DIM, generator=generator) - 0.5) * 0.05
+        position: (torch.rand(INNER_STATE_DIM) - 0.5) * 0.05
         for position in range(max(0, prefix - STATE_LEN), prefix)
     }
     for rank in range(cp_size):
@@ -820,9 +817,9 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     idx_cache = torch.zeros(cp_size, PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
     idx_scale = torch.zeros(cp_size, PREFILL_IDX_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, 1, dtype=torch.float32)
     completed = prefix // COMPRESS_RATIO
-    logical_cmp = ((torch.rand(completed, HEAD_DIM, generator=generator) - 0.5) .to(torch.bfloat16) .contiguous())
-    logical_idx = torch.randint(-31, 32, (completed, IDX_HEAD_DIM), generator=generator, dtype=torch.int8)
-    logical_scale = torch.rand(completed, 1, generator=generator) * 0.01 + 1e-4
+    logical_cmp = ((torch.rand(completed, HEAD_DIM) - 0.5) .to(torch.bfloat16) .contiguous())
+    logical_idx = torch.randint(-31, 32, (completed, IDX_HEAD_DIM), dtype=torch.int8)
+    logical_scale = torch.rand(completed, 1) * 0.01 + 1e-4
     for rank in range(cp_size):
         cmp_flat = cmp_cache[rank].view(-1, HEAD_DIM)
         idx_flat = idx_cache[rank].view(-1, IDX_HEAD_DIM)
