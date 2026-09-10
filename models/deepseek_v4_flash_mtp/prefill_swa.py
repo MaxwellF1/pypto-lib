@@ -456,7 +456,7 @@ def build_tensor_specs(
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
             row = cache_row_from_table(table, abs_pos)
-            value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
+            value = (torch.rand(HEAD_DIM) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
         return cache
@@ -897,10 +897,7 @@ def prefill_attention_swa(
                 ] = pl.full([1, D], dtype=pl.BF16, value=0.0)
                 if tail_offset < final_total:
                     src = part * MAX_SEGMENT_TILES * TAIL_ROWS + tail_offset
-                    local_hidden_tail[
-                        part * TAIL_ROWS + row:
-                        part * TAIL_ROWS + row + 1
-                    ] = normed[src:src + 1]
+                    local_hidden_tail[part * TAIL_ROWS + row: part * TAIL_ROWS + row + 1] = normed[src:src + 1]
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_tail_exchange") as tail_exchange_tid:
         _prefill_cp_hidden_tail_exchange_wave(
@@ -986,20 +983,13 @@ def prefill_attention_swa(
             local_row0 = part * MAX_SEGMENT_TILES * TAIL_ROWS
             predecessor_row0 = part * TAIL_ROWS
             for row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
-                predecessor_kv[
-                    predecessor_row0 + row0:
-                    predecessor_row0 + row0 + ROW_TILE,
-                    :,
-                ] = augmented_kv[
+                predecessor_kv[predecessor_row0 + row0: predecessor_row0 + row0 + ROW_TILE, :] = augmented_kv[
                     augmented_row0 + row0:
                     augmented_row0 + row0 + ROW_TILE,
                     :,
                 ]
             for row0 in pl.range(0, MAX_SEGMENT_TILES * TAIL_ROWS, ROW_TILE):
-                local_kv[
-                    local_row0 + row0:local_row0 + row0 + ROW_TILE,
-                    :,
-                ] = augmented_kv[
+                local_kv[local_row0 + row0:local_row0 + row0 + ROW_TILE, :] = augmented_kv[
                     augmented_row0 + TAIL_ROWS + row0:
                     augmented_row0 + TAIL_ROWS + row0 + ROW_TILE,
                     :,
@@ -1263,18 +1253,8 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     meta, ctx = build_metadata(cp_size, num_tokens=num_tokens)
     torch.manual_seed(4100 + cp_size * 31)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, TAIL_ROWS)}
-    sparse_specs = {
-        spec.name: spec
-        for spec in build_sparse_attn_tensor_specs(0, TAIL_ROWS)
-    }
-    qkv_names = (
-        "wq_a",
-        "wq_b",
-        "wq_b_scale",
-        "wkv",
-        "gamma_cq",
-        "gamma_ckv",
-    )
+    sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(0, TAIL_ROWS) }
+    qkv_names = ("wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv")
     tail_names = ("attn_sink", "wo_a", "wo_b", "wo_b_scale")
     base = {name: qkv_specs[name].create_tensor() for name in qkv_names}
     base.update({name: sparse_specs[name].create_tensor() for name in tail_names})
@@ -1403,11 +1383,7 @@ def golden_prefill_cp_swa(tensors):
                 int(meta["overlay_active_lengths"][rank, part, tile, 1])
                 for tile in range(MAX_SEGMENT_TILES)
             ]
-            rows = [
-                local_kvs[rank, part, tile, :active]
-                for tile, active in enumerate(active_lengths)
-                if active > 0
-            ]
+            rows = [local_kvs[rank, part, tile, :active] for tile, active in enumerate(active_lengths) if active > 0]
             if rows:
                 segment_rows = torch.cat(rows, dim=0)
                 valid = min(TAIL_ROWS, segment_rows.shape[0])

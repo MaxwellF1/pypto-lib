@@ -802,10 +802,8 @@ def main():
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2, max_error_ratio=0.01),
-            "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
-                                        valid_rows=args.num_tokens, valid_axis=1),
-            "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
-                                               valid_rows=args.num_tokens, valid_axis=1),
+            "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05, valid_rows=args.num_tokens, valid_axis=1),
+            "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05, valid_rows=args.num_tokens, valid_axis=1),
             "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.06),
         },
     )

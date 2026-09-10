@@ -400,9 +400,7 @@ def precompute_freqs_cos_sin(
     out_device = torch.device(device) if device is not None else None
     half_dim = dim // 2
 
-    inv_freq = 1.0 / (
-        float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32, device=out_device) / dim)
-    )
+    inv_freq = 1.0 / (float(base) ** (torch.arange(0, dim, 2, dtype=torch.float32, device=out_device) / dim))
     if original_seq_len > 0:
         low, high = _find_correction_range(beta_fast, beta_slow, dim, float(base), int(original_seq_len))
         smooth = 1 - _linear_ramp_factor(low, high, half_dim, device=out_device)

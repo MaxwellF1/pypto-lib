@@ -333,21 +333,19 @@ def _fwd_pack_moe_inputs(
 
 
 @pl.jit.inline
-def _fwd_publish_hidden(
+def _fwd_restore_hidden_layout(
     x_next_work: pl.Tensor[[CP_LOCAL_ROWS, HC_MULT, D], pl.FP32],
     active_flat: pl.Tensor[[NUM_ATTN_TILES, OVERLAY_SOURCES], pl.INT32],
     hidden_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32]],
     moe_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Tensor[
-    [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32
-]:
+) -> pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32]:
     """Restore packed MoE rows to the two attention slots and zero padding."""
     hidden_flat = pl.reshape(hidden_out, [CP_LOCAL_ROWS, HC_MULT, D])
     first_tokens = pl.cast(0, pl.INDEX)
     for first_tile in pl.range(MAX_SEGMENT_TILES):
         first_tokens = first_tokens + pl.cast(pl.read(active_flat, [first_tile, 1]), pl.INDEX)
     tile_blocks = (ATTN_TILE_ROWS // PRE_HC_COPY_TOKEN_TILE) * HC_MULT
-    with pl.spmd(NUM_ATTN_TILES * tile_blocks, name_hint="publish_hidden", deps=[moe_tid]) as _publish_tid:
+    with pl.spmd(NUM_ATTN_TILES * tile_blocks, name_hint="restore_hidden_layout", deps=[moe_tid]) as _restore_tid:
         block = pl.tile.get_block_idx()
         tile = block // tile_blocks
         tile_block = block % tile_blocks
@@ -368,11 +366,7 @@ def _fwd_publish_hidden(
                     0:D,
                 ] = pl.slice(x_next_work, [1, 1, D], [packed_row, hc_lane, 0])
             else:
-                hidden_flat[
-                    row : row + 1,
-                    hc_lane : hc_lane + 1,
-                    0:D,
-                ] = pl.full([1, 1, D], dtype=pl.FP32, value=0.0)
+                hidden_flat[row : row + 1, hc_lane : hc_lane + 1, 0:D] = pl.full([1, 1, D], dtype=pl.FP32, value=0.0)
     return pl.reshape(hidden_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D])
 
 
@@ -434,9 +428,7 @@ def _fwd_moe_tail(
     completion_anchor: pl.Out[pl.Tensor[[1, 1, 8], pl.FP32]],
     attention_done_tid: pl.Scalar[pl.TASK_ID],
     layer_id: pl.Scalar[pl.INT32],
-) -> pl.Tensor[
-    [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32
-]:
+) -> pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32]:
     """Pack real CP rows, run one MoE slab, and restore the attention slots."""
     x_attn_flat = pl.reshape(x_attn, [CP_LOCAL_ROWS, HC_MULT, D])
     x_next_work = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT, D], dtype=pl.FP32)
@@ -480,7 +472,7 @@ def _fwd_moe_tail(
         final_element = pl.slice(x_next_work, [1, 1, 8], [CP_LOCAL_ROWS - 1, 0, 0])
         completion_anchor[0:1, 0:1, 0:8] = final_element
 
-    hidden_out = _fwd_publish_hidden(x_next_work, active_flat, hidden_out, moe_tid)
+    hidden_out = _fwd_restore_hidden_layout(x_next_work, active_flat, hidden_out, moe_tid)
     return hidden_out
 
 
@@ -993,9 +985,7 @@ def prefill_fwd(
     csa_cmp_blocks = pl.tensor.dim(csa_cmp_kv, 0) // CSA_NUM_LAYERS
     csa_idx_blocks = pl.tensor.dim(idx_kv_cache, 0) // CSA_NUM_LAYERS
     csa_state_blocks = pl.tensor.dim(csa_compress_state, 0) // CSA_NUM_LAYERS
-    csa_inner_state_blocks = (
-        pl.tensor.dim(csa_inner_compress_state, 0) // CSA_NUM_LAYERS
-    )
+    csa_inner_state_blocks = (pl.tensor.dim(csa_inner_compress_state, 0) // CSA_NUM_LAYERS)
     # CSA scratch shares each sliced state root's physical page capacity.
     main_state_workspace0 = pl.create_tensor(
         [csa_state_blocks, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM],
@@ -1463,7 +1453,7 @@ from prefill_cp_exchange import (
 from prefill_cp_exchange import (
     _prefill_cp_request_header as prepare_cp_request,
     _prefill_cp_scatter_request as scatter_cp_request,
-    _prefill_cp_publish_hidden as publish_cp_hidden,
+    _prefill_cp_gather_hidden as gather_cp_hidden,
 )
 
 
@@ -1778,7 +1768,7 @@ def _prefill_request(
         )
         cp_pre_hc_flat = pl.reshape(cp_pre_hc_hidden_out, [CP_LOCAL_ROWS, HC_DIM])
         output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
-        x_out, output_pre_hc_flat = publish_cp_hidden(
+        x_out, output_pre_hc_flat = gather_cp_hidden(
             control,
             cp_hidden_out, cp_pre_hc_flat,
             entry_hidden_window,

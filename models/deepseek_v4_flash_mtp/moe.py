@@ -232,13 +232,7 @@ def dispatch(
                 pl.tile.write(meta_tile, [0, e], cursor[dst * N_LOCAL + e])
             pld.tile.remote_store(meta_tile, target=recv_meta, peer=dst, offsets=[my_rank, 0])
             if dst != my_rank:
-                pld.system.notify(
-                    target=arrived,
-                    peer=dst,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+                pld.system.notify(target=arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
         # Wait for every source's meta flag.
         for src in pl.range(N_RANKS):
@@ -822,10 +816,7 @@ def make_prefill_moe(layout: PrefillMoELayout):
                 if chunk_rows > PREFILL_MOE_RETURN_ROWS_PER_BLOCK:
                     chunk_rows = PREFILL_MOE_RETURN_ROWS_PER_BLOCK
                 for row in pl.range(chunk_rows):
-                    returned_y[
-                        live_row_base + row0 + row : live_row_base + row0 + row + 1,
-                        :,
-                    ] = reverse_target[
+                    returned_y[live_row_base + row0 + row : live_row_base + row0 + row + 1, :] = reverse_target[
                         staging_base + row0 + row : staging_base + row0 + row + 1,
                         :,
                     ]
@@ -1169,12 +1160,7 @@ def combine(
 
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.wait(
-                    signal=combine_arrived,
-                    offsets=[src, 0],
-                    expected=moe_epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.wait(signal=combine_arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait for the
     # peers' writes; this rank's own puts ride the local RAW edge on routed_y_buf,
@@ -1775,8 +1761,7 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
@@ -1817,10 +1802,7 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids,
-                num_sub_workers=0,
-            ),
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             platform=args.platform,
             enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,

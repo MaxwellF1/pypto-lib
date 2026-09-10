@@ -71,11 +71,7 @@ def expert_shared(
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
         # gate (w1) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
-            name_hint="sh_gate_mm",
-            allow_early_resolve=True,
-        ):
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
             n0 = nb_idx * MM_INTER_TILE
             gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -85,11 +81,7 @@ def expert_shared(
             gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
         # up (w3) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            MOE_INTER // MM_INTER_TILE,
-            name_hint="sh_up_mm",
-            allow_early_resolve=True,
-        ):
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
             n0 = nb_idx * MM_INTER_TILE
             up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -103,31 +95,17 @@ def expert_shared(
         # stay in one task so this stage can start alongside dispatch_push.
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
-        h_tile_scale_dq = pl.create_tensor(
-            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
-        )
+        h_tile_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_tile_i8_init"):
             h_tile_i8[:, :] = pl.cast(
                 pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0),
                 target_type=pl.INT8,
                 mode="trunc",
             )
-        for row_block in pl.spmd(
-            valid_rows // SH_ROWS_PER_BLOCK,
-            name_hint="sh_gate_up_act_q",
-        ):
+        for row_block in pl.spmd(valid_rows // SH_ROWS_PER_BLOCK, name_hint="sh_gate_up_act_q"):
             row0 = row_block * SH_ROWS_PER_BLOCK
-            x_scale = pl.slice(
-                x_local_scale_dq,
-                [SH_ROW_PAD, 1],
-                [ts0 + row0, 0],
-                valid_shape=[SH_ROWS_PER_BLOCK, 1],
-            )
-            row_amax = pl.full(
-                [1, SH_ROW_PAD],
-                dtype=pl.FP32,
-                value=INT8_AMAX_EPS,
-            )
+            x_scale = pl.slice(x_local_scale_dq, [SH_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[SH_ROWS_PER_BLOCK, 1])
+            row_amax = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for part in pl.pipeline(0, MOE_INTER // ACT_INTER_TILE, stage=1):
                 n0 = part * ACT_INTER_TILE
                 gate_rows_i32 = pl.slice(
@@ -142,63 +120,26 @@ def expert_shared(
                     [row0, n0],
                     valid_shape=[SH_ROWS_PER_BLOCK, ACT_INTER_TILE],
                 )
-                w1_scale = pl.reshape(
-                    shared_w1_scale[n0 : n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                w3_scale = pl.reshape(
-                    shared_w3_scale[n0 : n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                gate_fp32 = pl.cast(
-                    gate_rows_i32, target_type=pl.FP32, mode="none"
-                )
-                up_fp32 = pl.cast(
-                    up_rows_i32, target_type=pl.FP32, mode="none"
-                )
-                gate_fp32 = pl.col_expand_mul(
-                    pl.row_expand_mul(gate_fp32, x_scale), w1_scale
-                )
-                up_fp32 = pl.col_expand_mul(
-                    pl.row_expand_mul(up_fp32, x_scale), w3_scale
-                )
+                w1_scale = pl.reshape(shared_w1_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                w3_scale = pl.reshape(shared_w3_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_fp32 = pl.cast(gate_rows_i32, target_type=pl.FP32, mode="none")
+                up_fp32 = pl.cast(up_rows_i32, target_type=pl.FP32, mode="none")
+                gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale), w1_scale)
+                up_fp32 = pl.col_expand_mul(pl.row_expand_mul(up_fp32, x_scale), w3_scale)
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
-                    up_fp32 = pl.maximum(
-                        pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT
-                    )
+                    up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
-                chunk_amax = pl.reshape(
-                    pl.row_max(pl.abs(gated)), [1, SH_ROW_PAD]
-                )
+                chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, SH_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
-                h_tile_fp32[
-                    row0 : row0 + SH_ROWS_PER_BLOCK,
-                    n0 : n0 + ACT_INTER_TILE,
-                ] = gated[0:SH_ROWS_PER_BLOCK, :]
+                h_tile_fp32[row0 : row0 + SH_ROWS_PER_BLOCK, n0 : n0 + ACT_INTER_TILE] = gated[0:SH_ROWS_PER_BLOCK, :]
 
-            row_scale_q = pl.div(
-                pl.full(
-                    [1, SH_ROW_PAD],
-                    dtype=pl.FP32,
-                    value=INT8_SCALE_MAX,
-                ),
-                row_amax,
-            )
+            row_scale_q = pl.div(pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
             row_scale_q_col = pl.reshape(row_scale_q, [SH_ROW_PAD, 1])
-            row_scale_dq_col = pl.reshape(
-                pl.recip(row_scale_q), [SH_ROW_PAD, 1]
-            )
-            row_scale_dq = pl.row_expand(
-                pl.full(
-                    [SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0
-                ),
-                row_scale_dq_col,
-            )
-            h_tile_scale_dq[
-                row0 : row0 + SH_ROWS_PER_BLOCK, :
-            ] = row_scale_dq[0:SH_ROWS_PER_BLOCK, :]
+            row_scale_dq_col = pl.reshape(pl.recip(row_scale_q), [SH_ROW_PAD, 1])
+            row_scale_dq = pl.row_expand(pl.full([SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0), row_scale_dq_col)
+            h_tile_scale_dq[row0 : row0 + SH_ROWS_PER_BLOCK, :] = row_scale_dq[0:SH_ROWS_PER_BLOCK, :]
             for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=1):
                 k0 = q_idx * QUANT_TILE
                 h_fp32 = pl.slice(
@@ -213,32 +154,21 @@ def expert_shared(
                 h_tile_i8[
                     row0 : row0 + SH_ROWS_PER_BLOCK,
                     k0 : k0 + QUANT_TILE,
-                ] = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")[
-                    0:SH_ROWS_PER_BLOCK, :
-                ]
+                ] = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")[0:SH_ROWS_PER_BLOCK, :]
 
         # w2 (down) cube matmul -> INT32 GM accumulator.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
-        for db_idx in pl.spmd(
-            D // D_OUT_TILE,
-            name_hint="sh_w2_mm",
-        ):
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                 hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                sw2_k = shared_w2[
-                    d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
-                ]
+                sw2_k = shared_w2[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
                 y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(
-            D // (W2_ACT_INNER * D_OUT_TILE_ACT),
-            name_hint="sh_w2_act",
-            allow_early_resolve=True,
-        ):
+        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act", allow_early_resolve=True):
             d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
             h_scale = pl.row_max(h_tile_scale_dq[:, :])
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):
@@ -246,9 +176,7 @@ def expert_shared(
                 y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
                 w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                y_2d = pl.col_expand_mul(
-                    pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
-                )
+                y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk)
                 # Write valid rows straight to the (unpadded) output, mirroring
                 # expert_routed's direct recv_y store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
@@ -384,8 +312,7 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)

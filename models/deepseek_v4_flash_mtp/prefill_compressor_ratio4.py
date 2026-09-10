@@ -303,10 +303,7 @@ def compressor_ratio4(
                     pool_dep = pl.mul(pooled_kv[0:1, 0:STATE_UPDATE_OUT_TILE], 0.0)
                     for update_ob in pl.range(OUT_DIM // STATE_UPDATE_OUT_TILE):
                         update_o0 = update_ob * STATE_UPDATE_OUT_TILE
-                        ape_row = ape[
-                            ape_slot : ape_slot + 1,
-                            update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
-                        ]
+                        ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + STATE_UPDATE_OUT_TILE]
                         # Slices stay inline: naming one materializes an extra tile.
                         compress_state_flat[
                             state_row : state_row + 1,
@@ -345,9 +342,7 @@ def golden_prefill_compressor_ratio4(tensors):
     import torch
 
     x = tensors["x"].view(T, D).float()
-    compress_state_flat = tensors["compress_state"].view(
-        -1, COMPRESS_STATE_DIM,
-    )
+    compress_state_flat = tensors["compress_state"].view(-1, COMPRESS_STATE_DIM)
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
@@ -453,9 +448,7 @@ def golden_prefill_compressor_ratio4(tensors):
 @pl.jit
 def prefill_compressor_ratio4_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
+    compress_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],

@@ -150,12 +150,7 @@ def prefill_cp_zigzag_kv_tail_exchange_core(
         epoch_value = pl.cast(epoch + 1, pl.INT32)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
-                pld.system.wait(
-                    signal=consumed,
-                    offsets=[peer, 0],
-                    expected=epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.wait(signal=consumed, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
 
         for peer in pl.range(CP_SIZE):
             for part in pl.range(2):
@@ -173,47 +168,22 @@ def prefill_cp_zigzag_kv_tail_exchange_core(
                 )
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
-                pld.system.notify(
-                    target=ready,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+                pld.system.notify(target=ready, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
         for seg in pl.range(NUM_SEGMENTS):
             rm_pos = reverse_index[seg]
             owner = owner_rank_table[seg]
             if owner != my_rank:
-                pld.system.wait(
-                    signal=ready,
-                    offsets=[owner, 0],
-                    expected=epoch_value,
-                    cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.wait(signal=ready, offsets=[owner, 0], expected=epoch_value, cmp=pld.WaitCmp.Ge)
             source_row = rm_pos * TAIL_ROWS
             destination_row = epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
             for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
-                win_tile = pl.load(
-                    kv_tail_window,
-                    [source_row + t0, 0],
-                    [ROW_TILE, HEAD_DIM],
-                )
-                pl.store(
-                    win_tile,
-                    [destination_row + t0, 0],
-                    logical_tails_out,
-                )
+                win_tile = pl.load(kv_tail_window, [source_row + t0, 0], [ROW_TILE, HEAD_DIM])
+                pl.store(win_tile, [destination_row + t0, 0], logical_tails_out)
 
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
-                pld.system.notify(
-                    target=consumed,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+                pld.system.notify(target=consumed, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
     last_epoch_base = (EPOCHS - 1) * CP_TAIL_WINDOW_ROWS
     for j in pl.range(TAIL_ROWS):

@@ -146,10 +146,7 @@ def gate(
         t0 = quant_block * T_TILE
         xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
         for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-            xn_q_scaled = pl.row_expand_mul(
-                xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
-                xn_sq_col,
-            )
+            xn_q_scaled = pl.row_expand_mul(xg_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE], xn_sq_col)
             xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
             xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
             x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
@@ -172,9 +169,7 @@ def gate(
             # same columns a row block at a time; the bytes stored are the same.
             for pad_block in pl.range(padded_rows // GATE_M_TILE):
                 pad_t0 = pad_block * GATE_M_TILE
-                biased_scores_buf[
-                    pad_t0 : pad_t0 + GATE_M_TILE, N_EXPERTS:SCORE_PAD
-                ] = pl.full(
+                biased_scores_buf[pad_t0 : pad_t0 + GATE_M_TILE, N_EXPERTS:SCORE_PAD] = pl.full(
                     [GATE_M_TILE, SCORE_PAD - N_EXPERTS],
                     dtype=pl.FP32,
                     value=FP32_NEG_INF,
@@ -434,8 +429,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--num-tokens", type=int, default=T)

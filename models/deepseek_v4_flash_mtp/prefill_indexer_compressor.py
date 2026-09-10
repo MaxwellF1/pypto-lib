@@ -87,10 +87,7 @@ def _prefill_indexer_compressor_with_completion(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    compress_state_flat = pl.reshape(
-        compress_state,
-        [state_block_num * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
-    )
+    compress_state_flat = pl.reshape(compress_state, [state_block_num * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -338,10 +335,7 @@ def _prefill_indexer_compressor_with_completion(
             final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
 
     scale_scratch = pl.create_tensor([MAX_CMP_WRITES, 1], dtype=pl.FP32)
-    with pl.spmd(
-        MAX_CMP_WRITES // PACKED_RMS_TILE,
-        name_hint="prefill_idx_c4_cache_write",
-    ) as cache_write_tid:
+    with pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write") as cache_write_tid:
         final_block = pl.tile.get_block_idx()
         final_base = final_block * PACKED_RMS_TILE
         # C8 quant-on-write: per-row INT8 quant of the bf16-rounded block + per-position dequant scale
@@ -398,20 +392,14 @@ def _prefill_indexer_compressor_with_completion(
                     update_o0 = update_ob * OUT_TILE
                     ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
                     compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                        kv_proj_scratch[
-                            update_t : update_t + 1,
-                            update_o0 : update_o0 + OUT_TILE,
-                        ],
+                        kv_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
                         pool_dep,
                     )
                     compress_state_flat[
                         state_row : state_row + 1,
                         OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
                     ] = pl.add(
-                        pl.add(
-                            score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                            ape_row,
-                        ),
+                        pl.add(score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE], ape_row),
                         pool_dep,
                     )
 
@@ -457,9 +445,7 @@ def prefill_indexer_compressor(
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[T, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
-    compress_state: pl.InOut[
-        pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
-    ],
+    compress_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -522,9 +508,7 @@ def golden_prefill_indexer_compressor(tensors):
 
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()   # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    compress_state_flat = tensors["compress_state"].view(
-        -1, COMPRESS_STATE_DIM,
-    )
+    compress_state_flat = tensors["compress_state"].view(-1, COMPRESS_STATE_DIM)
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["inner_compress_state_block_table"]
@@ -763,8 +747,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer compressor validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--compile-only",

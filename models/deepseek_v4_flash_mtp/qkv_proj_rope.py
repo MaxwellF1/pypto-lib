@@ -225,11 +225,7 @@ def rope_prepare(
             )
             qrp_tail_sign = pl.sub(pl.mul(qrp_tail_lane, 2.0), 1.0)
             qrp_sin_signed_tail = pl.mul(qrp_sin_il_tail, qrp_tail_sign)
-            pl.store(
-                pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM),
-                [qrp_t0, 0],
-                rope_cos_il_view,
-            )
+            pl.store(pl.set_validshape(qrp_cos_il_tail, qrp_valid_rows, ROPE_DIM), [qrp_t0, 0], rope_cos_il_view)
             pl.store(
                 pl.set_validshape(qrp_sin_signed_tail, qrp_valid_rows, ROPE_DIM),
                 [qrp_t0, 0],
@@ -276,9 +272,7 @@ def q_proj_rope(
                         qr_seed = pl.full([QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0)
                         qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = qr_seed
 
-            for qbg_idx in pl.spmd(
-                (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
-            ):
+            for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
                 for t0 in pl.range(0, qr_t_matmul, QR_M_TILE):
@@ -1195,14 +1189,10 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run
 
-    MODES = {
-        "decode":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
-    }
+    MODES = { "decode":  (DECODE_BATCH, DECODE_SEQ), "prefill": (PREFILL_BATCH, PREFILL_SEQ), }
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")

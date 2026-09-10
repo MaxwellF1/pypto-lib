@@ -151,9 +151,7 @@ LOCAL_AUGMENTED_ROWS = LOCAL_PARTS * ROWS_PER_AUGMENTED_PART
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 # A compressor leaf emits at most one row in the persistent HCA page layout.
 LEAF_CMP_BLOCKS = 1
-LEAF_CMP_ROWS = (
-    LOCAL_PARTS * MAX_COMPRESS_LEAVES * LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE
-)
+LEAF_CMP_ROWS = (LOCAL_PARTS * MAX_COMPRESS_LEAVES * LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE)
 
 # Canonical per-dispatch ring sizing for the standalone L3 harness.  The
 # dbdd runtime no longer reads the retired PTO2_RING_* environment variables.
@@ -241,11 +239,7 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
                     query_requests[rank, part, tile, :active] = 0
                 if tile == 0:
                     predecessor = segment - 1
-                    predecessor_len = (
-                        min(TAIL_ROWS, lengths[predecessor])
-                        if predecessor >= 0
-                        else 0
-                    )
+                    predecessor_len = (min(TAIL_ROWS, lengths[predecessor]) if predecessor >= 0 else 0)
                     predecessor_start = (
                         _tail_start(starts[predecessor], lengths[predecessor])
                         if predecessor >= 0
@@ -263,9 +257,7 @@ def _build_raw_attention_metadata(cp_size: int, *, num_tokens: int | None = None
                     overlay_positions[
                         rank, part, tile, TAIL_ROWS:TAIL_ROWS + active
                     ] = torch.arange(tile_start, tile_start + active, dtype=torch.int32)
-                    overlay_requests[
-                        rank, part, tile, TAIL_ROWS:TAIL_ROWS + active
-                    ] = 0
+                    overlay_requests[rank, part, tile, TAIL_ROWS:TAIL_ROWS + active] = 0
                 overlay_lengths[rank, part, tile, 0] = predecessor_len
                 overlay_lengths[rank, part, tile, 1] = active
                 for query_row in range(active):
@@ -324,9 +316,7 @@ def _state_block_tables(cp_size: int):
     tables = torch.empty(cp_size, HCA_STATE_MAX_BLOCKS, dtype=torch.int32)
     for rank in range(cp_size):
         for logical_block in range(HCA_STATE_MAX_BLOCKS):
-            tables[rank, logical_block] = (
-                logical_block * 17 + 3
-            ) % HCA_STATE_PHYSICAL_BLOCKS
+            tables[rank, logical_block] = (logical_block * 17 + 3) % HCA_STATE_PHYSICAL_BLOCKS
     return tables
 
 
@@ -365,11 +355,7 @@ def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None)
             segment_len = lengths[segment]
             segment_end = segment_start + segment_len
 
-            boundaries = [
-                position
-                for position in range(segment_start, segment_end)
-                if _cmp_slot(position) >= 0
-            ]
+            boundaries = [position for position in range(segment_start, segment_end) if _cmp_slot(position) >= 0]
             if len(boundaries) > MAX_COMPRESSED_ROWS_PER_SEGMENT:
                 raise ValueError(
                     f"segment {segment} has {len(boundaries)} compressed rows; "
@@ -397,13 +383,9 @@ def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None)
                     absolute_position = tile_start + row
                     visible = min(IDX_TOPK, (absolute_position + 1) // COMPRESS_RATIO)
                     if visible:
-                        cmp_indices[rank, part, tile, row, :visible] = (
-                            torch.arange(visible, dtype=torch.int32)
-                        )
+                        cmp_indices[rank, part, tile, row, :visible] = (torch.arange(visible, dtype=torch.int32))
 
-    active_segments = [
-        segment for segment, length in enumerate(lengths) if length > 0
-    ]
+    active_segments = [segment for segment, length in enumerate(lengths) if length > 0]
     if not active_segments:
         raise ValueError("CP-HCA requires at least one active logical segment")
     final_segment = active_segments[-1]
@@ -547,9 +529,7 @@ def prefill_attention_hca(
             for row in pl.range(TAIL_ROWS):
                 tail_offset = tail_offset0 + row
                 destination = part * TAIL_ROWS + row
-                local_hidden_tail[
-                    destination : destination + 1, :
-                ] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                local_hidden_tail[destination : destination + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
                 if tail_offset < total:
                     source = (part * MAX_SEGMENT_TILES * TAIL_ROWS + tail_offset)
                     local_hidden_tail[destination : destination + 1, :] = normed[source : source + 1, :]
@@ -667,10 +647,7 @@ def prefill_attention_hca(
             augmented_row0 = part * ROWS_PER_AUGMENTED_PART
             local_row0 = part * MAX_SEGMENT_TILES * TAIL_ROWS
             for row0 in pl.range(0, MAX_SEGMENT_TILES * TAIL_ROWS, ROW_TILE):
-                local_kv[
-                    local_row0 + row0:local_row0 + row0 + ROW_TILE,
-                    :,
-                ] = augmented_kv[
+                local_kv[local_row0 + row0:local_row0 + row0 + ROW_TILE, :] = augmented_kv[
                     augmented_row0 + TAIL_ROWS + row0:
                     augmented_row0 + TAIL_ROWS + row0 + ROW_TILE,
                     :,
@@ -679,11 +656,7 @@ def prefill_attention_hca(
             if predecessor >= 0:
                 predecessor_row0 = predecessor * TAIL_ROWS
                 for row0 in pl.range(0, TAIL_ROWS, ROW_TILE):
-                    logical_kv[
-                        predecessor_row0 + row0:
-                        predecessor_row0 + row0 + ROW_TILE,
-                        :,
-                    ] = augmented_kv[
+                    logical_kv[predecessor_row0 + row0: predecessor_row0 + row0 + ROW_TILE, :] = augmented_kv[
                         augmented_row0 + row0:
                         augmented_row0 + row0 + ROW_TILE,
                         :,
@@ -827,17 +800,9 @@ def prefill_attention_hca(
                         position = pl.read(query_positions_flat, [query_row0 + row])
                         if (position + 1) % COMPRESS_RATIO == 0:
                             destination = part * CMP_ROWS_PER_SEGMENT + tile
-                            leaf_index = (
-                                part * MAX_COMPRESS_LEAVES + 1 + tile
-                            )
-                            source = (
-                                leaf_index
-                                * LEAF_CMP_BLOCKS
-                                * CMP_STORAGE_BLOCK_SIZE
-                            )
-                            local_cmp_payload[
-                                destination : destination + 1, :
-                            ] = leaf_cmp_flat[source : source + 1, :]
+                            leaf_index = (part * MAX_COMPRESS_LEAVES + 1 + tile)
+                            source = (leaf_index * LEAF_CMP_BLOCKS * CMP_STORAGE_BLOCK_SIZE)
+                            local_cmp_payload[destination : destination + 1, :] = leaf_cmp_flat[source : source + 1, :]
                             pl.write(local_cmp_meta, [destination, 0], pl.cast(1, pl.INT32))
                             pl.write(local_cmp_meta, [destination, 1], segment)
                             pl.write(local_cmp_meta, [destination, 2], position)
@@ -848,10 +813,7 @@ def prefill_attention_hca(
                             )
             if segment == final_segment:
                 valid = pl.read(snapshot_valid, [part])
-                end_position = (
-                    pl.read(segment_starts_t, [segment])
-                    + pl.read(segment_active_lengths, [part])
-                )
+                end_position = (pl.read(segment_starts_t, [segment]) + pl.read(segment_active_lengths, [part]))
                 pl.write(local_state_meta, [0, 0], pl.cast(1, pl.INT32))
                 pl.write(local_state_meta, [0, 1], segment)
                 pl.write(local_state_meta, [0, 2], valid)
@@ -868,9 +830,7 @@ def prefill_attention_hca(
                                 * HCA_STATE_BLOCK_SIZE
                                 + position % HCA_STATE_BLOCK_SIZE
                             )
-                            local_state_payload[
-                                row:row + 1, :
-                            ] = scratch_state_flat[source:source + 1, :]
+                            local_state_payload[row:row + 1, :] = scratch_state_flat[source:source + 1, :]
 
     attn_cmp_flat = pl.create_tensor([HCA_MAX_COMPRESSED_ROWS, HEAD_DIM], dtype=pl.BF16)
     attn_cmp_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
@@ -1219,10 +1179,7 @@ def _state_physical_row(table, absolute_position: int) -> int:
     physical_block = int(table[logical_block].item())
     if physical_block < 0:
         return -1
-    return (
-        physical_block * HCA_STATE_BLOCK_SIZE
-        + absolute_position % HCA_STATE_BLOCK_SIZE
-    )
+    return (physical_block * HCA_STATE_BLOCK_SIZE + absolute_position % HCA_STATE_BLOCK_SIZE)
 
 
 def _cmp_physical_row(table, logical_slot: int) -> int:
@@ -1234,10 +1191,7 @@ def _cmp_physical_row(table, logical_slot: int) -> int:
     physical_block = int(table[logical_block].item())
     if physical_block < 0:
         return -1
-    return (
-        physical_block * CMP_STORAGE_BLOCK_SIZE
-        + logical_slot % CMP_STORAGE_BLOCK_SIZE
-    )
+    return (physical_block * CMP_STORAGE_BLOCK_SIZE + logical_slot % CMP_STORAGE_BLOCK_SIZE)
 
 
 def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
@@ -1251,21 +1205,9 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     raw_metadata = _build_raw_attention_metadata(cp_size, num_tokens=num_tokens)
     torch.manual_seed(4100 + cp_size * 31)
     qkv_specs = {spec.name: spec for spec in build_qkv_tensor_specs(1, TAIL_ROWS)}
-    sparse_specs = {
-        spec.name: spec
-        for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, TAIL_ROWS)
-    }
-    compressor_specs = {
-        spec.name: spec for spec in build_compressor_tensor_specs(0)
-    }
-    qkv_names = (
-        "wq_a",
-        "wq_b",
-        "wq_b_scale",
-        "wkv",
-        "gamma_cq",
-        "gamma_ckv",
-    )
+    sparse_specs = { spec.name: spec for spec in build_sparse_attn_tensor_specs(COMPRESS_RATIO, TAIL_ROWS) }
+    compressor_specs = { spec.name: spec for spec in build_compressor_tensor_specs(0) }
+    qkv_names = ("wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv")
     tail_names = ("attn_sink", "wo_a", "wo_b", "wo_b_scale")
     hca_values = {name: qkv_specs[name].create_tensor() for name in qkv_names}
     hca_values.update({name: sparse_specs[name].create_tensor() for name in tail_names})
@@ -1280,9 +1222,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     hca_values["hc_attn_scale"] = torch.randn(3)
     hca_values["hc_attn_base"] = torch.randn(MIX_HC)
     hca_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
-    hca_values["freqs_cos"], hca_values["freqs_sin"] = (
-        build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
-    )
+    hca_values["freqs_cos"], hca_values["freqs_sin"] = (build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16))
     x_generator = torch.Generator().manual_seed(4100 + cp_size * 31)
     x_hc = torch.zeros(cp_size, LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D, dtype=torch.float32)
     for rank in range(cp_size):
@@ -1311,9 +1251,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
         "cmp_ape",
         "cmp_norm_w",
     )
-    specs = [
-        TensorSpec("x_hc", list(x_hc.shape), torch.float32, init_value=x_hc)
-    ]
+    specs = [TensorSpec("x_hc", list(x_hc.shape), torch.float32, init_value=x_hc)]
     for name in common_names:
         value = hca_values[name]
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
@@ -1537,9 +1475,7 @@ def golden_prefill_cp_hca(tensors):
             pred_positions = torch.zeros(TAIL_ROWS, dtype=torch.int32)
             if pred_valid:
                 pred_x[:pred_valid] = logical_hidden[predecessor, :pred_valid]
-                pred_positions[:pred_valid] = tensors[
-                    "segment_tail_positions"
-                ][predecessor, :pred_valid]
+                pred_positions[:pred_valid] = tensors["segment_tail_positions"][predecessor, :pred_valid]
             leaves.append((pred_x, pred_positions, pred_valid, False))
         else:
             leaves.append(
@@ -1632,13 +1568,9 @@ def golden_prefill_cp_hca(tensors):
                 pred_valid = int(tensors["overlay_active_lengths"][rank, part, tile, 0])
                 if pred_valid:
                     if tile == 0 and predecessor >= 0:
-                        fake[
-                            OVERLAY_BASE:OVERLAY_BASE + pred_valid
-                        ] = logical_kv[predecessor, :pred_valid]
+                        fake[OVERLAY_BASE:OVERLAY_BASE + pred_valid] = logical_kv[predecessor, :pred_valid]
                     elif tile > 0:
-                        fake[
-                            OVERLAY_BASE:OVERLAY_BASE + pred_valid
-                        ] = local_kv[rank, part, tile - 1, :pred_valid]
+                        fake[OVERLAY_BASE:OVERLAY_BASE + pred_valid] = local_kv[rank, part, tile - 1, :pred_valid]
                 fake[
                     OVERLAY_BASE + PRED_OVERLAY_ROWS:
                     OVERLAY_BASE + PRED_OVERLAY_ROWS + active
@@ -1651,15 +1583,11 @@ def golden_prefill_cp_hca(tensors):
                     {
                         "q": local_q[rank, part, tile],
                         "ori_kv": fake_cache,
-                        "swa_indices": tensors["swa_indices"][
-                            rank, part, tile
-                        ],
+                        "swa_indices": tensors["swa_indices"][rank, part, tile],
                         "cmp_kv": cmp_result[rank],
                         "cmp_block_table": tensors["cmp_block_table"][rank],
                         "cmp_storage_block_size": CMP_STORAGE_BLOCK_SIZE,
-                        "cmp_indices": tensors["cmp_indices"][
-                            rank, part, tile
-                        ],
+                        "cmp_indices": tensors["cmp_indices"][rank, part, tile],
                         "attn_sink": tensors["attn_sink"],
                         "num_tokens": active,
                         "freqs_cos": tensors["freqs_cos"].index_select(0, rope_positions),
