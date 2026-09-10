@@ -69,9 +69,9 @@ from prefill_swa import (
     Q_LORA,
     ROPE_HEAD_DIM,
     golden_prefill_attention_swa,
-    prefill_attention_swa,
+    prefill_mtp_attention_swa,
+    build_tensor_specs as build_swa_tensor_specs,
 )
-from prefill_fwd import build_single_layer_tensor_specs
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -180,7 +180,6 @@ def mtp_prefill_fwd(
     scale_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     reverse_target: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     reverse_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
@@ -208,7 +207,7 @@ def mtp_prefill_fwd(
 
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        prefill_attention_swa(
+        prefill_mtp_attention_swa(
             projected,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_w,
@@ -230,8 +229,7 @@ def mtp_prefill_fwd(
     moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
     completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
     with pl.scope():
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_attention_ready",
-                   allow_early_resolve=False) as attention_ready:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_attention_ready", allow_early_resolve=False) as attention_ready:
             _attention_ready = pl.read(x_attn, [0, 0, 0])
         moe_tid = prefill_moe(
             x_attn, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -363,7 +361,7 @@ def l3_mtp_prefill_fwd(
             hidden_out[r], pre_hc_hidden_out[r],
             count_target, count_signal, x_target, x_signal, scale_target,
             reverse_target, reverse_signal,
-            r, num_tokens,
+            num_tokens,
             device=r,
         )
 
@@ -382,12 +380,6 @@ def l3_mtp_prefill_fwd(
             r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
             LM_HEAD_COMM_EPOCH, device=r,
         )
-
-
-def _ranked(spec, torch):
-    from golden import TensorSpec
-
-    return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value)
 
 
 def _projection_specs():
@@ -488,16 +480,33 @@ def build_tensor_specs(
     from golden import ScalarSpec, TensorSpec
 
     if output_mode not in ("validate", "device-resident"):
-        raise ValueError(
-            f"unsupported output_mode {output_mode!r}; expected 'validate' or 'device-resident'"
-        )
+        raise ValueError(f"unsupported output_mode {output_mode!r}; expected 'validate' or 'device-resident'")
     # Both modes use the same resident device buffers. ``main`` controls whether
     # they are copied to host once for golden validation or remain device-only.
 
-    base_tensor_specs = build_single_layer_tensor_specs(
-        start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID,
-    )
-    base = {spec.name: spec for spec in base_tensor_specs if isinstance(spec, TensorSpec)}
+    # MTP consumes SWA and MoE only; no main-forward compressor fixtures are needed.
+    base = {}
+    for spec in build_swa_tensor_specs(start_pos=start_pos, num_tokens=num_tokens):
+        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_out"}:
+            continue
+        name = "ori_block_table" if spec.name == "block_table" else spec.name
+
+        def init_ranked(spec=spec):
+            return torch.stack([spec.create_tensor() for _ in range(N_RANKS)], dim=0).contiguous()
+
+        base[name] = TensorSpec(name, [N_RANKS, *spec.shape], spec.dtype, init_value=init_ranked)
+
+    # Preserve the two-profile host ABI; MTP attention consumes the raw profile.
+    from utils import build_rope_tables
+
+    compressed_rope = build_rope_tables(M, 4, dtype=torch.bfloat16)
+    for name, compressed in zip(("freqs_cos", "freqs_sin"), compressed_rope):
+        raw = base[name]
+
+        def init_rope(raw=raw, compressed=compressed):
+            return torch.stack((raw.create_tensor(), compressed.unsqueeze(0).expand(N_RANKS, -1, -1)), dim=1)
+
+        base[name] = TensorSpec(name, [N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], raw.dtype, init_value=init_rope)
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
@@ -513,6 +522,20 @@ def build_tensor_specs(
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
     moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens, token_capacity=T)
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
+
+    def init_tid2eid():
+        ids = torch.arange(VOCAB, dtype=torch.int64).view(VOCAB, 1)
+        ks = torch.arange(TOPK, dtype=torch.int64).view(1, TOPK)
+        table = ((ids * TOPK + ks) % N_EXPERTS_GLOBAL).to(torch.int32)
+        return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+    def init_input_ids():
+        rows = torch.stack([torch.roll(torch.arange(T, dtype=torch.int64), shifts=r) for r in range(N_RANKS)])
+        rows[:, num_tokens:] = -1
+        return rows
+
+    moe_specs["tid2eid"].init_value = init_tid2eid
+    moe_specs["input_ids"].init_value = init_input_ids
 
     ordered_names = [
         "hidden_states", "prev_hidden_states",
@@ -544,8 +567,8 @@ def build_tensor_specs(
             specs.append(projection[name])
         elif name in mtp_head:
             specs.append(mtp_head[name])
-        elif name in moe_specs and name not in base:
-            specs.append(_ranked(moe_specs[name], torch))
+        elif name in moe_specs:
+            specs.append(moe_specs[name])
         elif name == "kv_cache":
             cache_dtype = base[name].dtype
 
@@ -565,10 +588,7 @@ def build_tensor_specs(
                 table = torch.arange(BLOCK_NUM, dtype=table_dtype).remainder(ori_block_num)
                 return table.view(1, BLOCK_NUM).expand(N_RANKS, -1).contiguous()
 
-            block_table_spec = TensorSpec(
-                name, [N_RANKS, BLOCK_NUM], table_dtype,
-                init_value=init_ori_block_table,
-            )
+            block_table_spec = TensorSpec(name, [N_RANKS, BLOCK_NUM], table_dtype, init_value=init_ori_block_table)
             specs.append(block_table_spec)
         elif name == "ori_slot_mapping":
             slot_init = base[name].init_value
@@ -577,13 +597,10 @@ def build_tensor_specs(
                 slots = torch.remainder(slot_init()[:1].reshape(1, T), ori_block_num * BLOCK_SIZE)
                 return slots.expand(N_RANKS, -1).contiguous()
 
-            slot_mapping_spec = TensorSpec(
-                name, [N_RANKS, T], base[name].dtype,
-                init_value=init_ori_slot_mapping,
-            )
+            slot_mapping_spec = TensorSpec(name, [N_RANKS, T], base[name].dtype, init_value=init_ori_slot_mapping)
             specs.append(slot_mapping_spec)
         else:
-            specs.append(_ranked(base[name], torch))
+            specs.append(base[name])
 
     # Keep static weights on their consuming cards.  Apply this after assembly
     # so the policy is independent of which component builder produced a spec.
@@ -597,20 +614,11 @@ def build_tensor_specs(
         resident="stacked",
     )
     specs.append(lm_head_spec)
-    hidden_out_spec = TensorSpec(
-        "hidden_out", [N_RANKS, T, D], torch.bfloat16,
-        resident="stacked",
-    )
+    hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, resident="stacked")
     specs.append(hidden_out_spec)
-    pre_hc_hidden_spec = TensorSpec(
-        "pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32,
-        resident="stacked",
-    )
+    pre_hc_hidden_spec = TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, resident="stacked")
     specs.append(pre_hc_hidden_spec)
-    logits_spec = TensorSpec(
-        "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
-        resident="stacked",
-    )
+    logits_spec = TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, resident="stacked")
     specs.append(logits_spec)
     row_indices_spec = TensorSpec(
         "logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32,

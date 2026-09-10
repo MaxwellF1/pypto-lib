@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek V4 SWA prefill with shared math and local/CP cache adapters."""
+"""DeepSeek V4 CP SWA prefill and the MTP cached-tail adapter."""
 # ci: devices=2
 
 import sys
@@ -85,15 +85,12 @@ BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
-EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HEAD_DIM = ROPE_DIM
-NOPE_DIM = M.nope_head_dim
 Q_LORA = M.q_lora_rank
-ROPE_HALF = ROPE_DIM // 2
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 IDX_TOPK = M.index_topk
@@ -110,8 +107,6 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # block count all collapse to 1.
 BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 START_POS = 0
 
@@ -120,7 +115,7 @@ assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN
 
 
 @pl.jit.inline
-def prefill_attention_swa(
+def prefill_mtp_attention_swa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -229,7 +224,7 @@ def prefill_attention_swa(
 
 
 @pl.jit
-def prefill_attention_swa_test(
+def prefill_mtp_attention_swa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -254,7 +249,7 @@ def prefill_attention_swa_test(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    prefill_attention_swa(
+    prefill_mtp_attention_swa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -578,39 +573,6 @@ def tail_start(seg_start: int, seg_len: int) -> int:
     return seg_start + max(0, seg_len - TAIL_ROWS)
 
 
-def segment_starts(prefix: int, segment_span: int, nseg: int):
-    return [prefix + s * segment_span for s in range(nseg)]
-
-
-def lower_key_build(key_abs, segment, tile, starts, lengths, prefix):
-    """Lower an absolute key position into the persistent or overlay row."""
-    seg_start = starts[segment]
-    seg_len = lengths[segment]
-    cur_start = seg_start + tile * TAIL_ROWS
-    cur_len = active_tile(seg_len, tile)
-
-    if key_abs < prefix:
-        return ring_phys_row(key_abs)
-    if cur_start <= key_abs < cur_start + cur_len:
-        return OVERLAY_BASE + CUR_OVERLAY_ROWS + (key_abs - cur_start)
-    if key_abs < cur_start:
-        if tile == 0:
-            pred_seg = pred_segment(segment)
-            if pred_seg < 0:
-                return -1
-            pred_len = min(TAIL_ROWS, lengths[pred_seg])
-            pred_tail = tail_start(starts[pred_seg], lengths[pred_seg])
-            if pred_tail <= key_abs < pred_tail + pred_len:
-                return OVERLAY_BASE + (key_abs - pred_tail)
-            return -1
-        prev_start = cur_start - TAIL_ROWS
-        prev_len = active_tile(seg_len, tile - 1)
-        if prev_start <= key_abs < prev_start + prev_len:
-            return OVERLAY_BASE + (key_abs - prev_start)
-        return -1
-    return -1
-
-
 def build_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
     """Build zero-history CP metadata with real lengths and fixed backing shapes."""
     prefix = 0
@@ -627,9 +589,7 @@ def build_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
         valid = min(TAIL_ROWS, lengths[segment])
         if valid > 0:
             tail_pos0 = tail_start(starts[segment], lengths[segment])
-            segment_tail_positions[segment, :valid] = torch.arange(
-                tail_pos0, tail_pos0 + valid, dtype=torch.int32
-            )
+            segment_tail_positions[segment, :valid] = torch.arange(tail_pos0, tail_pos0 + valid, dtype=torch.int32)
     owner_segs_t = torch.tensor(parts, dtype=torch.int32)
     reverse_index_t = cp_reverse_index(cp_size).to(torch.int32)
 
@@ -658,8 +618,7 @@ def build_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None):
                 tile_start = starts[segment] + tile * TAIL_ROWS
 
                 if active > 0:
-                    q_pos[rank, part, tile, :active] = torch.arange(
-                        tile_start, tile_start + active, dtype=torch.int32)
+                    q_pos[rank, part, tile, :active] = torch.arange(tile_start, tile_start + active, dtype=torch.int32)
                     q_req[rank, part, tile, :active] = 0
 
                 if tile == 0:
@@ -836,10 +795,8 @@ def _cp_swa_stage_sources(
 
 
 @pl.jit.inline
-def prefill_cp_swa_core(
-    x_hc: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32
-    ],
+def prefill_attention_swa(
+    x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -852,9 +809,7 @@ def prefill_cp_swa_core(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[
-        pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16]
-    ],
+    kv_cache: pl.InOut[pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -862,43 +817,22 @@ def prefill_cp_swa_core(
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
-    query_positions: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
-    ],
-    query_requests: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
-    ],
-    overlay_positions: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32
-    ],
-    overlay_requests: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32
-    ],
-    overlay_active_lengths: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32
-    ],
-    swa_indices: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], pl.INT32
-    ],
+    query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
+    query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
+    overlay_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
+    overlay_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
+    overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
+    swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], pl.INT32],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    hidden_tail_window: pld.DistributedTensor[
-        [CP_TAIL_WINDOW_ROWS, D], pl.BF16
-    ],
+    hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    x_out: pl.Out[
-        pl.Tensor[
-            [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D],
-            pl.FP32,
-        ]
-    ],
-    completion_token: pl.Out[
-        pl.Tensor[[NUM_LOCAL_TILES, 1, 8], pl.FP32]
-    ],
+    x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32]],
+    completion_token: pl.Out[pl.Tensor[[NUM_LOCAL_TILES, 1, 8], pl.FP32]],
     cache_owner_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tail_epoch: pl.Scalar[pl.INT32],
@@ -935,8 +869,7 @@ def prefill_cp_swa_core(
     # two logical 512-token segments stay visible in the CP metadata below;
     # they are not exposed as eight fixed 128-token projection calls.
     materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
+        freqs_cos, freqs_sin,
         q_pos_flat,
         pl.const(LOCAL_ROWS, pl.INT32),
         rope_cos_flat,
@@ -1022,8 +955,7 @@ def prefill_cp_swa_core(
     augmented_rope_swap_idx = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     augmented_kv = pl.create_tensor([LOCAL_AUGMENTED_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
+        freqs_cos, freqs_sin,
         augmented_positions,
         pl.const(LOCAL_AUGMENTED_ROWS, pl.INT32),
         augmented_rope_cos,
@@ -1097,20 +1029,13 @@ def prefill_cp_swa_core(
     final_rope_swap_idx = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     final_kv = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
+        freqs_cos, freqs_sin,
         final_positions,
         pl.const(TAIL_ROWS, pl.INT32),
         final_rope_cos,
         final_rope_sin,
     )
-    rope_prepare(
-        final_rope_cos,
-        final_rope_sin,
-        final_rope_cos_il,
-        final_rope_sin_signed,
-        final_rope_swap_idx,
-    )
+    rope_prepare(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
     kv_proj_rope(
         final_hidden,
         wkv,
@@ -1202,18 +1127,14 @@ def prefill_cp_swa_core(
     resource_done_tid = pl.system.task_dummy(deps=[tail_exchange_tid, raw_commit_tid, attention_done_tid])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_rank_complete", deps=[resource_done_tid]):
         for tile in pl.range(NUM_LOCAL_TILES):
-            completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(
-                x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0]
-            )
+            completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
     x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
     return x_out
 
 
 @pl.jit
 def prefill_cp_swa_rank(
-    x_hc: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32
-    ],
+    x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -1226,9 +1147,7 @@ def prefill_cp_swa_rank(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[
-        pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16]
-    ],
+    kv_cache: pl.InOut[pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -1236,40 +1155,21 @@ def prefill_cp_swa_rank(
     segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     segment_tail_positions: pl.Tensor[[NUM_SEGMENTS, TAIL_ROWS], pl.INT32],
     predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
-    query_positions: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
-    ],
-    query_requests: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32
-    ],
-    overlay_positions: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32
-    ],
-    overlay_requests: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32
-    ],
-    overlay_active_lengths: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32
-    ],
-    swa_indices: pl.Tensor[
-        [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], pl.INT32
-    ],
+    query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
+    query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], pl.INT32],
+    overlay_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
+    overlay_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], pl.INT32],
+    overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
+    swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], pl.INT32],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     final_win_seg_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_win_row_src: pl.Tensor[[TAIL_ROWS], pl.INT32],
     final_slot_mapping: pl.Tensor[[TAIL_ROWS], pl.INT32],
-    hidden_tail_window: pld.DistributedTensor[
-        [CP_TAIL_WINDOW_ROWS, D], pl.BF16
-    ],
+    hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    x_out: pl.Out[
-        pl.Tensor[
-            [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D],
-            pl.FP32,
-        ]
-    ],
+    x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32]],
     cache_owner_rank_t: pl.Tensor[[1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tail_epoch: pl.Scalar[pl.INT32],
@@ -1277,7 +1177,7 @@ def prefill_cp_swa_rank(
     """Standalone CP-SWA rank child. Delegates to the inline core so the
     standalone test preserves the original @pl.jit entry point."""
     completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
-    return prefill_cp_swa_core(
+    return prefill_attention_swa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -1309,11 +1209,7 @@ def prefill_cp_swa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[
-        pl.Tensor[
-            [CP_SIZE, RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16
-        ]
-    ],
+    kv_cache: pl.InOut[pl.Tensor[[CP_SIZE, RAW_BLOCKS_DYN, BLOCK_ROWS, 1, HEAD_DIM], pl.BF16]],
     cache_owner_rank_t: pl.Tensor[[CP_SIZE, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -1576,8 +1472,7 @@ if __name__ == "__main__" and not _run_cp_fixture:
     from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill SWA correctness test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--start-pos", type=int, default=START_POS,
@@ -1591,7 +1486,7 @@ if __name__ == "__main__" and not _run_cp_fixture:
     compare_tokens = args.num_tokens
 
     result = run(
-        fn=prefill_attention_swa_test,
+        fn=prefill_mtp_attention_swa_test,
         specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_attention_swa,
         config=dict(

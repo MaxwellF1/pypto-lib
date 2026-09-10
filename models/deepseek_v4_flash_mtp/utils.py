@@ -258,51 +258,6 @@ def swa_indices_and_lens(
     return indices, lens
 
 
-def history_window_swa_indices_and_lens(
-    positions: torch.Tensor,
-    window_block_table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-    window: int = M.sliding_window,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Lower historical HCA/CSA window rows to physical KV-cache slots.
-
-    Current decode-chunk positions are excluded from this list because HCA/CSA
-    still attend current MTP tokens through their overlay raw-index range. The
-    returned rows are packed oldest-to-newest; invalid tail columns are -1. The
-    block table follows the same vLLM-style absolute logical block contract as
-    SWA, while physical blocks may still be a small sliding-window ring.
-    """
-    if positions.ndim != 2:
-        raise ValueError("history window indices expect positions with shape [B, S]")
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = window_block_table.to(device=positions.device, dtype=torch.int64)
-    batch, seq = positions_i64.shape
-    indices = torch.full((batch * seq, window), -1, dtype=torch.int32, device=positions.device)
-    lens = torch.zeros((batch * seq,), dtype=torch.int32, device=positions.device)
-
-    for b in range(batch):
-        for s in range(seq):
-            t = b * seq + s
-            abs_pos = int(positions_i64[b, s].item())
-            overlay_positions = {int(positions_i64[b, os].item()) for os in range(s + 1)}
-            start = max(0, abs_pos - window + 1)
-            out_k = 0
-            for pos in range(start, abs_pos + 1):
-                if pos in overlay_positions:
-                    continue
-                logical_blk = pos // block_size
-                intra = pos % block_size
-                if logical_blk >= table_i64.shape[1]:
-                    continue
-                blk = int(table_i64[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, out_k] = blk * block_size + intra
-                    out_k += 1
-            lens[t] = out_k
-    return indices, lens
-
-
 def compressed_slot_mapping(
     positions: torch.Tensor,
     cmp_block_table: torch.Tensor,

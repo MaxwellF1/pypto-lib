@@ -19,11 +19,11 @@ that every kernel imports as a bare sibling module.
 | Speculative decoding | MTP = 1 — one draft token verified against the previous one, so a decode step carries `S = 2` token rows per request |
 | Decode batch per card | 4 requests → 8 token rows per step (`DECODE_BATCH`, `DECODE_SEQ`) |
 | Decode context length | up to 16,384 positions, paged in 128-token pages (`max_position_embeddings`, `BLOCK_SIZE`) |
-| Prefill shape | one request per rank partition, each with up to 8,192 active tokens per dispatch; the program walks the dynamic extent in 128-token tiles (`PREFILL_BATCH`, `PREFILL_SEQ`) |
+| Prefill shape | one cold request across CP=EP ranks, 1..CP*1024 active tokens per dispatch (8,192 at CP8); internal attention tiles have 128 rows |
 | Platform | Ascend A2/A3, single node |
 | Expert parallelism | `--ep 2/4/8`; the deployment point is EP 8, and each rank holds `256 / ep` routed experts |
 | LM-head parallelism | `--tp 2/4/8/16` vocab shards over DP row owners, `--tp <= --ep` |
-| Other components | no tensor parallelism — attention is data-parallel (each rank owns its own decode micro-batch) and the MoE is expert-parallel |
+| Attention parallelism | context-parallel main prefill; data-parallel decode (each rank owns its decode micro-batch) |
 | Quantization | W8A8 INT8: INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
 
 ### What is quantized
@@ -87,11 +87,19 @@ three compressor states) are passed in flat and sliced per layer.
 
 ### `prefill_fwd`
 
-[prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) mirrors
-that structure for a packed prompt: the same per-rank kernel shape, the same
-per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
-orchestrations, and the same `hc_head → rms_norm → lm_head` tail over selected
-hidden rows.
+[prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py) owns one
+context-parallel layer schedule for both short and long prompts. The existing
+`l3_prefill_fwd` serving ABI distributes one request over the EP world, executes
+`prefill_{swa,hca,csa}` and MoE, then publishes hidden rows for
+`hc_head → rms_norm → lm_head`. There is no local-forward fallback.
+
+The current entry requires CP=EP in {2, 4, 8}, exactly one active request owner,
+position zero, and 1..CP*1024 tokens per call. CP1, prefix-cache reuse, chunk
+continuation, multiple active owners, and larger requests are deferred. Callers
+must enforce these input constraints: the standalone fixture rejects invalid
+arguments, while unsupported device metadata produces NaN hidden outputs rather
+than executing another forward. This is not a serving-level error response.
+The separate MTP prefill still uses its cached-tail SWA adapter.
 
 ### `decode_fwd_mtp`
 
@@ -114,8 +122,9 @@ moe         hc_pre → gate → expert_shared → dispatch → expert_routed →
 
 `hc_pre` mixes the four hyper-connection streams into one hidden row (RMS,
 sigmoid gates, a Sinkhorn-normalized combine matrix); `hc_post` folds the
-sublayer output back into the stack. `decode_layer` and `prefill_layer` are
-exactly this pair exposed as standalone two-rank harnesses.
+sublayer output back into the stack. `decode_layer` exposes this pair as a standalone two-rank harness. Prefill
+attention is validated through the CP fixtures in `prefill_swa`, `prefill_hca`
+and `prefill_csa`; the duplicate local-prefill layer harness has been removed.
 
 ### Attention paths
 
@@ -194,7 +203,7 @@ serving-level residency and lowering — with the limit measured at each step.
 | Group | Files |
 | --- | --- |
 | Full forward | [decode_fwd.py](../../../models/deepseek_v4_flash_mtp/decode_fwd.py), [prefill_fwd.py](../../../models/deepseek_v4_flash_mtp/prefill_fwd.py), [decode_fwd_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) |
-| Layer composition | [decode_layer.py](../../../models/deepseek_v4_flash_mtp/decode_layer.py), [prefill_layer.py](../../../models/deepseek_v4_flash_mtp/prefill_layer.py) |
+| Layer composition | [decode_layer.py](../../../models/deepseek_v4_flash_mtp/decode_layer.py) |
 | MTP | [decode_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_mtp.py), [prefill_mtp.py](../../../models/deepseek_v4_flash_mtp/prefill_mtp.py), [mtp_projection.py](../../../models/deepseek_v4_flash_mtp/mtp_projection.py) |
 | Decode attention orchestration | [decode_swa.py](../../../models/deepseek_v4_flash_mtp/decode_swa.py), [decode_csa.py](../../../models/deepseek_v4_flash_mtp/decode_csa.py), [decode_hca.py](../../../models/deepseek_v4_flash_mtp/decode_hca.py) |
 | Decode sparse attention (fused o-proj) | [decode_sparse_attn_swa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_swa.py), [decode_sparse_attn_csa.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_csa.py), [decode_sparse_attn_hca.py](../../../models/deepseek_v4_flash_mtp/decode_sparse_attn_hca.py) |
