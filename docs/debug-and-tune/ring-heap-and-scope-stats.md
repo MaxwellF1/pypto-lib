@@ -164,7 +164,7 @@ config=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP)
 ```
 
 Live examples: [`models/deepseek_v4_pro/prefill_fwd.py`](../../models/deepseek_v4_pro/prefill_fwd.py),
-[`models/deepseek_v4_flash_mtp/prefill_fwd.py`](../../models/deepseek_v4_flash_mtp/prefill_fwd.py)
+[`models/deepseek_v4_flash_mtp/prefill_layer.py`](../../models/deepseek_v4_flash_mtp/prefill_layer.py)
 (per-ring tuple), [`models/deepseek_v4_flash_dspark/decode_layer.py`](../../models/deepseek_v4_flash_dspark/decode_layer.py)
 (scalar, broadcast to all four rings).
 
