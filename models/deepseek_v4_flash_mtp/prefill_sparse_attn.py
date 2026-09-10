@@ -577,8 +577,10 @@ def _physical_sparse_heads(
     rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
     completion = pl.array.create(1, pl.TASK_ID)
     completion[0] = packed_init_tid
+    # Keep gathered KV on the caller's ring, separate from the FP32 head
+    # partials. A combined allocation can pin wrap padding on the inner ring.
+    sparse_kv = pl.create_tensor([source_rows, HEAD_DIM], dtype=pl.BF16)
     with pl.scope():
-        sparse_kv = pl.create_tensor([source_rows, HEAD_DIM], dtype=pl.BF16)
         sparse_bias = pl.create_tensor([token_rows, PREFILL_SPARSE_PAD], dtype=pl.FP32)
         sparse_blk_mi = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
         sparse_blk_li = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
