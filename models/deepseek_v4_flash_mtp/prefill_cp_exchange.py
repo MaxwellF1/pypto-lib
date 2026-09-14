@@ -113,21 +113,12 @@ def _prefill_cp_request_header(
     num_tokens_per_owner: pl.Tensor[[CP_SIZE], pl.INT32],
     position_ids: pl.Tensor[[CP_REQUEST_TOKENS_DYN], pl.INT32],
     header: pl.Tensor[[1, 16], pl.INT32],
+    request_owner: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     for header_block in pl.spmd(1):
-        owner = pl.cast(-1, pl.INDEX)
-        owners = pl.cast(0, pl.INDEX)
-        length = pl.cast(0, pl.INDEX)
-        for peer in pl.range(CP_SIZE):
-            count = pl.read(num_tokens_per_owner, [peer])
-            if count > 0:
-                owner = peer
-                owners = owners + 1
-                length = pl.cast(count, pl.INDEX)
-        if owners != 1:
-            owner = pl.cast(-1, pl.INDEX)
-            length = pl.cast(0, pl.INDEX)
+        owner = pl.cast(request_owner, pl.INDEX)
+        length = pl.cast(pl.read(num_tokens_per_owner, [owner]), pl.INDEX)
         # A continued chunk arrives with an absolute base; the caches it reads
         # were written by the earlier chunks of the same request.
         base = pl.cast(0, pl.INDEX)
@@ -775,7 +766,7 @@ def _prefill_cp_csa_compact_finish_wave(
             )
 
 
-@pl.jit.incore
+@pl.jit.inline
 def _prefill_cp_gather_hidden(
     control: pl.Tensor[[1, 16], pl.INT32],
     local_hidden: pl.Tensor[[LOCAL_ROWS, D], pl.BF16],
@@ -783,96 +774,142 @@ def _prefill_cp_gather_hidden(
     hidden_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, D], pl.BF16],
     pre_hc_tail_window: pld.DistributedTensor[[NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
     complete: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    hidden_out: pl.Out[pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16]],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32]],
+    hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16],
+    pre_hc_hidden_out: pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    output_rows = pl.tensor.dim(hidden_out, 0)
-    for row_start in pl.range(0, output_rows, ROW_TILE):
-        valid_rows = pl.min(ROW_TILE, output_rows - row_start)
-        for column in pl.range(D // CP_REQUEST_COPY_COLS):
-            zero_hidden = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
-            zero_valid = pl.tile.set_validshape(zero_hidden, valid_rows, CP_REQUEST_COPY_COLS)
-            pl.store(zero_valid, [row_start, column * CP_REQUEST_COPY_COLS], hidden_out)
-    for row_start in pl.range(0, TAIL_ROWS, ROW_TILE):
-        for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-            zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
-            pl.store(zero_tail, [row_start, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
-    if pl.read(control, [0, 0]) == 1:
-        owner = pl.read(control, [0, 1])
-        length = pl.read(control, [0, 2])
-        span = pl.read(control, [0, 3])
-        # Rank-major slabs keep padded segments disjoint for arbitrary spans.
-        pld.tensor.put(
-            dst=hidden_window, peer=owner, src=local_hidden,
-            dst_offsets=[my_rank * LOCAL_ROWS, 0], src_offsets=[0, 0],
-            shape=[LOCAL_ROWS, D], chunk_rows=ROW_TILE, chunk_cols=CP_REQUEST_COPY_COLS,
-        )
-        for local_part in pl.range(LOCAL_PARTS):
-            if local_part == 0:
-                local_segment = pl.cast(my_rank, pl.INDEX)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gather_hidden"):
+        # Other owners' outputs survive subsequent requests in the same call.
+        if pl.read(control, [0, 1]) == my_rank:
+            output_rows = pl.tensor.dim(hidden_out, 0)
+            for row_start in pl.range(0, output_rows, ROW_TILE):
+                valid_rows = pl.min(ROW_TILE, output_rows - row_start)
+                for column in pl.range(D // CP_REQUEST_COPY_COLS):
+                    zero_hidden = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
+                    zero_valid = pl.tile.set_validshape(zero_hidden, valid_rows, CP_REQUEST_COPY_COLS)
+                    pl.store(zero_valid, [row_start, column * CP_REQUEST_COPY_COLS], hidden_out)
+            for row_start in pl.range(0, TAIL_ROWS, ROW_TILE):
+                for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                    zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
+                    pl.store(zero_tail, [row_start, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
+        if pl.read(control, [0, 0]) == 1:
+            owner = pl.read(control, [0, 1])
+            length = pl.read(control, [0, 2])
+            span = pl.read(control, [0, 3])
+            # Rank-major slabs keep padded segments disjoint for arbitrary spans.
+            pld.tensor.put(
+                dst=hidden_window, peer=owner, src=local_hidden,
+                dst_offsets=[my_rank * LOCAL_ROWS, 0], src_offsets=[0, 0],
+                shape=[LOCAL_ROWS, D], chunk_rows=ROW_TILE, chunk_cols=CP_REQUEST_COPY_COLS,
+            )
+            for local_part in pl.range(LOCAL_PARTS):
+                if local_part == 0:
+                    local_segment = pl.cast(my_rank, pl.INDEX)
+                else:
+                    local_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
+                local_length = pl.max(0, pl.min(span, length - local_segment * span))
+                local_tail_start = pl.max(0, local_length - TAIL_ROWS)
+                local_tail_length = pl.min(TAIL_ROWS, local_length)
+                for tail_row in pl.range(0, TAIL_ROWS, ROW_TILE):
+                    active_tail = pl.max(0, pl.min(ROW_TILE, local_tail_length - tail_row))
+                    source_row = local_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_tail_start + tail_row
+                    destination_row = (my_rank * LOCAL_PARTS + local_part) * TAIL_ROWS + tail_row
+                    for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                        if active_tail > 0:
+                            valid_tail = pl.load(
+                                local_pre_hc_hidden, [source_row, column * CP_REQUEST_COPY_COLS],
+                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active_tail, CP_REQUEST_COPY_COLS],
+                            )
+                            padded_tail = pl.tile.fillpad(valid_tail, pad_value=pl.PadValue.zero)
+                            full_tail = pl.tile.set_validshape(padded_tail, ROW_TILE, CP_REQUEST_COPY_COLS)
+                            pld.tile.remote_store(full_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
+                        else:
+                            empty_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
+                            pld.tile.remote_store(empty_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
+            if my_rank != owner:
+                pld.system.notify(target=complete, peer=owner, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
             else:
-                local_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INDEX)
-            local_length = pl.max(0, pl.min(span, length - local_segment * span))
-            local_tail_start = pl.max(0, local_length - TAIL_ROWS)
-            local_tail_length = pl.min(TAIL_ROWS, local_length)
-            for tail_row in pl.range(0, TAIL_ROWS, ROW_TILE):
-                active_tail = pl.max(0, pl.min(ROW_TILE, local_tail_length - tail_row))
-                source_row = local_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_tail_start + tail_row
-                destination_row = (my_rank * LOCAL_PARTS + local_part) * TAIL_ROWS + tail_row
-                for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                    if active_tail > 0:
-                        valid_tail = pl.load(
-                            local_pre_hc_hidden, [source_row, column * CP_REQUEST_COPY_COLS],
-                            [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active_tail, CP_REQUEST_COPY_COLS],
-                        )
-                        padded_tail = pl.tile.fillpad(valid_tail, pad_value=pl.PadValue.zero)
-                        full_tail = pl.tile.set_validshape(padded_tail, ROW_TILE, CP_REQUEST_COPY_COLS)
-                        pld.tile.remote_store(full_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
+                for peer in pl.range(CP_SIZE):
+                    if peer != my_rank:
+                        pld.system.wait(signal=complete, offsets=[peer, 0], expected=1, cmp=pld.WaitCmp.Ge)
+                for segment in pl.range(NUM_SEGMENTS):
+                    segment_start = segment * span
+                    segment_length = pl.max(0, pl.min(span, length - segment_start))
+                    if segment < CP_SIZE:
+                        source_rank = segment
+                        source_part = pl.cast(0, pl.INDEX)
                     else:
-                        empty_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
-                        pld.tile.remote_store(empty_tail, pre_hc_tail_window, owner, [destination_row, column * CP_REQUEST_COPY_COLS])
-        if my_rank != owner:
-            pld.system.notify(target=complete, peer=owner, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
-        else:
-            for peer in pl.range(CP_SIZE):
-                if peer != my_rank:
-                    pld.system.wait(signal=complete, offsets=[peer, 0], expected=1, cmp=pld.WaitCmp.Ge)
-            for segment in pl.range(NUM_SEGMENTS):
-                segment_start = segment * span
-                segment_length = pl.max(0, pl.min(span, length - segment_start))
-                if segment < CP_SIZE:
-                    source_rank = segment
-                    source_part = pl.cast(0, pl.INDEX)
-                else:
-                    source_rank = NUM_SEGMENTS - 1 - segment
-                    source_part = pl.cast(1, pl.INDEX)
-                for local_row in pl.range(0, segment_length, ROW_TILE):
-                    active = pl.min(ROW_TILE, segment_length - local_row)
-                    source_base = source_rank * LOCAL_ROWS + source_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_row
-                    for column in pl.range(D // CP_REQUEST_COPY_COLS):
-                        restored = pl.load(
-                            hidden_window, [source_base, column * CP_REQUEST_COPY_COLS],
-                            [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active, CP_REQUEST_COPY_COLS],
-                        )
-                        pl.store(restored, [segment_start + local_row, column * CP_REQUEST_COPY_COLS], hidden_out)
-            final_tail_start = pl.max(0, length - TAIL_ROWS)
-            for tail_row in pl.range(pl.min(TAIL_ROWS, length)):
-                position = final_tail_start + tail_row
-                tail_segment = position // span
-                tail_segment_start = tail_segment * span
-                tail_segment_length = pl.max(0, pl.min(span, length - tail_segment_start))
-                if tail_segment < CP_SIZE:
-                    tail_rank = tail_segment
-                    tail_part = pl.cast(0, pl.INDEX)
-                else:
-                    tail_rank = NUM_SEGMENTS - 1 - tail_segment
-                    tail_part = pl.cast(1, pl.INDEX)
-                tail_offset = position - tail_segment_start - pl.max(0, tail_segment_length - TAIL_ROWS)
-                source_tail = (tail_rank * LOCAL_PARTS + tail_part) * TAIL_ROWS + tail_offset
-                for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                    restored_tail = pl.load(pre_hc_tail_window, [source_tail, column * CP_REQUEST_COPY_COLS], [1, CP_REQUEST_COPY_COLS])
-                    pl.store(restored_tail, [tail_row, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
-    for peer in pl.range(CP_SIZE):
-        pl.write(complete, [peer, 0], pl.cast(0, pl.INT32))
+                        source_rank = NUM_SEGMENTS - 1 - segment
+                        source_part = pl.cast(1, pl.INDEX)
+                    for local_row in pl.range(0, segment_length, ROW_TILE):
+                        active = pl.min(ROW_TILE, segment_length - local_row)
+                        source_base = source_rank * LOCAL_ROWS + source_part * MAX_SEGMENT_TILES * TAIL_ROWS + local_row
+                        for column in pl.range(D // CP_REQUEST_COPY_COLS):
+                            restored = pl.load(
+                                hidden_window, [source_base, column * CP_REQUEST_COPY_COLS],
+                                [ROW_TILE, CP_REQUEST_COPY_COLS], valid_shape=[active, CP_REQUEST_COPY_COLS],
+                            )
+                            pl.store(restored, [segment_start + local_row, column * CP_REQUEST_COPY_COLS], hidden_out)
+                final_tail_start = pl.max(0, length - TAIL_ROWS)
+                for tail_row in pl.range(pl.min(TAIL_ROWS, length)):
+                    position = final_tail_start + tail_row
+                    tail_segment = position // span
+                    tail_segment_start = tail_segment * span
+                    tail_segment_length = pl.max(0, pl.min(span, length - tail_segment_start))
+                    if tail_segment < CP_SIZE:
+                        tail_rank = tail_segment
+                        tail_part = pl.cast(0, pl.INDEX)
+                    else:
+                        tail_rank = NUM_SEGMENTS - 1 - tail_segment
+                        tail_part = pl.cast(1, pl.INDEX)
+                    tail_offset = position - tail_segment_start - pl.max(0, tail_segment_length - TAIL_ROWS)
+                    source_tail = (tail_rank * LOCAL_PARTS + tail_part) * TAIL_ROWS + tail_offset
+                    for column in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                        restored_tail = pl.load(pre_hc_tail_window, [source_tail, column * CP_REQUEST_COPY_COLS], [1, CP_REQUEST_COPY_COLS])
+                        pl.store(restored_tail, [tail_row, column * CP_REQUEST_COPY_COLS], pre_hc_hidden_out)
+        for peer in pl.range(CP_SIZE):
+            pl.write(complete, [peer, 0], pl.cast(0, pl.INT32))
     return hidden_out, pre_hc_hidden_out
+
+
+@pl.jit.inline
+def _prefill_cp_release_request(
+    hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16],
+    pre_hc_hidden_out: pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
+    released: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
+    cp_tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_hca_compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_hca_compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_csa_compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_csa_compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_count_signal: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_prefill_moe_x_signal: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    cp_prefill_moe_reverse_signal: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    entry_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    # Each rank owns one cache-line-separated epoch counter. Credits remain
+    # monotonic across owners and repeated calls; no reset races the next call.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_request_release", allow_early_resolve=False):
+        _hidden_anchor = pl.read(hidden_out, [0, 0])
+        _tail_anchor = pl.read(pre_hc_hidden_out, [0, 0])
+        _cp_tail_ready_anchor = pl.read(cp_tail_ready, [0, 0])
+        _cp_tail_consumed_anchor = pl.read(cp_tail_consumed, [0, 0])
+        _cp_hca_compact_ready_anchor = pl.read(cp_hca_compact_ready, [0, 0])
+        _cp_hca_compact_consumed_anchor = pl.read(cp_hca_compact_consumed, [0, 0])
+        _cp_csa_compact_ready_anchor = pl.read(cp_csa_compact_ready, [0, 0])
+        _cp_csa_compact_consumed_anchor = pl.read(cp_csa_compact_consumed, [0, 0])
+        _cp_count_signal_anchor = pl.read(cp_count_signal, [0, 0])
+        _cp_prefill_moe_x_signal_anchor = pl.read(cp_prefill_moe_x_signal, [0, 0])
+        _cp_prefill_moe_reverse_signal_anchor = pl.read(cp_prefill_moe_reverse_signal, [0, 0])
+        _entry_ready_anchor = pl.read(entry_ready, [0, 0])
+        epoch = pl.cast(pl.read(released, [my_rank, 0]) + 1, pl.INT32)
+        pl.write(released, [my_rank, 0], epoch)
+        for peer in pl.range(CP_SIZE):
+            if peer != my_rank:
+                pld.system.notify(target=released, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+        for peer in pl.range(CP_SIZE):
+            if peer != my_rank:
+                pld.system.wait(signal=released, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+    return released
