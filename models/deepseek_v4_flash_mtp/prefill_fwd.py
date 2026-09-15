@@ -8,7 +8,22 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4 Flash multi-request prefill with lib-owned context parallelism."""
+"""DeepSeek-V4 Flash MTP prefill entry with lib-owned context parallelism.
+
+The serving-facing ``l3_prefill_fwd`` entry owns request distribution and CP
+workspace. With CP=EP>1, it processes active request owners sequentially,
+using the full CP group for each request, including short chunks. Each owner
+supplies its absolute positions and cache page tables for chunk continuation
+and prefix reuse. Each request contributes 1..CP_SIZE*1024 tokens per call.
+Hidden outputs and pre-HC tails remain in their owner partitions; a release
+barrier separates requests before communication windows are reused.
+
+The layer schedule follows model order through attention and MoE, then HC
+head and final RMSNorm. The HOST projects selected hidden rows through the
+LM head after all owners finish. Unsupported runtime metadata produces NaN
+outputs on the affected owner. The colocated standalone runner is an
+execution smoke check, not a numerical oracle.
+"""
 
 import argparse
 

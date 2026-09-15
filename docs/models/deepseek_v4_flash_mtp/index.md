@@ -93,31 +93,6 @@ per-stage scopes, `prefill_{swa,hca,csa}` in place of the decode
 orchestrations, and the same `hc_head → rms_norm → lm_head` tail over selected
 hidden rows.
 
-The serving entry accepts one request per cache partition and multiple active
-partitions in one call. `num_tokens_per_owner` supplies each request's actual
-length; token storage is padded to a common dynamic extent. Each owner keeps
-its absolute positions and seven cache page tables. With CP=EP>1, each request
-can contain up to `CP_SIZE * 1024` tokens (8,192 at CP8).
-
-The lib HOST entry processes owners in rank order using the full CP group for
-each request. Hidden outputs and the final 128 pre-HC rows remain in their
-owner partition. A separate release barrier retires communication before the
-next owner reuses the windows; the grouped LM head runs after all owners.
-This adds internal chip dispatches and does not compute different requests'
-attention simultaneously. The serving call signature is unchanged.
-
-[The request boundary test](../../../models/deepseek_v4_flash_mtp/prefill_cp_requests_test.py)
-checks exact hidden outputs, retained tails, INT64 token IDs, absolute positions
-and all seven page tables. It covers mixed lengths and noncontiguous owners,
-and repeats each case three times on the same communication windows:
-
-```bash
-python models/deepseek_v4_flash_mtp/prefill_cp_requests_test.py -p a2a3 --cp 2 --ep 2 --tp 2 -d 0,1
-```
-
-Use `--cp 8 --ep 8 --tp 4` and eight allocated devices for the deployment topology.
-The full-forward smoke fixture also accepts `--active-ranks` from 1 through EP.
-
 ### `decode_fwd_mtp`
 
 [decode_fwd_mtp.py](../../../models/deepseek_v4_flash_mtp/decode_fwd_mtp.py) is
