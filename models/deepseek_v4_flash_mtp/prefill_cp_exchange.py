@@ -876,10 +876,10 @@ def _prefill_cp_gather_hidden(
 
 
 @pl.jit.inline
-def _prefill_cp_release_request(
+def _prefill_cp_request_barrier(
     hidden_out: pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16],
     pre_hc_hidden_out: pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
-    released: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
+    request_barrier_epochs: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
     cp_tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     cp_hca_compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -892,9 +892,10 @@ def _prefill_cp_release_request(
     entry_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
+    # Wait for all CP ranks to finish this request chunk before window reuse.
     # Each rank owns one cache-line-separated epoch counter. Credits remain
     # monotonic across owners and repeated calls; no reset races the next call.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_request_release", allow_early_resolve=False):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_request_barrier", allow_early_resolve=False):
         _hidden_anchor = pl.read(hidden_out, [0, 0])
         _tail_anchor = pl.read(pre_hc_hidden_out, [0, 0])
         _cp_tail_ready_anchor = pl.read(cp_tail_ready, [0, 0])
@@ -907,15 +908,15 @@ def _prefill_cp_release_request(
         _cp_prefill_moe_x_signal_anchor = pl.read(cp_prefill_moe_x_signal, [0, 0])
         _cp_prefill_moe_reverse_signal_anchor = pl.read(cp_prefill_moe_reverse_signal, [0, 0])
         _entry_ready_anchor = pl.read(entry_ready, [0, 0])
-        epoch = pl.cast(pl.read(released, [my_rank, 0]) + 1, pl.INT32)
-        pl.write(released, [my_rank, 0], epoch)
+        epoch = pl.cast(pl.read(request_barrier_epochs, [my_rank, 0]) + 1, pl.INT32)
+        pl.write(request_barrier_epochs, [my_rank, 0], epoch)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
-                pld.system.notify(target=released, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+                pld.system.notify(target=request_barrier_epochs, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
-                pld.system.wait(signal=released, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
-    return released
+                pld.system.wait(signal=request_barrier_epochs, offsets=[peer, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+    return request_barrier_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -962,7 +963,7 @@ def _prefill_cp_request_test(
     hidden_window: pld.DistributedTensor[[CP_REQUEST_CAPACITY, D], pl.BF16],
     tail_window: pld.DistributedTensor[[NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32],
     complete: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    released: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
+    request_barrier_epochs: pld.DistributedTensor[[CP_SIZE, 16], pl.INT32],
     hidden_out: pl.InOut[pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16]],
     tail_out: pl.InOut[pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32]],
     audit: pl.InOut[pl.Tensor[[CP_SIZE, 9, CP_REQUEST_TABLE_COLS], pl.INT32]],
@@ -1064,8 +1065,8 @@ def _prefill_cp_request_test(
             hidden_window, tail_window, complete,
             hidden_out, tail_out, my_rank,
         )
-    _prefill_cp_release_request(
-        hidden_out, tail_out, released,
+    _prefill_cp_request_barrier(
+        hidden_out, tail_out, request_barrier_epochs,
         ready, ready, ready, ready, ready, ready, ready, ready, ready, ready,
         my_rank,
     )
@@ -1100,14 +1101,14 @@ def prefill_cp_exchange_test(
     hidden_window_buf = pld.alloc_window_buffer([CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
     tail_window_buf = pld.alloc_window_buffer([NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
     complete_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
-    released_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
+    request_barrier_epochs_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
     for repetition in pl.range(3):
         for request_owner in pl.range(CP_SIZE):
             for rank in pl.range(CP_SIZE):
                 hidden_window = pld.window(hidden_window_buf, [CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
                 tail_window = pld.window(tail_window_buf, [NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
                 complete = pld.window(complete_buf, [CP_SIZE, 1], dtype=pl.INT32)
-                released = pld.window(released_buf, [CP_SIZE, 16], dtype=pl.INT32)
+                request_barrier_epochs = pld.window(request_barrier_epochs_buf, [CP_SIZE, 16], dtype=pl.INT32)
                 header_window = pld.window(header_window_buf, [1, 16], dtype=pl.INT32)
                 input_window = pld.window(input_window_buf, [LOCAL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
                 ids_window = pld.window(ids_window_buf, [1, LOCAL_ROWS * 2], dtype=pl.INT32)
@@ -1118,7 +1119,7 @@ def prefill_cp_exchange_test(
                     ori_block_table[rank], hca_cmp_block_table[rank], csa_cmp_block_table[rank], idx_block_table[rank],
                     hca_compress_state_block_table[rank], csa_compress_state_block_table[rank], csa_inner_compress_state_block_table[rank],
                     header_window, input_window, ids_window, tables_window, ready,
-                    hidden_window, tail_window, complete, released,
+                    hidden_window, tail_window, complete, request_barrier_epochs,
                     hidden_out[rank], tail_out[rank], audit[rank],
                     request_owner, rank,
                     device=rank,

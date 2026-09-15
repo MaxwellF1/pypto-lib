@@ -15,8 +15,8 @@ workspace. With CP=EP>1, it processes active request owners sequentially,
 using the full CP group for each request, including short chunks. Each owner
 supplies its absolute positions and cache page tables for chunk continuation
 and prefix reuse. Each request contributes 1..CP_SIZE*1024 tokens per call.
-Hidden outputs and pre-HC tails remain in their owner partitions; a release
-barrier separates requests before communication windows are reused.
+Hidden outputs and pre-HC tails remain in their owner partitions; a CP barrier
+separates request chunks before communication windows are reused.
 
 The layer schedule follows model order through attention and MoE, then HC
 head and final RMSNorm. The HOST projects selected hidden rows through the
@@ -1515,7 +1515,7 @@ from prefill_cp_exchange import (
     _prefill_cp_request_header as prepare_cp_request,
     _prefill_cp_scatter_request as scatter_cp_request,
     _prefill_cp_gather_hidden as gather_cp_hidden,
-    _prefill_cp_release_request as release_cp_request,
+    _prefill_cp_request_barrier as cp_request_barrier,
 )
 
 
@@ -1631,7 +1631,7 @@ def _prefill_request(
     entry_hidden_window: pld.DistributedTensor[[CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], pl.BF16],
     entry_pre_hc_tail_window: pld.DistributedTensor[[CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], pl.FP32],
     entry_complete: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 1], pl.INT32],
-    entry_released: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 16], pl.INT32],
+    entry_barrier_epochs: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 16], pl.INT32],
     request_owner: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
@@ -1826,8 +1826,8 @@ def _prefill_request(
                 for stream in pl.range(HC_MULT):
                     pl.store(invalid_tail, [row, stream, 0], pre_hc_hidden_out)
     output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
-    release_cp_request(
-        x_out, output_pre_hc_flat, entry_released,
+    cp_request_barrier(
+        x_out, output_pre_hc_flat, entry_barrier_epochs,
         cp_tail_ready, cp_tail_consumed,
         cp_hca_compact_ready, cp_hca_compact_consumed,
         cp_csa_compact_ready, cp_csa_compact_consumed,
@@ -1982,9 +1982,9 @@ def l3_prefill_fwd(
     entry_ready_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
     entry_hidden_window_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
     entry_pre_hc_tail_window_buf = pld.alloc_window_buffer([CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
-    # Gather clears and release credits occupy separate 64-byte cache lines.
+    # Gather clears and request barrier epochs occupy separate 64-byte cache lines.
     entry_complete_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
-    entry_released_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
+    entry_barrier_epochs_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
 
     # Process cache owners within the existing lib call. Each chip invocation
     # owns one request's scratch; the shared outputs accumulate across owners.
@@ -2024,7 +2024,7 @@ def l3_prefill_fwd(
             entry_hidden_window = pld.window(entry_hidden_window_buf, [CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
             entry_pre_hc_tail_window = pld.window(entry_pre_hc_tail_window_buf, [CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
             entry_complete = pld.window(entry_complete_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
-            entry_released = pld.window(entry_released_buf, [CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
+            entry_barrier_epochs = pld.window(entry_barrier_epochs_buf, [CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
             x_hc_rank = x_hc[r]
             hidden_rank = hidden_out[r]
             position_ids_rank = position_ids[r]
@@ -2075,7 +2075,7 @@ def l3_prefill_fwd(
                 cp_prefill_moe_x_target, cp_prefill_moe_x_signal, cp_prefill_moe_scale_target,
                 cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
                 entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
-                entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_released,
+                entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_barrier_epochs,
                 request_owner, r,
                 device=r,
             )
