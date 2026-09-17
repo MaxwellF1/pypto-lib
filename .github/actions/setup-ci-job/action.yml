@@ -160,12 +160,10 @@ inputs:
     required: true
   pypto-ref:
     description: >-
-      pypto revision to build (a full commit sha). Defaults to the revision
-      pypto-serving's CI pins (PYPTO_PIN in its setup-ci-job action), so
-      pypto-lib and serving validate against the same PyPTO stack; bump both
-      together. An explicit empty value follows origin HEAD.
+      PyPTO revision to build (a full commit sha). An empty value follows
+      origin HEAD; pass an explicit sha only when a job needs a pinned revision.
     required: false
-    default: '747e1e4ba99f13dea1a609d893ac7512e85a5897'
+    default: ''
 
 runs:
   using: composite
