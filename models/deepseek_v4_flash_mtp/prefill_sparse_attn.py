@@ -784,16 +784,32 @@ def _hca_segment_heads(
                 valid_stage = pl.full([1, WIN], dtype=pl.FP32, value=0.0)
                 if gather_t < active_rows:
                     gather_threshold = WIN - predecessor_valid
-                    for gather_k in pl.range(WIN):
-                        gather_candidate = gather_t + 1 + gather_k
-                        if gather_candidate >= gather_threshold:
-                            gather_row = gather_candidate
-                            if gather_candidate < WIN:
-                                gather_row = gather_candidate - gather_threshold
-                            raw_stage[gather_k:gather_k + 1, 0:HEAD_DIM] = full_kv_flat[
-                                gather_row:gather_row + 1, 0:HEAD_DIM
+                    for gather_k0 in pl.range(0, WIN, 16):
+                        gather_first = gather_t + 1 + gather_k0
+                        # A bulk tile must be valid and stay on one side of
+                        # the predecessor/current physical-row mapping.
+                        if gather_first >= gather_threshold and (gather_first >= WIN or gather_first + 16 <= WIN):
+                            gather_row0 = gather_first
+                            if gather_first < WIN:
+                                gather_row0 = gather_first - gather_threshold
+                            raw_stage[gather_k0:gather_k0 + 16, 0:HEAD_DIM] = full_kv_flat[
+                                gather_row0:gather_row0 + 16, 0:HEAD_DIM
                             ]
-                            pl.write(valid_stage, [0, gather_k], 1.0)
+                            for gather_valid_col in pl.range(16):
+                                gather_valid_index = gather_k0 + gather_valid_col
+                                pl.write(valid_stage, [0, gather_valid_index], 1.0)
+                        else:
+                            for gather_tail in pl.range(16):
+                                gather_k = gather_k0 + gather_tail
+                                gather_candidate = gather_t + 1 + gather_k
+                                if gather_candidate >= gather_threshold:
+                                    gather_row = gather_candidate
+                                    if gather_candidate < WIN:
+                                        gather_row = gather_candidate - gather_threshold
+                                    raw_stage[gather_k:gather_k + 1, 0:HEAD_DIM] = full_kv_flat[
+                                        gather_row:gather_row + 1, 0:HEAD_DIM
+                                    ]
+                                    pl.write(valid_stage, [0, gather_k], 1.0)
                 raw_kv_view[gather_dst:gather_dst + WIN, 0:HEAD_DIM] = raw_stage
                 raw_valid_view[gather_local_t:gather_local_t + 1, 0:WIN] = valid_stage
 
@@ -912,6 +928,14 @@ def _hca_segment_heads(
             merge_visible_rows = pl.min(merge_visible_rows, pl.cast(HCA_MAX_COMPRESSED_ROWS, pl.INDEX))
             merge_cos = rope_cos_il[merge_t:merge_t + 1, 0:ROPE_DIM]
             merge_sin = rope_sin_signed[merge_t:merge_t + 1, 0:ROPE_DIM]
+            # Build the odd/even RoPE channel permutation.
+            merge_cols = pl.col_expand_mul(
+                pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+                pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), pl.FP32),
+            )
+            merge_pairs = pl.cast(pl.cast(pl.mul(merge_cols, 0.5), pl.INT32, mode="trunc"), pl.FP32)
+            merge_lanes = pl.sub(merge_cols, pl.mul(merge_pairs, 2.0))
+            merge_swap_idx = pl.cast(pl.sub(pl.add(merge_cols, 1.0), pl.mul(merge_lanes, 2.0)), pl.INT32)
             for merge_h_idx in pl.range(H // HEAD_TILE):
                 merge_h0 = merge_h_idx * HEAD_TILE
                 merge_stream_row = merge_local_t * H + merge_h0
@@ -945,15 +969,7 @@ def _hca_segment_heads(
                 merge_full = pl.row_expand_div(merge_o, merge_denom)
                 merge_nope_bf16 = pl.cast(merge_full[:, 0:NOPE_DIM], target_type=pl.BF16, mode="rint")
                 merge_rope = merge_full[:, NOPE_DIM:HEAD_DIM]
-                merge_even = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P0101)
-                merge_odd = pl.gather(merge_rope, mask_pattern=pl.tile.MaskPattern.P1010)
-                merge_swapped = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                merge_swapped = pl.tensor.scatter(merge_odd, mask_pattern=pl.tile.MaskPattern.P0101, dst=merge_swapped)
-                merge_swapped = pl.tensor.scatter(
-                    merge_even,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    dst=merge_swapped,
-                )
+                merge_swapped = pl.gather(merge_rope, dim=-1, index=merge_swap_idx)
                 merge_rot = pl.add(
                     pl.col_expand_mul(merge_rope, merge_cos),
                     pl.col_expand_mul(merge_swapped, merge_sin),

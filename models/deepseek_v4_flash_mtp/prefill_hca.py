@@ -803,23 +803,25 @@ def prefill_attention_hca(
         dtype=pl.FP32,
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_init_state") as state_init_done:
+    with pl.spmd(48, name_hint="cp_hca_init_state") as state_init_done:
+        init_worker_id = pl.tile.get_block_idx()
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
-            for state_row in pl.range(state_rows):
+            for state_row in pl.range(init_worker_id, state_rows, 48):
                 destination = part * state_rows + state_row
                 scratch_state_flat[
                     destination : destination + 1, :
                 ] = pl.full([1, COMPRESS_STATE_DIM], dtype=pl.FP32, value=0.0)
             if segment == 0 and pl.read(segment_starts_t, [0]) > 0:
                 for row in pl.range(TAIL_ROWS):
-                    seed_position = pl.read(segment_starts_t, [0]) - TAIL_ROWS + row
-                    if seed_position >= 0:
-                        seed_page = pl.read(compress_state_block_table, [seed_position // HCA_STATE_BLOCK_SIZE])
-                        seed_row = seed_page * HCA_STATE_BLOCK_SIZE + seed_position % HCA_STATE_BLOCK_SIZE
-                        if seed_page >= 0 and seed_row < state_rows:
-                            seed_destination = part * state_rows + seed_row
-                            scratch_state_flat[seed_destination:seed_destination + 1, :] = history_state[row:row + 1, :]
+                    history_position = pl.read(segment_starts_t, [0]) - TAIL_ROWS + row
+                    if history_position >= 0:
+                        history_state_block = pl.read(compress_state_block_table, [history_position // HCA_STATE_BLOCK_SIZE])
+                        history_state_row = history_state_block * HCA_STATE_BLOCK_SIZE + history_position % HCA_STATE_BLOCK_SIZE
+                        # Each worker restores only the state rows it cleared.
+                        if history_state_block >= 0 and history_state_row < state_rows and history_state_row % 48 == init_worker_id:
+                            history_destination_row = part * state_rows + history_state_row
+                            scratch_state_flat[history_destination_row:history_destination_row + 1, :] = history_state[row:row + 1, :]
 
     leaf_cmp = pl.create_tensor(
         [
@@ -861,13 +863,8 @@ def prefill_attention_hca(
                 cmp_slots_leaf, state_slots_leaf, state_read_done,
             )
             leaf_cmp = pl.assemble(leaf_cmp, cmp_leaf, [cmp_block0, 0, 0, 0])
-        # Publish the updated view in fixed-size rows; the physical pool
-        # extent is runtime-sized and cannot form one on-chip tile.
-        state_part_flat = pl.reshape(state_part, [state_rows, COMPRESS_STATE_DIM])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_state_part_publish"):
-            for row in pl.range(state_rows):
-                destination = part * state_rows + row
-                scratch_state_flat[destination:destination + 1, :] = state_part_flat[row:row + 1, :]
+        # Publish the compressor's updated scratch-state view.
+        scratch_state = pl.assemble(scratch_state, state_part, [state_base, 0, 0])
 
     local_cmp_payload = pl.create_tensor([EPOCHS * CMP_ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16)
     local_cmp_meta = pl.create_tensor([EPOCHS * CMP_ROWS_PER_RANK, CMP_META_DIM], dtype=pl.INT32)

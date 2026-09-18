@@ -958,7 +958,7 @@ def _cp_csa_compress_pack_part(
     inner_state = pl.reshape(inner_state_workspace, [inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM])
 
     # Alternate the input workspace and one scratch pair across serial leaves.
-    # Keep full-state copies and physical page IDs unchanged.
+    # Physical pools and page IDs stay unchanged; only live boundary rows move.
     main_state_scratch = pl.create_tensor([main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
     inner_state_scratch = pl.create_tensor(
         [
@@ -1024,14 +1024,31 @@ def _cp_csa_compress_pack_part(
             name_hint="cp_csa_materialize_leaf",
             deps=[part_meta_seed_tid, main_completion[0], inner_completion[0]],
         ):
-            for state_row in pl.range(main_state_rows):
-                main_state_next_flat[state_row : state_row + 1, :] = (
-                    main_state_written_flat[state_row : state_row + 1, :]
-                )
-            for state_row in pl.range(inner_state_rows):
-                inner_state_next_flat[state_row : state_row + 1, :] = (
-                    inner_state_written_flat[state_row : state_row + 1, :]
-                )
+            # Later leaves read only the preceding ratio-4 window from state;
+            # their current rows come from their own projections. Keep the final
+            # eight rows for both that history and the terminal state snapshot.
+            # Empty leaves retain the latest active leaf's boundary.
+            carry_end = pl.cast(segment_start, pl.INDEX)
+            for previous_leaf in pl.range(leaf + 1):
+                previous_active = pl.read(leaf_num_tokens, [previous_leaf])
+                if previous_active > 0:
+                    last_row = previous_leaf * T + previous_active - 1
+                    carry_end = pl.read(leaf_positions, [last_row]) + 1
+            for carry_row in pl.range(STATE_LEN):
+                carry_position = carry_end - STATE_LEN + carry_row
+                if carry_position >= 0:
+                    main_carry_block = pl.read(main_state_block_table, [carry_position // MAIN_STATE_BLOCK_SIZE])
+                    inner_carry_block = pl.read(inner_state_block_table, [carry_position // INNER_STATE_BLOCK_SIZE])
+                    if main_carry_block >= 0:
+                        main_carry_row = pl.cast(main_carry_block, pl.INDEX) * MAIN_STATE_BLOCK_SIZE + carry_position % MAIN_STATE_BLOCK_SIZE
+                        main_state_next_flat[main_carry_row : main_carry_row + 1, :] = (
+                            main_state_written_flat[main_carry_row : main_carry_row + 1, :]
+                        )
+                    if inner_carry_block >= 0:
+                        inner_carry_row = pl.cast(inner_carry_block, pl.INDEX) * INNER_STATE_BLOCK_SIZE + carry_position % INNER_STATE_BLOCK_SIZE
+                        inner_state_next_flat[inner_carry_row : inner_carry_row + 1, :] = (
+                            inner_state_written_flat[inner_carry_row : inner_carry_row + 1, :]
+                        )
             if leaf > 0:
                 segment_slot0 = segment_start // COMPRESS_RATIO
                 for row in pl.range(T):
