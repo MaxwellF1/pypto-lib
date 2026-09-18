@@ -83,6 +83,7 @@ def prefill_compressor_ratio128(
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_reuse_ready: pl.Scalar[pl.TASK_ID],
 ):
     x_flat = x
     state_block_num = pl.tensor.dim(compress_state, 0)
@@ -127,10 +128,9 @@ def prefill_compressor_ratio128(
                     pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
 
-    # State scatter (decode order): write every token's raw projection (+APE on score) into
-    # paged kv_state/score_state BEFORE pooling, so softmax_pool reads its window straight from
-    # state (no seed+overlay, no pool_dep ordering hack). pool depends on this via kv_state RAW.
-    for scatter_t in pl.spmd(T, name_hint="prefill_hca_c128_state_scatter_pre"):
+    # Finish the previous leaf's state reads before scattering raw projections and scores.
+    with pl.spmd(T, name_hint="prefill_hca_c128_state_scatter_pre", deps=[state_reuse_ready]) as _state_scatter_tid:
+        scatter_t = pl.tile.get_block_idx()
         if scatter_t < num_tokens:
             scatter_row_raw = pl.read(state_slot_mapping, [scatter_t])
             if scatter_row_raw >= 0:
@@ -143,7 +143,8 @@ def prefill_compressor_ratio128(
                     ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
                 )
 
-    for pool_idx in pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool"):
+    with pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool") as state_read_done:
+        pool_idx = pl.tile.get_block_idx()
         write_i = pool_idx // (HEAD_DIM // HEAD_TILE)
         hb = pool_idx - write_i * (HEAD_DIM // HEAD_TILE)
         h0 = hb * HEAD_TILE
@@ -257,7 +258,7 @@ def prefill_compressor_ratio128(
 
     # Writes through the flattened views already update the caller-owned buffers.
     # Avoid a dynamic reshape-back here because this inline kernel is nested.
-    return cmp_kv, compress_state
+    return cmp_kv, compress_state, state_read_done
 
 
 @pl.jit
@@ -277,10 +278,12 @@ def prefill_compressor_ratio128_test(
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
-    return prefill_compressor_ratio128(
+    state_reuse_ready = pl.system.task_dummy(deps=[])
+    cmp_kv, compress_state, _state_read_done = prefill_compressor_ratio128(
         x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping, state_reuse_ready,
     )
+    return cmp_kv, compress_state
 
 
 def golden_prefill_compressor_ratio128(tensors):

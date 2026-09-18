@@ -74,7 +74,6 @@ import pypto.language as pl
 from config import (
     BLOCK_SIZE,
     FLASH as M,
-    HCA_STATE_PHYSICAL_BLOCKS,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
@@ -328,10 +327,12 @@ def _cmp_block_tables(cp_size: int, request_end: int):
 def _state_block_tables(cp_size: int):
     import torch
 
+    # Recycle physical state pages within the five-leaf compressor sequence.
+    physical_blocks = 3 * COMPRESS_RATIO // HCA_STATE_BLOCK_SIZE
     tables = torch.empty(cp_size, HCA_STATE_MAX_BLOCKS, dtype=torch.int32)
     for rank in range(cp_size):
         for logical_block in range(HCA_STATE_MAX_BLOCKS):
-            tables[rank, logical_block] = (logical_block * 17 + 3) % HCA_STATE_PHYSICAL_BLOCKS
+            tables[rank, logical_block] = (logical_block * 17 + 3) % physical_blocks
     return tables
 
 
@@ -802,7 +803,7 @@ def prefill_attention_hca(
         dtype=pl.FP32,
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_seed_state"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_seed_state") as state_seed_tid:
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
             for state_row in pl.range(state_rows):
@@ -840,6 +841,8 @@ def prefill_attention_hca(
             ],
             [state_base, 0, 0],
         )
+        # Finish pooling before the next leaf overwrites recycled state pages.
+        state_read_done = state_seed_tid
         for leaf in pl.range(MAX_COMPRESS_LEAVES):
             leaf_index = part * MAX_COMPRESS_LEAVES + leaf
             token0 = leaf_index * TAIL_ROWS
@@ -850,12 +853,12 @@ def prefill_attention_hca(
             state_slots_leaf = pl.slice(leaf_state_slots, [TAIL_ROWS], [token0])
             cmp_leaf = pl.slice(leaf_cmp, [LEAF_CMP_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], [cmp_block0, 0, 0, 0])
             active = pl.read(leaf_num_tokens, [part, leaf])
-            cmp_leaf, state_part = prefill_compressor_ratio128(
+            cmp_leaf, state_part, state_read_done = prefill_compressor_ratio128(
                 x_leaf, state_part, compress_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 freqs_cos, freqs_sin,
                 cmp_leaf, position_leaf, active,
-                cmp_slots_leaf, state_slots_leaf,
+                cmp_slots_leaf, state_slots_leaf, state_read_done,
             )
             leaf_cmp = pl.assemble(leaf_cmp, cmp_leaf, [cmp_block0, 0, 0, 0])
         # Publish the updated view in fixed-size rows; the physical pool
@@ -1363,7 +1366,7 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     state_tables = metadata["compress_state_block_table"]
     state = torch.zeros(
         cp_size,
-        HCA_STATE_PHYSICAL_BLOCKS,
+        int(state_tables.max()) + 1,
         HCA_STATE_BLOCK_SIZE,
         COMPRESS_STATE_DIM,
         dtype=torch.float32,
