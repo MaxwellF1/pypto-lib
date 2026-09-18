@@ -129,7 +129,7 @@ runs:
         # instead of two. A renamed case id makes pytest exit 4 (no tests ran)
         # rather than silently widening the run.
         test_file=tests/test_deepseek_v4_accuracy.py
-        mtp_test=test_deepseek_v4_http_completion_matches_expected_text
+        mtp_test=test_deepseek_v4_http_completion_contract
         case "$MTP_CASES" in
           k1)  pytest_target="'$test_file::$mtp_test[k1-fused]'" ;;
           all) pytest_target="$test_file" ;;
