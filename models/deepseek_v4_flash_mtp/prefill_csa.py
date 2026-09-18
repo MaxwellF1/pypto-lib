@@ -1261,7 +1261,7 @@ def _prefill_cp_csa_history_exchange(
             else:
                 for row in pl.range(RECORDS_PER_WINDOW):
                     logical = (phase - 1) * RECORDS_PER_WINDOW + row
-                    if logical < compressed and BLOCK_SIZE + logical < root_rows:
+                    if logical < compressed and BLOCK_SIZE + logical < pl.tensor.dim(cmp_dst, 0):
                         destination = BLOCK_SIZE + logical
                         cmp_dst[destination:destination + 1, :] = main_window[row:row + 1, 0:HEAD_DIM]
                         idx_dst[destination:destination + 1, :] = idx_window[row:row + 1, 0:IDX_HEAD_DIM]
