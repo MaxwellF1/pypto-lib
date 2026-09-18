@@ -803,7 +803,7 @@ def prefill_attention_hca(
         dtype=pl.FP32,
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_seed_state") as state_seed_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_init_state") as state_init_done:
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
             for state_row in pl.range(state_rows):
@@ -842,7 +842,7 @@ def prefill_attention_hca(
             [state_base, 0, 0],
         )
         # Finish pooling before the next leaf overwrites recycled state pages.
-        state_read_done = state_seed_tid
+        state_read_done = state_init_done
         for leaf in pl.range(MAX_COMPRESS_LEAVES):
             leaf_index = part * MAX_COMPRESS_LEAVES + leaf
             token0 = leaf_index * TAIL_ROWS
