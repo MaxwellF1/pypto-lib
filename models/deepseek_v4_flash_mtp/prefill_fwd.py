@@ -1632,209 +1632,213 @@ def _prefill_request(
     entry_pre_hc_tail_window: pld.DistributedTensor[[CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], pl.FP32],
     entry_complete: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 1], pl.INT32],
     entry_barrier_epochs: pld.DistributedTensor[[CP_EXCHANGE_CP_SIZE, 16], pl.INT32],
-    request_owner: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    request_rows = pl.tensor.dim(x_hc, 0)
+    # Process owners sequentially within each chip invocation.
+    # Reuse scratch after the preceding owner completion read.
     header = pl.create_tensor([1, 16], dtype=pl.INT32)
-    if request_owner == 0:
-        # The public outputs include inactive owners and padding.
-        for row in pl.spmd(request_rows, name_hint="prefill_empty_hidden"):
-            zero = pl.tile.full([1, D], value=0.0, dtype=pl.BF16)
-            pl.store(zero, [row, 0], x_out)
-        for row in pl.spmd(T, name_hint="prefill_empty_tail"):
-            zero_tail = pl.tile.full([1, 1, D], value=0.0, dtype=pl.FP32)
-            for stream in pl.range(HC_MULT):
-                pl.store(zero_tail, [row, stream, 0], pre_hc_hidden_out)
-    if pl.read(num_tokens_per_owner, [request_owner]) > 0:
+    control = pl.create_tensor([1, 16], dtype=pl.INT32)
+    local_x_hc = pl.create_tensor([CP_EXCHANGE_LOCAL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
+    local_input_ids = pl.create_tensor([1, CP_EXCHANGE_LOCAL_ROWS], dtype=pl.INT64)
+    local_ori_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
+    local_hca_cmp_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_csa_cmp_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_idx_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_hca_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_HCA_STATE_MAX_BLOCKS], dtype=pl.INT32)
+    local_csa_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS], dtype=pl.INT32)
+    local_csa_inner_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS], dtype=pl.INT32)
+    segment_starts_t = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
+    predecessor_segments = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
+    query_position_ids = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], dtype=pl.INT32)
+    query_token_to_request = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], dtype=pl.INT32)
+    overlay_position_ids = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], dtype=pl.INT32)
+    overlay_token_to_request = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], dtype=pl.INT32)
+    overlay_active_lengths = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], dtype=pl.INT32)
+    swa_indices = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], dtype=pl.INT32)
+    reverse_index = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
+    owner_rank_table = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
+    final_win_seg_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+    final_win_row_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+    final_slot_mapping = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+    segment_active_lengths = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
+    cache_owner_rank_t = pl.create_tensor([1], dtype=pl.INT32)
+    owner_segments_t = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
+    final_segment_t = pl.create_tensor([1], dtype=pl.INT32)
+    segment_tail_positions = pl.create_tensor([NUM_SEGMENTS, TAIL_ROWS], dtype=pl.INT32)
+    snapshot_positions = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
+    snapshot_valid = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
+    owner_part_table = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
+    segment_lengths_t = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
+    leaf_positions_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT32)
+    leaf_main_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
+    leaf_idx_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
+    leaf_main_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
+    leaf_inner_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
+    leaf_num_tokens_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], dtype=pl.INT32)
+    hca_history_slots = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
+    hca_history_positions = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
+    csa_history_slots = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
+    cp_pre_hc_hidden_out = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
+    cp_hidden_out = pl.create_tensor([CP_LOCAL_ROWS, D], dtype=pl.BF16)
+    for request_owner in pl.range(CP_EXCHANGE_CP_SIZE):
         request_rows = pl.tensor.dim(x_hc, 0)
-        control = pl.create_tensor([1, 16], dtype=pl.INT32)
-        input_x_flat = pl.reshape(x_hc, [request_rows, HC_DIM])
-        input_ids_row = pl.reshape(input_ids, [1, request_rows])
-        ori_block_table_row = pl.reshape(ori_block_table, [1, CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
-        hca_cmp_block_table_row = pl.reshape(hca_cmp_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-        csa_cmp_block_table_row = pl.reshape(csa_cmp_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-        idx_block_table_row = pl.reshape(idx_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-        hca_compress_state_block_table_row = pl.reshape(hca_compress_state_block_table, [1, CP_EXCHANGE_HCA_STATE_MAX_BLOCKS])
-        csa_compress_state_block_table_row = pl.reshape(csa_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS])
-        csa_inner_compress_state_block_table_row = pl.reshape(csa_inner_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS])
-        local_x_hc = pl.create_tensor([CP_EXCHANGE_LOCAL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
-        local_input_ids = pl.create_tensor([1, CP_EXCHANGE_LOCAL_ROWS], dtype=pl.INT64)
-        local_ori_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
-        local_hca_cmp_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_csa_cmp_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_idx_block_table = pl.create_tensor([1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_hca_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_HCA_STATE_MAX_BLOCKS], dtype=pl.INT32)
-        local_csa_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS], dtype=pl.INT32)
-        local_csa_inner_compress_state_block_table = pl.create_tensor([1, CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS], dtype=pl.INT32)
-        prepare_cp_request(num_tokens_per_owner, position_ids, header, request_owner, my_rank)
-        (control, local_x_hc, local_input_ids, local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table, local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table) = scatter_cp_request(
-            header,
-            input_x_flat,
-            input_ids_row,
-            ori_block_table_row,
-            hca_cmp_block_table_row,
-            csa_cmp_block_table_row,
-            idx_block_table_row,
-            hca_compress_state_block_table_row,
-            csa_compress_state_block_table_row,
-            csa_inner_compress_state_block_table_row,
-            entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
-            control,
-            local_x_hc,
-            local_input_ids,
-            local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
-            local_hca_compress_state_block_table,
-            local_csa_compress_state_block_table,
-            local_csa_inner_compress_state_block_table,
+        if request_owner == 0:
+            # The public outputs include inactive owners and padding.
+            for row in pl.spmd(request_rows, name_hint="prefill_empty_hidden"):
+                zero = pl.tile.full([1, D], value=0.0, dtype=pl.BF16)
+                pl.store(zero, [row, 0], x_out)
+            for row in pl.spmd(T, name_hint="prefill_empty_tail"):
+                zero_tail = pl.tile.full([1, 1, D], value=0.0, dtype=pl.FP32)
+                for stream in pl.range(HC_MULT):
+                    pl.store(zero_tail, [row, stream, 0], pre_hc_hidden_out)
+        if pl.read(num_tokens_per_owner, [request_owner]) > 0:
+            request_rows = pl.tensor.dim(x_hc, 0)
+            input_x_flat = pl.reshape(x_hc, [request_rows, HC_DIM])
+            input_ids_row = pl.reshape(input_ids, [1, request_rows])
+            ori_block_table_row = pl.reshape(ori_block_table, [1, CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
+            hca_cmp_block_table_row = pl.reshape(hca_cmp_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+            csa_cmp_block_table_row = pl.reshape(csa_cmp_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+            idx_block_table_row = pl.reshape(idx_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+            hca_compress_state_block_table_row = pl.reshape(hca_compress_state_block_table, [1, CP_EXCHANGE_HCA_STATE_MAX_BLOCKS])
+            csa_compress_state_block_table_row = pl.reshape(csa_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS])
+            csa_inner_compress_state_block_table_row = pl.reshape(csa_inner_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS])
+            prepare_cp_request(num_tokens_per_owner, position_ids, header, request_owner, my_rank)
+            (control, local_x_hc, local_input_ids, local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table, local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table) = scatter_cp_request(
+                header,
+                input_x_flat,
+                input_ids_row,
+                ori_block_table_row,
+                hca_cmp_block_table_row,
+                csa_cmp_block_table_row,
+                idx_block_table_row,
+                hca_compress_state_block_table_row,
+                csa_compress_state_block_table_row,
+                csa_inner_compress_state_block_table_row,
+                entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
+                control,
+                local_x_hc,
+                local_input_ids,
+                local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
+                local_hca_compress_state_block_table,
+                local_csa_compress_state_block_table,
+                local_csa_inner_compress_state_block_table,
+                my_rank,
+            )
+            mode = pl.read(control, [0, 0])
+            if mode == 1:
+                cp_ori_block_table = pl.reshape(local_ori_block_table, [CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
+                cp_hca_cmp_block_table = pl.reshape(local_hca_cmp_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+                cp_csa_cmp_block_table = pl.reshape(local_csa_cmp_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+                cp_idx_block_table = pl.reshape(local_idx_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
+                cp_hca_compress_state_block_table = pl.reshape(local_hca_compress_state_block_table, [CP_EXCHANGE_HCA_STATE_MAX_BLOCKS])
+                cp_csa_compress_state_block_table = pl.reshape(local_csa_compress_state_block_table, [CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS])
+                cp_csa_inner_compress_state_block_table = pl.reshape(local_csa_inner_compress_state_block_table, [CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS])
+                _prefill_cp_metadata(
+                    control,
+                    cp_ori_block_table, cp_csa_compress_state_block_table, cp_csa_inner_compress_state_block_table,
+                    cp_idx_block_table,
+                    segment_starts_t, predecessor_segments,
+                    query_position_ids, query_token_to_request,
+                    overlay_position_ids, overlay_token_to_request, overlay_active_lengths,
+                    swa_indices,
+                    reverse_index, owner_rank_table,
+                    final_win_seg_src, final_win_row_src,
+                    final_slot_mapping,
+                    segment_active_lengths, cache_owner_rank_t, owner_segments_t, final_segment_t,
+                    segment_tail_positions, snapshot_positions, snapshot_valid, owner_part_table, segment_lengths_t,
+                    leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input,
+                    leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input,
+                    hca_history_slots, hca_history_positions, csa_history_slots,
+                    my_rank,
+                )
+                cp_x_hc = pl.reshape(local_x_hc, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
+                cp_input_ids = pl.reshape(local_input_ids, [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS])
+                cp_hidden_out = prefill_fwd(
+                    cp_x_hc,
+                    hc_attn_fn, hc_attn_scale, hc_attn_base,
+                    attn_norm_w,
+                    wq_a, wq_b, wq_b_scale,
+                    wkv,
+                    gamma_cq, gamma_ckv,
+                    freqs_cos, freqs_sin,
+                    kv_cache, hca_cmp_kv, csa_cmp_kv,
+                    attn_sink,
+                    wo_a, wo_b, wo_b_scale,
+                    segment_starts_t, predecessor_segments,
+                    query_position_ids, query_token_to_request,
+                    overlay_position_ids, overlay_token_to_request, overlay_active_lengths,
+                    swa_indices,
+                    reverse_index, owner_rank_table,
+                    final_win_seg_src, final_win_row_src,
+                    final_slot_mapping,
+                    segment_active_lengths, cache_owner_rank_t, owner_segments_t, final_segment_t,
+                    hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
+                    hca_compress_state, cp_hca_compress_state_block_table,
+                    segment_tail_positions, snapshot_positions, snapshot_valid, owner_part_table,
+                    csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
+                    csa_hadamard_idx, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
+                    csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
+                    csa_compress_state, csa_inner_compress_state,
+                    idx_kv_cache, idx_kv_scale,
+                    cp_csa_compress_state_block_table, cp_csa_inner_compress_state_block_table, cp_idx_block_table,
+                    segment_lengths_t,
+                    leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input,
+                    leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input,
+                    hca_history_slots, hca_history_positions, csa_history_slots,
+                    cp_hca_cmp_block_table, cp_csa_cmp_block_table, cp_hidden_tail_window,
+                    cp_tail_ready, cp_tail_consumed, cp_cmp_window, cp_cmp_meta_window, cp_state_window,
+                    cp_state_meta_window, cp_hca_compact_ready, cp_hca_compact_consumed, cp_main_window, cp_idx_window,
+                    cp_scale_window, cp_record_window, cp_main_state_window, cp_main_state_meta_window,
+                    cp_inner_state_window, cp_inner_state_meta_window, cp_csa_compact_ready, cp_csa_compact_consumed,
+                    hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+                    norm_w, gate_w, gate_bias, tid2eid,
+                    cp_input_ids,
+                    routed_w1, routed_w1_scale,
+                    routed_w3, routed_w3_scale,
+                    routed_w2, routed_w2_scale,
+                    shared_w1, shared_w1_scale,
+                    shared_w3, shared_w3_scale,
+                    shared_w2, shared_w2_scale,
+                    cp_count_target, cp_count_signal, cp_prefill_moe_x_target, cp_prefill_moe_x_signal,
+                    cp_prefill_moe_scale_target, cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
+                    hc_head_fn, hc_head_scale, hc_head_base,
+                    final_norm_w,
+                    cp_pre_hc_hidden_out, cp_hidden_out,
+                    my_rank,
+                )
+                cp_pre_hc_flat = pl.reshape(cp_pre_hc_hidden_out, [CP_LOCAL_ROWS, HC_DIM])
+                output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
+                gather_cp_hidden(
+                    control,
+                    cp_hidden_out, cp_pre_hc_flat,
+                    entry_hidden_window, entry_pre_hc_tail_window, entry_complete,
+                    x_out,
+                    output_pre_hc_flat,
+                    my_rank,
+                )
+            elif request_owner == my_rank:
+                # Unsupported request metadata must not leave allocator residue as output.
+                for row in pl.spmd(request_rows, name_hint="prefill_unsupported_request"):
+                    invalid_bits = pl.tile.full([1, D], value=0x7FC0, dtype=pl.INT16)
+                    invalid = pl.tile.reinterpret_view(invalid_bits, pl.BF16)
+                    pl.store(invalid, [row, 0], x_out)
+                for row in pl.spmd(T, name_hint="prefill_unsupported_tail"):
+                    invalid_tail_bits = pl.tile.full([1, 1, D], value=0x7FC00000, dtype=pl.INT32)
+                    invalid_tail = pl.tile.reinterpret_view(invalid_tail_bits, pl.FP32)
+                    for stream in pl.range(HC_MULT):
+                        pl.store(invalid_tail, [row, stream, 0], pre_hc_hidden_out)
+        output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
+        cp_request_barrier(
+            x_out, output_pre_hc_flat, entry_barrier_epochs,
+            cp_tail_ready, cp_tail_consumed,
+            cp_hca_compact_ready, cp_hca_compact_consumed,
+            cp_csa_compact_ready, cp_csa_compact_consumed,
+            cp_count_signal, cp_prefill_moe_x_signal,
+            cp_prefill_moe_reverse_signal, entry_ready,
             my_rank,
         )
-        mode = pl.read(control, [0, 0])
-        if mode == 1:
-            cp_ori_block_table = pl.reshape(local_ori_block_table, [CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
-            cp_hca_cmp_block_table = pl.reshape(local_hca_cmp_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-            cp_csa_cmp_block_table = pl.reshape(local_csa_cmp_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-            cp_idx_block_table = pl.reshape(local_idx_block_table, [CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
-            cp_hca_compress_state_block_table = pl.reshape(local_hca_compress_state_block_table, [CP_EXCHANGE_HCA_STATE_MAX_BLOCKS])
-            cp_csa_compress_state_block_table = pl.reshape(local_csa_compress_state_block_table, [CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS])
-            cp_csa_inner_compress_state_block_table = pl.reshape(local_csa_inner_compress_state_block_table, [CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS])
-            segment_starts_t = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
-            predecessor_segments = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
-            query_position_ids = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], dtype=pl.INT32)
-            query_token_to_request = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS], dtype=pl.INT32)
-            overlay_position_ids = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], dtype=pl.INT32)
-            overlay_token_to_request = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_ROWS], dtype=pl.INT32)
-            overlay_active_lengths = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], dtype=pl.INT32)
-            swa_indices = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, WIN], dtype=pl.INT32)
-            reverse_index = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
-            owner_rank_table = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
-            final_win_seg_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-            final_win_row_src = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-            final_slot_mapping = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-            segment_active_lengths = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
-            cache_owner_rank_t = pl.create_tensor([1], dtype=pl.INT32)
-            owner_segments_t = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
-            final_segment_t = pl.create_tensor([1], dtype=pl.INT32)
-            segment_tail_positions = pl.create_tensor([NUM_SEGMENTS, TAIL_ROWS], dtype=pl.INT32)
-            snapshot_positions = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
-            snapshot_valid = pl.create_tensor([LOCAL_PARTS], dtype=pl.INT32)
-            owner_part_table = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
-            segment_lengths_t = pl.create_tensor([NUM_SEGMENTS], dtype=pl.INT32)
-            leaf_positions_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT32)
-            leaf_main_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
-            leaf_idx_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
-            leaf_main_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
-            leaf_inner_state_slots_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES, ATTN_TILE_ROWS], dtype=pl.INT64)
-            leaf_num_tokens_input = pl.create_tensor([LOCAL_PARTS, CSA_MAX_COMPRESS_LEAVES], dtype=pl.INT32)
-            hca_history_slots = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
-            hca_history_positions = pl.create_tensor([LOCAL_PARTS, TAIL_ROWS], dtype=pl.INT32)
-            csa_history_slots = pl.create_tensor([TAIL_ROWS], dtype=pl.INT32)
-            _prefill_cp_metadata(
-                control,
-                cp_ori_block_table, cp_csa_compress_state_block_table, cp_csa_inner_compress_state_block_table,
-                cp_idx_block_table,
-                segment_starts_t, predecessor_segments,
-                query_position_ids, query_token_to_request,
-                overlay_position_ids, overlay_token_to_request, overlay_active_lengths,
-                swa_indices,
-                reverse_index, owner_rank_table,
-                final_win_seg_src, final_win_row_src,
-                final_slot_mapping,
-                segment_active_lengths, cache_owner_rank_t, owner_segments_t, final_segment_t,
-                segment_tail_positions, snapshot_positions, snapshot_valid, owner_part_table, segment_lengths_t,
-                leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input,
-                leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input,
-                hca_history_slots, hca_history_positions, csa_history_slots,
-                my_rank,
-            )
-            cp_x_hc = pl.reshape(local_x_hc, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
-            cp_input_ids = pl.reshape(local_input_ids, [LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS])
-            cp_pre_hc_hidden_out = pl.create_tensor([LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], dtype=pl.FP32)
-            cp_hidden_out = pl.create_tensor([CP_LOCAL_ROWS, D], dtype=pl.BF16)
-            cp_hidden_out = prefill_fwd(
-                cp_x_hc,
-                hc_attn_fn, hc_attn_scale, hc_attn_base,
-                attn_norm_w,
-                wq_a, wq_b, wq_b_scale,
-                wkv,
-                gamma_cq, gamma_ckv,
-                freqs_cos, freqs_sin,
-                kv_cache, hca_cmp_kv, csa_cmp_kv,
-                attn_sink,
-                wo_a, wo_b, wo_b_scale,
-                segment_starts_t, predecessor_segments,
-                query_position_ids, query_token_to_request,
-                overlay_position_ids, overlay_token_to_request, overlay_active_lengths,
-                swa_indices,
-                reverse_index, owner_rank_table,
-                final_win_seg_src, final_win_row_src,
-                final_slot_mapping,
-                segment_active_lengths, cache_owner_rank_t, owner_segments_t, final_segment_t,
-                hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
-                hca_compress_state, cp_hca_compress_state_block_table,
-                segment_tail_positions, snapshot_positions, snapshot_valid, owner_part_table,
-                csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
-                csa_hadamard_idx, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
-                csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-                csa_compress_state, csa_inner_compress_state,
-                idx_kv_cache, idx_kv_scale,
-                cp_csa_compress_state_block_table, cp_csa_inner_compress_state_block_table, cp_idx_block_table,
-                segment_lengths_t,
-                leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input,
-                leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input,
-                hca_history_slots, hca_history_positions, csa_history_slots,
-                cp_hca_cmp_block_table, cp_csa_cmp_block_table, cp_hidden_tail_window,
-                cp_tail_ready, cp_tail_consumed, cp_cmp_window, cp_cmp_meta_window, cp_state_window,
-                cp_state_meta_window, cp_hca_compact_ready, cp_hca_compact_consumed, cp_main_window, cp_idx_window,
-                cp_scale_window, cp_record_window, cp_main_state_window, cp_main_state_meta_window,
-                cp_inner_state_window, cp_inner_state_meta_window, cp_csa_compact_ready, cp_csa_compact_consumed,
-                hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-                norm_w, gate_w, gate_bias, tid2eid,
-                cp_input_ids,
-                routed_w1, routed_w1_scale,
-                routed_w3, routed_w3_scale,
-                routed_w2, routed_w2_scale,
-                shared_w1, shared_w1_scale,
-                shared_w3, shared_w3_scale,
-                shared_w2, shared_w2_scale,
-                cp_count_target, cp_count_signal, cp_prefill_moe_x_target, cp_prefill_moe_x_signal,
-                cp_prefill_moe_scale_target, cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
-                hc_head_fn, hc_head_scale, hc_head_base,
-                final_norm_w,
-                cp_pre_hc_hidden_out, cp_hidden_out,
-                my_rank,
-            )
-            cp_pre_hc_flat = pl.reshape(cp_pre_hc_hidden_out, [CP_LOCAL_ROWS, HC_DIM])
-            output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
-            gather_cp_hidden(
-                control,
-                cp_hidden_out, cp_pre_hc_flat,
-                entry_hidden_window, entry_pre_hc_tail_window, entry_complete,
-                x_out,
-                output_pre_hc_flat,
-                my_rank,
-            )
-        elif request_owner == my_rank:
-            # Unsupported request metadata must not leave allocator residue as output.
-            for row in pl.spmd(request_rows, name_hint="prefill_unsupported_request"):
-                invalid_bits = pl.tile.full([1, D], value=0x7FC0, dtype=pl.INT16)
-                invalid = pl.tile.reinterpret_view(invalid_bits, pl.BF16)
-                pl.store(invalid, [row, 0], x_out)
-            for row in pl.spmd(T, name_hint="prefill_unsupported_tail"):
-                invalid_tail_bits = pl.tile.full([1, 1, D], value=0x7FC00000, dtype=pl.INT32)
-                invalid_tail = pl.tile.reinterpret_view(invalid_tail_bits, pl.FP32)
-                for stream in pl.range(HC_MULT):
-                    pl.store(invalid_tail, [row, stream, 0], pre_hc_hidden_out)
-    output_pre_hc_flat = pl.reshape(pre_hc_hidden_out, [T, HC_DIM])
-    cp_request_barrier(
-        x_out, output_pre_hc_flat, entry_barrier_epochs,
-        cp_tail_ready, cp_tail_consumed,
-        cp_hca_compact_ready, cp_hca_compact_consumed,
-        cp_csa_compact_ready, cp_csa_compact_consumed,
-        cp_count_signal, cp_prefill_moe_x_signal,
-        cp_prefill_moe_reverse_signal, entry_ready,
-        my_rank,
-    )
+        # Complete the owner before reusing its CP windows.
+        _owner_complete = pl.read(entry_barrier_epochs, [my_rank, 0])
     return x_out
 
 
@@ -1986,99 +1990,97 @@ def l3_prefill_fwd(
     entry_complete_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
     entry_barrier_epochs_buf = pld.alloc_window_buffer([CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
 
-    # Process cache owners within the existing lib call. Each chip invocation
-    # owns one request's scratch; the shared outputs accumulate across owners.
-    for request_owner in pl.range(CP_EXCHANGE_CP_SIZE):
-        for r in pl.range(pld.world_size()):
-            cp_hidden_tail_window = pld.window(cp_hidden_tail_window_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-            cp_tail_ready = pld.window(cp_tail_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_tail_consumed = pld.window(cp_tail_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_cmp_window = pld.window(cp_cmp_window_buf, [CMP_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
-            cp_cmp_meta_window = pld.window(cp_cmp_meta_window_buf, [CMP_WINDOW_ROWS, CMP_META_DIM], dtype=pl.INT32)
-            cp_state_window = pld.window(cp_state_window_buf, [STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], dtype=pl.FP32)
-            cp_state_meta_window = pld.window(cp_state_meta_window_buf, [CP_SIZE, STATE_META_DIM], dtype=pl.INT32)
-            cp_hca_compact_ready = pld.window(cp_hca_compact_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_hca_compact_consumed = pld.window(cp_hca_compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_main_window = pld.window(cp_main_window_buf, [RECORDS_PER_WINDOW, CSA_MAIN_OUT_DIM], dtype=pl.BF16)
-            cp_idx_window = pld.window(cp_idx_window_buf, [RECORDS_PER_WINDOW, IDX_HEAD_DIM], dtype=pl.INT8)
-            cp_scale_window = pld.window(cp_scale_window_buf, [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP16)
-            cp_record_window = pld.window(cp_record_window_buf, [RECORDS_PER_WINDOW, META_DIM], dtype=pl.INT32)
-            cp_main_state_window = pld.window(cp_main_state_window_buf, [STATE_RECORDS_PER_WINDOW, CSA_COMPRESS_STATE_DIM], dtype=pl.FP32)
-            cp_main_state_meta_window = pld.window(cp_main_state_meta_window_buf, [STATE_RECORDS_PER_WINDOW, STATE_META_DIM], dtype=pl.INT32)
-            cp_inner_state_window = pld.window(cp_inner_state_window_buf, [STATE_RECORDS_PER_WINDOW, CSA_INNER_COMPRESS_STATE_DIM], dtype=pl.FP32)
-            cp_inner_state_meta_window = pld.window(cp_inner_state_meta_window_buf, [STATE_RECORDS_PER_WINDOW, STATE_META_DIM], dtype=pl.INT32)
-            cp_csa_compact_ready = pld.window(cp_csa_compact_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_csa_compact_consumed = pld.window(cp_csa_compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
-            cp_count_target = pld.window(cp_count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-            cp_count_signal = pld.window(cp_count_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-            cp_prefill_moe_x_target = pld.window(cp_prefill_moe_x_target_buf, [CP_MOE_TOTAL_CAP, D], dtype=pl.INT8)
-            cp_prefill_moe_x_signal = pld.window(cp_prefill_moe_x_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-            cp_prefill_moe_scale_target = pld.window(cp_prefill_moe_scale_target_buf, [CP_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
-            cp_prefill_moe_reverse_target = pld.window(cp_prefill_moe_reverse_target_buf, [CP_MOE_TOTAL_CAP, D], dtype=pl.BF16)
-            cp_prefill_moe_reverse_signal = pld.window(cp_prefill_moe_reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-            entry_header_window = pld.window(entry_header_window_buf, [1, 16], dtype=pl.INT32)
-            entry_input_window = pld.window(entry_input_window_buf, [CP_EXCHANGE_LOCAL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
-            entry_ids_window = pld.window(entry_ids_window_buf, [1, CP_EXCHANGE_LOCAL_ROWS * 2], dtype=pl.INT32)
-            entry_tables_window = pld.window(entry_tables_window_buf, [7, CP_EXCHANGE_CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
-            entry_ready = pld.window(entry_ready_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
-            entry_hidden_window = pld.window(entry_hidden_window_buf, [CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
-            entry_pre_hc_tail_window = pld.window(entry_pre_hc_tail_window_buf, [CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
-            entry_complete = pld.window(entry_complete_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
-            entry_barrier_epochs = pld.window(entry_barrier_epochs_buf, [CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
-            x_hc_rank = x_hc[r]
-            hidden_rank = hidden_out[r]
-            position_ids_rank = position_ids[r]
-            input_ids_rank = input_ids[r]
-            _prefill_request(
-                x_hc_rank,
-                hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
-                attn_norm_w[r],
-                wq_a[r], wq_b[r], wq_b_scale[r],
-                wkv[r],
-                gamma_cq[r], gamma_ckv[r],
-                kv_cache[r],
-                attn_sink[r],
-                wo_a[r], wo_b[r], wo_b_scale[r],
-                hca_cmp_kv[r], csa_cmp_kv[r],
-                hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
-                hca_compress_state[r],
-                csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
-                csa_compress_state[r],
-                csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r],
-                csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
-                csa_inner_compress_state[r],
-                idx_kv_cache[r], idx_kv_scale[r],
-                hca_compress_state_block_table[r],
-                csa_compress_state_block_table[r],
-                csa_inner_compress_state_block_table[r],
-                freqs_cos[r], freqs_sin[r],
-                ori_block_table[r], hca_cmp_block_table[r], csa_cmp_block_table[r], idx_block_table[r],
-                position_ids_rank, input_ids_rank,
-                hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
-                final_norm_w[r],
-                pre_hc_hidden_out[r],
-                hidden_rank,
-                hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
-                norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
-                routed_w1[r], routed_w1_scale[r],
-                routed_w3[r], routed_w3_scale[r],
-                routed_w2[r], routed_w2_scale[r],
-                shared_w1[r], shared_w1_scale[r],
-                shared_w3[r], shared_w3_scale[r],
-                shared_w2[r], shared_w2_scale[r],
-                num_tokens_per_owner,
-                cp_hidden_tail_window, cp_tail_ready, cp_tail_consumed, cp_cmp_window,
-                cp_cmp_meta_window, cp_state_window, cp_state_meta_window, cp_hca_compact_ready,
-                cp_hca_compact_consumed, cp_main_window, cp_idx_window, cp_scale_window, cp_record_window,
-                cp_main_state_window, cp_main_state_meta_window, cp_inner_state_window, cp_inner_state_meta_window,
-                cp_csa_compact_ready, cp_csa_compact_consumed, cp_count_target, cp_count_signal,
-                cp_prefill_moe_x_target, cp_prefill_moe_x_signal, cp_prefill_moe_scale_target,
-                cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
-                entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
-                entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_barrier_epochs,
-                request_owner, r,
-                device=r,
-            )
+    # One chip invocation per rank processes the owners sequentially.
+    for r in pl.range(pld.world_size()):
+        cp_hidden_tail_window = pld.window(cp_hidden_tail_window_buf, [CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
+        cp_tail_ready = pld.window(cp_tail_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_tail_consumed = pld.window(cp_tail_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_cmp_window = pld.window(cp_cmp_window_buf, [CMP_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
+        cp_cmp_meta_window = pld.window(cp_cmp_meta_window_buf, [CMP_WINDOW_ROWS, CMP_META_DIM], dtype=pl.INT32)
+        cp_state_window = pld.window(cp_state_window_buf, [STATE_WINDOW_ROWS, HCA_COMPRESS_STATE_DIM], dtype=pl.FP32)
+        cp_state_meta_window = pld.window(cp_state_meta_window_buf, [CP_SIZE, STATE_META_DIM], dtype=pl.INT32)
+        cp_hca_compact_ready = pld.window(cp_hca_compact_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_hca_compact_consumed = pld.window(cp_hca_compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_main_window = pld.window(cp_main_window_buf, [RECORDS_PER_WINDOW, CSA_MAIN_OUT_DIM], dtype=pl.BF16)
+        cp_idx_window = pld.window(cp_idx_window_buf, [RECORDS_PER_WINDOW, IDX_HEAD_DIM], dtype=pl.INT8)
+        cp_scale_window = pld.window(cp_scale_window_buf, [RECORDS_PER_WINDOW, SCALE_TILE_COLS], dtype=pl.FP16)
+        cp_record_window = pld.window(cp_record_window_buf, [RECORDS_PER_WINDOW, META_DIM], dtype=pl.INT32)
+        cp_main_state_window = pld.window(cp_main_state_window_buf, [STATE_RECORDS_PER_WINDOW, CSA_COMPRESS_STATE_DIM], dtype=pl.FP32)
+        cp_main_state_meta_window = pld.window(cp_main_state_meta_window_buf, [STATE_RECORDS_PER_WINDOW, STATE_META_DIM], dtype=pl.INT32)
+        cp_inner_state_window = pld.window(cp_inner_state_window_buf, [STATE_RECORDS_PER_WINDOW, CSA_INNER_COMPRESS_STATE_DIM], dtype=pl.FP32)
+        cp_inner_state_meta_window = pld.window(cp_inner_state_meta_window_buf, [STATE_RECORDS_PER_WINDOW, STATE_META_DIM], dtype=pl.INT32)
+        cp_csa_compact_ready = pld.window(cp_csa_compact_ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_csa_compact_consumed = pld.window(cp_csa_compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
+        cp_count_target = pld.window(cp_count_target_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        cp_count_signal = pld.window(cp_count_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        cp_prefill_moe_x_target = pld.window(cp_prefill_moe_x_target_buf, [CP_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        cp_prefill_moe_x_signal = pld.window(cp_prefill_moe_x_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        cp_prefill_moe_scale_target = pld.window(cp_prefill_moe_scale_target_buf, [CP_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
+        cp_prefill_moe_reverse_target = pld.window(cp_prefill_moe_reverse_target_buf, [CP_MOE_TOTAL_CAP, D], dtype=pl.BF16)
+        cp_prefill_moe_reverse_signal = pld.window(cp_prefill_moe_reverse_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
+        entry_header_window = pld.window(entry_header_window_buf, [1, 16], dtype=pl.INT32)
+        entry_input_window = pld.window(entry_input_window_buf, [CP_EXCHANGE_LOCAL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
+        entry_ids_window = pld.window(entry_ids_window_buf, [1, CP_EXCHANGE_LOCAL_ROWS * 2], dtype=pl.INT32)
+        entry_tables_window = pld.window(entry_tables_window_buf, [7, CP_EXCHANGE_CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
+        entry_ready = pld.window(entry_ready_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
+        entry_hidden_window = pld.window(entry_hidden_window_buf, [CP_EXCHANGE_CP_REQUEST_CAPACITY, CP_EXCHANGE_D], dtype=pl.BF16)
+        entry_pre_hc_tail_window = pld.window(entry_pre_hc_tail_window_buf, [CP_EXCHANGE_NUM_SEGMENTS * CP_EXCHANGE_TAIL_ROWS, CP_EXCHANGE_CP_REQUEST_HC_DIM], dtype=pl.FP32)
+        entry_complete = pld.window(entry_complete_buf, [CP_EXCHANGE_CP_SIZE, 1], dtype=pl.INT32)
+        entry_barrier_epochs = pld.window(entry_barrier_epochs_buf, [CP_EXCHANGE_CP_SIZE, 16], dtype=pl.INT32)
+        x_hc_rank = x_hc[r]
+        hidden_rank = hidden_out[r]
+        position_ids_rank = position_ids[r]
+        input_ids_rank = input_ids[r]
+        _prefill_request(
+            x_hc_rank,
+            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r],
+            wq_a[r], wq_b[r], wq_b_scale[r],
+            wkv[r],
+            gamma_cq[r], gamma_ckv[r],
+            kv_cache[r],
+            attn_sink[r],
+            wo_a[r], wo_b[r], wo_b_scale[r],
+            hca_cmp_kv[r], csa_cmp_kv[r],
+            hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
+            hca_compress_state[r],
+            csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
+            csa_compress_state[r],
+            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r],
+            csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
+            csa_inner_compress_state[r],
+            idx_kv_cache[r], idx_kv_scale[r],
+            hca_compress_state_block_table[r],
+            csa_compress_state_block_table[r],
+            csa_inner_compress_state_block_table[r],
+            freqs_cos[r], freqs_sin[r],
+            ori_block_table[r], hca_cmp_block_table[r], csa_cmp_block_table[r], idx_block_table[r],
+            position_ids_rank, input_ids_rank,
+            hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
+            final_norm_w[r],
+            pre_hc_hidden_out[r],
+            hidden_rank,
+            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
+            norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+            routed_w1[r], routed_w1_scale[r],
+            routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r],
+            shared_w1[r], shared_w1_scale[r],
+            shared_w3[r], shared_w3_scale[r],
+            shared_w2[r], shared_w2_scale[r],
+            num_tokens_per_owner,
+            cp_hidden_tail_window, cp_tail_ready, cp_tail_consumed, cp_cmp_window,
+            cp_cmp_meta_window, cp_state_window, cp_state_meta_window, cp_hca_compact_ready,
+            cp_hca_compact_consumed, cp_main_window, cp_idx_window, cp_scale_window, cp_record_window,
+            cp_main_state_window, cp_main_state_meta_window, cp_inner_state_window, cp_inner_state_meta_window,
+            cp_csa_compact_ready, cp_csa_compact_consumed, cp_count_target, cp_count_signal,
+            cp_prefill_moe_x_target, cp_prefill_moe_x_signal, cp_prefill_moe_scale_target,
+            cp_prefill_moe_reverse_target, cp_prefill_moe_reverse_signal,
+            entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
+            entry_hidden_window, entry_pre_hc_tail_window, entry_complete, entry_barrier_epochs,
+            r,
+            device=r,
+        )
 
     # Grouped LM head: the N_RANKS DP world is cut into N_RANKS // LM_HEAD_TP_SIZE
     # groups. Every card is both an owner and a TP rank, so the single lm_head

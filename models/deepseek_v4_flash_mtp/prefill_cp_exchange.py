@@ -109,6 +109,15 @@ CP_REQUEST_MAIN_TABLE_COLS = (MAX_SEQ_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_S
 CP_REQUEST_INNER_TABLE_COLS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 CP_REQUEST_TABLE_COLS = max(PREFILL_ORI_MAX_BLOCKS, PREFILL_CMP_MAX_BLOCKS,
     HCA_STATE_MAX_BLOCKS, CP_REQUEST_MAIN_TABLE_COLS, CP_REQUEST_INNER_TABLE_COLS)
+# Complete page-table transfer tile.
+_CP_REQUEST_TABLE_TILE = min(
+    CP_REQUEST_COPY_COLS, PREFILL_ORI_MAX_BLOCKS, PREFILL_CMP_MAX_BLOCKS,
+    HCA_STATE_MAX_BLOCKS, CP_REQUEST_MAIN_TABLE_COLS, CP_REQUEST_INNER_TABLE_COLS,
+)
+assert all(cols % _CP_REQUEST_TABLE_TILE == 0 for cols in (
+    PREFILL_ORI_MAX_BLOCKS, PREFILL_CMP_MAX_BLOCKS, HCA_STATE_MAX_BLOCKS,
+    CP_REQUEST_MAIN_TABLE_COLS, CP_REQUEST_INNER_TABLE_COLS,
+))
 
 
 @pl.jit.inline
@@ -222,37 +231,37 @@ def _prefill_cp_scatter_request(
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=ori_block_table,
                         dst_offsets=[0, 0], src_offsets=[0, 0], shape=[1, PREFILL_ORI_MAX_BLOCKS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=hca_cmp_block_table,
                         dst_offsets=[1, 0], src_offsets=[0, 0], shape=[1, PREFILL_CMP_MAX_BLOCKS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=csa_cmp_block_table,
                         dst_offsets=[2, 0], src_offsets=[0, 0], shape=[1, PREFILL_CMP_MAX_BLOCKS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=idx_block_table,
                         dst_offsets=[3, 0], src_offsets=[0, 0], shape=[1, PREFILL_CMP_MAX_BLOCKS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=hca_compress_state_block_table,
                         dst_offsets=[4, 0], src_offsets=[0, 0], shape=[1, HCA_STATE_MAX_BLOCKS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=csa_compress_state_block_table,
                         dst_offsets=[5, 0], src_offsets=[0, 0], shape=[1, CP_REQUEST_MAIN_TABLE_COLS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
                     pld.tensor.put(
                         dst=tables_window, peer=peer, src=csa_inner_compress_state_block_table,
                         dst_offsets=[6, 0], src_offsets=[0, 0], shape=[1, CP_REQUEST_INNER_TABLE_COLS],
-                        chunk_rows=1, chunk_cols=16,
+                        chunk_rows=1, chunk_cols=_CP_REQUEST_TABLE_TILE,
                     )
             for peer in pl.range(CP_SIZE):
                 if peer != my_rank:
@@ -271,27 +280,27 @@ def _prefill_cp_scatter_request(
             received_words = pl.load(ids_window, [0, tile * ROW_TILE * 2], [1, ROW_TILE * 2])
             received_ids = pl.reinterpret_view(received_words, pl.INT64)
             pl.store(received_ids, [0, tile * ROW_TILE], local_input_ids)
-        for table_chunk in pl.range(PREFILL_ORI_MAX_BLOCKS // 16):
-            received_page = pl.load(tables_window, [0, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_ori_block_table)
-        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // 16):
-            received_page = pl.load(tables_window, [1, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_hca_cmp_block_table)
-        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // 16):
-            received_page = pl.load(tables_window, [2, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_csa_cmp_block_table)
-        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // 16):
-            received_page = pl.load(tables_window, [3, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_idx_block_table)
-        for table_chunk in pl.range(HCA_STATE_MAX_BLOCKS // 16):
-            received_page = pl.load(tables_window, [4, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_hca_compress_state_block_table)
-        for table_chunk in pl.range(CP_REQUEST_MAIN_TABLE_COLS // 16):
-            received_page = pl.load(tables_window, [5, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_csa_compress_state_block_table)
-        for table_chunk in pl.range(CP_REQUEST_INNER_TABLE_COLS // 16):
-            received_page = pl.load(tables_window, [6, table_chunk * 16], [1, 16])
-            pl.store(received_page, [0, table_chunk * 16], local_csa_inner_compress_state_block_table)
+        for table_chunk in pl.range(PREFILL_ORI_MAX_BLOCKS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [0, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_ori_block_table)
+        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [1, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_hca_cmp_block_table)
+        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [2, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_csa_cmp_block_table)
+        for table_chunk in pl.range(PREFILL_CMP_MAX_BLOCKS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [3, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_idx_block_table)
+        for table_chunk in pl.range(HCA_STATE_MAX_BLOCKS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [4, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_hca_compress_state_block_table)
+        for table_chunk in pl.range(CP_REQUEST_MAIN_TABLE_COLS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [5, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_csa_compress_state_block_table)
+        for table_chunk in pl.range(CP_REQUEST_INNER_TABLE_COLS // _CP_REQUEST_TABLE_TILE):
+            received_page = pl.load(tables_window, [6, table_chunk * _CP_REQUEST_TABLE_TILE], [1, _CP_REQUEST_TABLE_TILE])
+            pl.store(received_page, [0, table_chunk * _CP_REQUEST_TABLE_TILE], local_csa_inner_compress_state_block_table)
     # The only sender has finished publishing before receivers clear this bank.
     for peer in pl.range(CP_SIZE):
         pl.write(ready, [peer, 0], pl.cast(0, pl.INT32))
@@ -967,109 +976,111 @@ def _prefill_cp_request_test(
     hidden_out: pl.InOut[pl.Tensor[[CP_REQUEST_TOKENS_DYN, D], pl.BF16]],
     tail_out: pl.InOut[pl.Tensor[[TAIL_ROWS, CP_REQUEST_HC_DIM], pl.FP32]],
     audit: pl.InOut[pl.Tensor[[CP_SIZE, 9, CP_REQUEST_TABLE_COLS], pl.INT32]],
-    request_owner: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
+    # Reuse scratch after the preceding owner completion read.
     header = pl.create_tensor([1, 16], dtype=pl.INT32)
-    if request_owner == 0:
-        for row in pl.spmd(CP_SIZE * 9):
-            for col in pl.range(CP_REQUEST_TABLE_COLS // 128):
-                zeros = pl.tile.full([1, 1, 128], value=0, dtype=pl.INT32)
-                pl.store(zeros, [row // 9, row % 9, col * 128], audit)
-        for row in pl.spmd(CP_REQUEST_CAPACITY // ROW_TILE):
-            for col in pl.range(D // CP_REQUEST_COPY_COLS):
-                zero = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
-                pl.store(zero, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], hidden_out)
-        for row in pl.spmd(TAIL_ROWS // ROW_TILE):
-            for col in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
-                zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
-                pl.store(zero_tail, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], tail_out)
-    if pl.read(num_tokens_per_owner, [request_owner]) > 0:
-        control = pl.create_tensor([1, 16], dtype=pl.INT32)
-        local_x_hc = pl.create_tensor([LOCAL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
-        local_input_ids = pl.create_tensor([1, LOCAL_ROWS], dtype=pl.INT64)
-        local_ori_block_table = pl.create_tensor([1, PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
-        local_hca_cmp_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_csa_cmp_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_idx_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-        local_hca_compress_state_block_table = pl.create_tensor([1, HCA_STATE_MAX_BLOCKS], dtype=pl.INT32)
-        local_csa_compress_state_block_table = pl.create_tensor([1, CP_REQUEST_MAIN_TABLE_COLS], dtype=pl.INT32)
-        local_csa_inner_compress_state_block_table = pl.create_tensor([1, CP_REQUEST_INNER_TABLE_COLS], dtype=pl.INT32)
-        _prefill_cp_request_header(num_tokens_per_owner, position_ids, header, request_owner, my_rank)
-        (
-            control,
-            local_x_hc,
-            local_input_ids,
-            local_ori_block_table,
-            local_hca_cmp_block_table,
-            local_csa_cmp_block_table,
-            local_idx_block_table,
-            local_hca_compress_state_block_table,
-            local_csa_compress_state_block_table,
-            local_csa_inner_compress_state_block_table,
-        ) = _prefill_cp_scatter_request(
-            header, x_hc, input_ids,
-            ori_block_table, hca_cmp_block_table, csa_cmp_block_table, idx_block_table,
-            hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table,
-            header_window, input_window, ids_window, tables_window, ready,
-            control, local_x_hc, local_input_ids,
-            local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
-            local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table,
+    control = pl.create_tensor([1, 16], dtype=pl.INT32)
+    local_x_hc = pl.create_tensor([LOCAL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
+    local_input_ids = pl.create_tensor([1, LOCAL_ROWS], dtype=pl.INT64)
+    local_ori_block_table = pl.create_tensor([1, PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
+    local_hca_cmp_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_csa_cmp_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_idx_block_table = pl.create_tensor([1, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    local_hca_compress_state_block_table = pl.create_tensor([1, HCA_STATE_MAX_BLOCKS], dtype=pl.INT32)
+    local_csa_compress_state_block_table = pl.create_tensor([1, CP_REQUEST_MAIN_TABLE_COLS], dtype=pl.INT32)
+    local_csa_inner_compress_state_block_table = pl.create_tensor([1, CP_REQUEST_INNER_TABLE_COLS], dtype=pl.INT32)
+    local_hidden = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
+    for request_owner in pl.range(CP_SIZE):
+        if request_owner == 0:
+            for row in pl.spmd(CP_SIZE * 9):
+                for col in pl.range(CP_REQUEST_TABLE_COLS // 128):
+                    zeros = pl.tile.full([1, 1, 128], value=0, dtype=pl.INT32)
+                    pl.store(zeros, [row // 9, row % 9, col * 128], audit)
+            for row in pl.spmd(CP_REQUEST_CAPACITY // ROW_TILE):
+                for col in pl.range(D // CP_REQUEST_COPY_COLS):
+                    zero = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.BF16)
+                    pl.store(zero, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], hidden_out)
+            for row in pl.spmd(TAIL_ROWS // ROW_TILE):
+                for col in pl.range(CP_REQUEST_HC_DIM // CP_REQUEST_COPY_COLS):
+                    zero_tail = pl.tile.full([ROW_TILE, CP_REQUEST_COPY_COLS], value=0.0, dtype=pl.FP32)
+                    pl.store(zero_tail, [row * ROW_TILE, col * CP_REQUEST_COPY_COLS], tail_out)
+        if pl.read(num_tokens_per_owner, [request_owner]) > 0:
+            _prefill_cp_request_header(num_tokens_per_owner, position_ids, header, request_owner, my_rank)
+            (
+                control,
+                local_x_hc,
+                local_input_ids,
+                local_ori_block_table,
+                local_hca_cmp_block_table,
+                local_csa_cmp_block_table,
+                local_idx_block_table,
+                local_hca_compress_state_block_table,
+                local_csa_compress_state_block_table,
+                local_csa_inner_compress_state_block_table,
+            ) = _prefill_cp_scatter_request(
+                header, x_hc, input_ids,
+                ori_block_table, hca_cmp_block_table, csa_cmp_block_table, idx_block_table,
+                hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table,
+                header_window, input_window, ids_window, tables_window, ready,
+                control, local_x_hc, local_input_ids,
+                local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
+                local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table,
+                my_rank,
+            )
+            ids_flat = pl.reshape(local_input_ids, [1, 1, LOCAL_ROWS])
+            metadata = pl.reshape(control, [1, 1, 16])
+            table_2 = pl.reshape(local_ori_block_table, [1, 1, PREFILL_ORI_MAX_BLOCKS])
+            table_3 = pl.reshape(local_hca_cmp_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
+            table_4 = pl.reshape(local_csa_cmp_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
+            table_5 = pl.reshape(local_idx_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
+            table_6 = pl.reshape(local_hca_compress_state_block_table, [1, 1, HCA_STATE_MAX_BLOCKS])
+            table_7 = pl.reshape(local_csa_compress_state_block_table, [1, 1, CP_REQUEST_MAIN_TABLE_COLS])
+            table_8 = pl.reshape(local_csa_inner_compress_state_block_table, [1, 1, CP_REQUEST_INNER_TABLE_COLS])
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="capture_request_metadata"):
+                for col in pl.range(LOCAL_ROWS * 2 // 128):
+                    ids = pl.load(ids_flat, [0, 0, col * 64], [1, 1, 64])
+                    ids_words = pl.reinterpret_view(ids, pl.INT32)
+                    pl.store(ids_words, [request_owner, 0, col * 128], audit)
+                control_values = pl.load(metadata, [0, 0, 0], [1, 1, 16])
+                pl.store(control_values, [request_owner, 1, 0], audit)
+                for col in pl.range(PREFILL_ORI_MAX_BLOCKS // 128):
+                    values_2 = pl.load(table_2, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_2, [request_owner, 2, col * 128], audit)
+                for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
+                    values_3 = pl.load(table_3, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_3, [request_owner, 3, col * 128], audit)
+                for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
+                    values_4 = pl.load(table_4, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_4, [request_owner, 4, col * 128], audit)
+                for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
+                    values_5 = pl.load(table_5, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_5, [request_owner, 5, col * 128], audit)
+                for col in pl.range(HCA_STATE_MAX_BLOCKS // 128):
+                    values_6 = pl.load(table_6, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_6, [request_owner, 6, col * 128], audit)
+                for col in pl.range(CP_REQUEST_MAIN_TABLE_COLS // 128):
+                    values_7 = pl.load(table_7, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_7, [request_owner, 7, col * 128], audit)
+                for col in pl.range(CP_REQUEST_INNER_TABLE_COLS // 128):
+                    values_8 = pl.load(table_8, [0, 0, col * 128], [1, 1, 128])
+                    pl.store(values_8, [request_owner, 8, col * 128], audit)
+            for block in pl.spmd(LOCAL_ROWS // ROW_TILE):
+                for col in pl.range(D // CP_REQUEST_COPY_COLS):
+                    values = pl.load(local_x_hc, [block * ROW_TILE, col * CP_REQUEST_COPY_COLS], [ROW_TILE, CP_REQUEST_COPY_COLS])
+                    rounded = pl.cast(values, pl.BF16, mode="rint")
+                    pl.store(rounded, [block * ROW_TILE, col * CP_REQUEST_COPY_COLS], local_hidden)
+            _prefill_cp_gather_hidden(
+                control, local_hidden, local_x_hc,
+                hidden_window, tail_window, complete,
+                hidden_out, tail_out, my_rank,
+            )
+        _prefill_cp_request_barrier(
+            hidden_out, tail_out, request_barrier_epochs,
+            ready, ready, ready, ready, ready, ready, ready, ready, ready, ready,
             my_rank,
         )
-        ids_flat = pl.reshape(local_input_ids, [1, 1, LOCAL_ROWS])
-        metadata = pl.reshape(control, [1, 1, 16])
-        table_2 = pl.reshape(local_ori_block_table, [1, 1, PREFILL_ORI_MAX_BLOCKS])
-        table_3 = pl.reshape(local_hca_cmp_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
-        table_4 = pl.reshape(local_csa_cmp_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
-        table_5 = pl.reshape(local_idx_block_table, [1, 1, PREFILL_CMP_MAX_BLOCKS])
-        table_6 = pl.reshape(local_hca_compress_state_block_table, [1, 1, HCA_STATE_MAX_BLOCKS])
-        table_7 = pl.reshape(local_csa_compress_state_block_table, [1, 1, CP_REQUEST_MAIN_TABLE_COLS])
-        table_8 = pl.reshape(local_csa_inner_compress_state_block_table, [1, 1, CP_REQUEST_INNER_TABLE_COLS])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="capture_request_metadata"):
-            for col in pl.range(LOCAL_ROWS * 2 // 128):
-                ids = pl.load(ids_flat, [0, 0, col * 64], [1, 1, 64])
-                ids_words = pl.reinterpret_view(ids, pl.INT32)
-                pl.store(ids_words, [request_owner, 0, col * 128], audit)
-            control_values = pl.load(metadata, [0, 0, 0], [1, 1, 16])
-            pl.store(control_values, [request_owner, 1, 0], audit)
-            for col in pl.range(PREFILL_ORI_MAX_BLOCKS // 128):
-                values_2 = pl.load(table_2, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_2, [request_owner, 2, col * 128], audit)
-            for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
-                values_3 = pl.load(table_3, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_3, [request_owner, 3, col * 128], audit)
-            for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
-                values_4 = pl.load(table_4, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_4, [request_owner, 4, col * 128], audit)
-            for col in pl.range(PREFILL_CMP_MAX_BLOCKS // 128):
-                values_5 = pl.load(table_5, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_5, [request_owner, 5, col * 128], audit)
-            for col in pl.range(HCA_STATE_MAX_BLOCKS // 128):
-                values_6 = pl.load(table_6, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_6, [request_owner, 6, col * 128], audit)
-            for col in pl.range(CP_REQUEST_MAIN_TABLE_COLS // 128):
-                values_7 = pl.load(table_7, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_7, [request_owner, 7, col * 128], audit)
-            for col in pl.range(CP_REQUEST_INNER_TABLE_COLS // 128):
-                values_8 = pl.load(table_8, [0, 0, col * 128], [1, 1, 128])
-                pl.store(values_8, [request_owner, 8, col * 128], audit)
-        local_hidden = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
-        for block in pl.spmd(LOCAL_ROWS // ROW_TILE):
-            for col in pl.range(D // CP_REQUEST_COPY_COLS):
-                values = pl.load(local_x_hc, [block * ROW_TILE, col * CP_REQUEST_COPY_COLS], [ROW_TILE, CP_REQUEST_COPY_COLS])
-                rounded = pl.cast(values, pl.BF16, mode="rint")
-                pl.store(rounded, [block * ROW_TILE, col * CP_REQUEST_COPY_COLS], local_hidden)
-        _prefill_cp_gather_hidden(
-            control, local_hidden, local_x_hc,
-            hidden_window, tail_window, complete,
-            hidden_out, tail_out, my_rank,
-        )
-    _prefill_cp_request_barrier(
-        hidden_out, tail_out, request_barrier_epochs,
-        ready, ready, ready, ready, ready, ready, ready, ready, ready, ready,
-        my_rank,
-    )
+        _owner_complete = pl.read(request_barrier_epochs, [my_rank, 0])
     return hidden_out, tail_out
 
 
@@ -1103,27 +1114,26 @@ def prefill_cp_exchange_test(
     complete_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
     request_barrier_epochs_buf = pld.alloc_window_buffer([CP_SIZE, 16], dtype=pl.INT32)
     for repetition in pl.range(3):
-        for request_owner in pl.range(CP_SIZE):
-            for rank in pl.range(CP_SIZE):
-                hidden_window = pld.window(hidden_window_buf, [CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
-                tail_window = pld.window(tail_window_buf, [NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
-                complete = pld.window(complete_buf, [CP_SIZE, 1], dtype=pl.INT32)
-                request_barrier_epochs = pld.window(request_barrier_epochs_buf, [CP_SIZE, 16], dtype=pl.INT32)
-                header_window = pld.window(header_window_buf, [1, 16], dtype=pl.INT32)
-                input_window = pld.window(input_window_buf, [LOCAL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
-                ids_window = pld.window(ids_window_buf, [1, LOCAL_ROWS * 2], dtype=pl.INT32)
-                tables_window = pld.window(tables_window_buf, [7, CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
-                ready = pld.window(ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
-                _prefill_cp_request_test(
-                    num_tokens_per_owner, position_ids[rank], x_hc[rank], input_ids[rank],
-                    ori_block_table[rank], hca_cmp_block_table[rank], csa_cmp_block_table[rank], idx_block_table[rank],
-                    hca_compress_state_block_table[rank], csa_compress_state_block_table[rank], csa_inner_compress_state_block_table[rank],
-                    header_window, input_window, ids_window, tables_window, ready,
-                    hidden_window, tail_window, complete, request_barrier_epochs,
-                    hidden_out[rank], tail_out[rank], audit[rank],
-                    request_owner, rank,
-                    device=rank,
-                )
+        for rank in pl.range(CP_SIZE):
+            hidden_window = pld.window(hidden_window_buf, [CP_REQUEST_CAPACITY, D], dtype=pl.BF16)
+            tail_window = pld.window(tail_window_buf, [NUM_SEGMENTS * TAIL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
+            complete = pld.window(complete_buf, [CP_SIZE, 1], dtype=pl.INT32)
+            request_barrier_epochs = pld.window(request_barrier_epochs_buf, [CP_SIZE, 16], dtype=pl.INT32)
+            header_window = pld.window(header_window_buf, [1, 16], dtype=pl.INT32)
+            input_window = pld.window(input_window_buf, [LOCAL_ROWS, CP_REQUEST_HC_DIM], dtype=pl.FP32)
+            ids_window = pld.window(ids_window_buf, [1, LOCAL_ROWS * 2], dtype=pl.INT32)
+            tables_window = pld.window(tables_window_buf, [7, CP_REQUEST_TABLE_COLS], dtype=pl.INT32)
+            ready = pld.window(ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
+            _prefill_cp_request_test(
+                num_tokens_per_owner, position_ids[rank], x_hc[rank], input_ids[rank],
+                ori_block_table[rank], hca_cmp_block_table[rank], csa_cmp_block_table[rank], idx_block_table[rank],
+                hca_compress_state_block_table[rank], csa_compress_state_block_table[rank], csa_inner_compress_state_block_table[rank],
+                header_window, input_window, ids_window, tables_window, ready,
+                hidden_window, tail_window, complete, request_barrier_epochs,
+                hidden_out[rank], tail_out[rank], audit[rank],
+                rank,
+                device=rank,
+            )
 
 
 def golden_prefill_cp_exchange(tensors):
@@ -1244,7 +1254,12 @@ def main():
             compile_only=args.compile_only,
             runtime_dir=runtime_dir,
             save_data=False,
-            config=dict(platform=args.platform, distributed_config=DistributedConfig(device_ids=devices)),
+            # Two active owners must fit by reusing one scratch allocation.
+            config=dict(
+                platform=args.platform,
+                distributed_config=DistributedConfig(device_ids=devices),
+                ring_heap=128 * 1024**2,
+            ),
         )
         if not result.passed:
             raise RuntimeError(result.error)
