@@ -125,6 +125,7 @@ FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 
 FWD_TOKENS_DYN = pl.dynamic("PREFILL_FWD_TOKENS_DYN")
+FWD_INPUT_STREAMS_DYN = pl.dynamic("PREFILL_FWD_INPUT_STREAMS_DYN")
 PRE_HC_COPY_TOKEN_TILE = 4
 assert T % PRE_HC_COPY_TOKEN_TILE == 0
 
@@ -292,47 +293,54 @@ def _fwd_attention_stage_barrier_from_x_attn(
 
 
 @pl.jit.inline
-def _fwd_pack_moe_inputs(
+def _fwd_prepare_moe_inputs(
     x_attn: pl.Tensor[[CP_LOCAL_ROWS, HC_MULT, D], pl.FP32],
     input_ids: pl.Tensor[[CP_LOCAL_ROWS], pl.INT64],
     active_flat: pl.Tensor[[NUM_ATTN_TILES, OVERLAY_SOURCES], pl.INT32],
-    packed_x: pl.Tensor[[CP_LOCAL_ROWS, HC_MULT, D], pl.FP32],
-    packed_ids: pl.Tensor[[CP_LOCAL_ROWS], pl.INT64],
     attention_done_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.INT32]:
-    """Pack the two real segment prefixes and zero the unused MoE capacity."""
+) -> tuple[
+    pl.Tensor[[CP_LOCAL_ROWS, HC_MULT, D], pl.FP32],
+    pl.Tensor[[CP_LOCAL_ROWS], pl.INT64],
+    pl.Scalar[pl.INT32],
+]:
+    """Reuse contiguous full slabs; otherwise pack the live segment prefixes."""
     first_tokens = pl.cast(0, pl.INDEX)
     second_tokens = pl.cast(0, pl.INDEX)
     for tile in pl.range(MAX_SEGMENT_TILES):
         first_tokens = first_tokens + pl.cast(pl.read(active_flat, [tile, 1]), pl.INDEX)
         second_tokens = second_tokens + pl.cast(pl.read(active_flat, [MAX_SEGMENT_TILES + tile, 1]), pl.INDEX)
     active_tokens = first_tokens + second_tokens
-    for block in pl.spmd(
-        (CP_LOCAL_ROWS // PRE_HC_COPY_TOKEN_TILE) * HC_MULT,
-        name_hint="pack_moe_hidden", deps=[attention_done_tid],
-    ):
-        row0 = (block // HC_MULT) * PRE_HC_COPY_TOKEN_TILE
-        hc_lane = block % HC_MULT
-        for lane in pl.range(PRE_HC_COPY_TOKEN_TILE):
-            row = row0 + lane
-            if row < active_tokens:
-                source = row
-                if row >= first_tokens:
-                    source = MAX_SEGMENT_TILES * ATTN_TILE_ROWS + row - first_tokens
-                packed_x[row : row + 1, hc_lane : hc_lane + 1, :] = pl.slice(x_attn, [1, 1, D], [source, hc_lane, 0])
-            else:
-                packed_x[row : row + 1, hc_lane : hc_lane + 1, :] = pl.full([1, 1, D], dtype=pl.FP32, value=0.0)
-    for block in pl.spmd(CP_LOCAL_ROWS // MOE_ID_COPY_TILE, name_hint="pack_moe_ids"):
-        for lane in pl.range(MOE_ID_COPY_TILE):
-            row = block * MOE_ID_COPY_TILE + lane
-            value = pl.cast(0, pl.INT64)
-            if row < active_tokens:
-                source = row
-                if row >= first_tokens:
-                    source = MAX_SEGMENT_TILES * ATTN_TILE_ROWS + row - first_tokens
-                value = pl.read(input_ids, [source])
-            pl.write(packed_ids, [row], value)
-    return pl.cast(active_tokens, pl.INT32)
+    packed_x = x_attn
+    packed_ids = input_ids
+    if active_tokens != CP_LOCAL_ROWS:
+        packed_x = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT, D], dtype=pl.FP32)
+        packed_ids = pl.create_tensor([CP_LOCAL_ROWS], dtype=pl.INT64)
+        for block in pl.spmd(
+            (CP_LOCAL_ROWS // PRE_HC_COPY_TOKEN_TILE) * HC_MULT,
+            name_hint="pack_moe_hidden", deps=[attention_done_tid],
+        ):
+            row0 = (block // HC_MULT) * PRE_HC_COPY_TOKEN_TILE
+            hc_lane = block % HC_MULT
+            for lane in pl.range(PRE_HC_COPY_TOKEN_TILE):
+                row = row0 + lane
+                if row < active_tokens:
+                    source = row
+                    if row >= first_tokens:
+                        source = MAX_SEGMENT_TILES * ATTN_TILE_ROWS + row - first_tokens
+                    packed_x[row : row + 1, hc_lane : hc_lane + 1, :] = pl.slice(x_attn, [1, 1, D], [source, hc_lane, 0])
+                else:
+                    packed_x[row : row + 1, hc_lane : hc_lane + 1, :] = pl.full([1, 1, D], dtype=pl.FP32, value=0.0)
+        for block in pl.spmd(CP_LOCAL_ROWS // MOE_ID_COPY_TILE, name_hint="pack_moe_ids"):
+            for lane in pl.range(MOE_ID_COPY_TILE):
+                row = block * MOE_ID_COPY_TILE + lane
+                value = pl.cast(0, pl.INT64)
+                if row < active_tokens:
+                    source = row
+                    if row >= first_tokens:
+                        source = MAX_SEGMENT_TILES * ATTN_TILE_ROWS + row - first_tokens
+                    value = pl.read(input_ids, [source])
+                pl.write(packed_ids, [row], value)
+    return packed_x, packed_ids, pl.cast(active_tokens, pl.INT32)
 
 
 @pl.jit.inline
@@ -434,14 +442,15 @@ def _fwd_moe_tail(
 ) -> pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32]:
     """Pack real CP rows, run one MoE slab, and restore the attention slots."""
     x_attn_flat = pl.reshape(x_attn, [CP_LOCAL_ROWS, HC_MULT, D])
-    x_next_work = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT, D], dtype=pl.FP32)
     active_flat = pl.reshape(overlay_active_lengths, [NUM_ATTN_TILES, OVERLAY_SOURCES])
     input_ids_flat = pl.reshape(input_ids, [CP_LOCAL_ROWS])
-    packed_x = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT, D], dtype=pl.FP32)
-    packed_ids = pl.create_tensor([CP_LOCAL_ROWS], dtype=pl.INT64)
-    active_tokens = _fwd_pack_moe_inputs(
-        x_attn_flat, input_ids_flat, active_flat, packed_x, packed_ids, attention_done_tid
+    packed_x, packed_ids, active_tokens = _fwd_prepare_moe_inputs(
+        x_attn_flat, input_ids_flat, active_flat, attention_done_tid
     )
+
+    x_next_work = pl.reshape(hidden_out, [CP_LOCAL_ROWS, HC_MULT, D])
+    if active_tokens != CP_LOCAL_ROWS:
+        x_next_work = pl.create_tensor([CP_LOCAL_ROWS, HC_MULT, D], dtype=pl.FP32)
 
     moe_dense_x = pl.create_tensor([CP_MOE_TOTAL_CAP, D], dtype=pl.INT8)
     moe_tid = cp_prefill_moe(
@@ -475,7 +484,8 @@ def _fwd_moe_tail(
         final_element = pl.slice(x_next_work, [1, 1, 8], [CP_LOCAL_ROWS - 1, 0, 0])
         completion_anchor[0:1, 0:1, 0:8] = final_element
 
-    hidden_out = _fwd_restore_hidden_layout(x_next_work, active_flat, hidden_out, moe_tid)
+    if active_tokens != CP_LOCAL_ROWS:
+        _restored_hidden = _fwd_restore_hidden_layout(x_next_work, active_flat, hidden_out, moe_tid)
     return hidden_out
 
 
@@ -1521,7 +1531,7 @@ from prefill_cp_exchange import (
 
 @pl.jit(auto_scope=False)
 def _prefill_request(
-    x_hc: pl.Tensor[[FWD_TOKENS_DYN, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[FWD_TOKENS_DYN, FWD_INPUT_STREAMS_DYN, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1693,7 +1703,6 @@ def _prefill_request(
                     pl.store(zero_tail, [row, stream, 0], pre_hc_hidden_out)
         if pl.read(num_tokens_per_owner, [request_owner]) > 0:
             request_rows = pl.tensor.dim(x_hc, 0)
-            input_x_flat = pl.reshape(x_hc, [request_rows, HC_DIM])
             input_ids_row = pl.reshape(input_ids, [1, request_rows])
             ori_block_table_row = pl.reshape(ori_block_table, [1, CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
             hca_cmp_block_table_row = pl.reshape(hca_cmp_block_table, [1, CP_EXCHANGE_PREFILL_CMP_MAX_BLOCKS])
@@ -1703,27 +1712,28 @@ def _prefill_request(
             csa_compress_state_block_table_row = pl.reshape(csa_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_MAIN_TABLE_COLS])
             csa_inner_compress_state_block_table_row = pl.reshape(csa_inner_compress_state_block_table, [1, CP_EXCHANGE_CP_REQUEST_INNER_TABLE_COLS])
             prepare_cp_request(num_tokens_per_owner, position_ids, header, request_owner, my_rank)
-            (control, local_x_hc, local_input_ids, local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table, local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table) = scatter_cp_request(
-                header,
-                input_x_flat,
-                input_ids_row,
-                ori_block_table_row,
-                hca_cmp_block_table_row,
-                csa_cmp_block_table_row,
-                idx_block_table_row,
-                hca_compress_state_block_table_row,
-                csa_compress_state_block_table_row,
-                csa_inner_compress_state_block_table_row,
-                entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
-                control,
-                local_x_hc,
-                local_input_ids,
-                local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
-                local_hca_compress_state_block_table,
-                local_csa_compress_state_block_table,
-                local_csa_inner_compress_state_block_table,
-                my_rank,
-            )
+            with pl.spmd(CP_SIZE):
+                (control, local_x_hc, local_input_ids, local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table, local_hca_compress_state_block_table, local_csa_compress_state_block_table, local_csa_inner_compress_state_block_table) = scatter_cp_request(
+                    header,
+                    x_hc,
+                    input_ids_row,
+                    ori_block_table_row,
+                    hca_cmp_block_table_row,
+                    csa_cmp_block_table_row,
+                    idx_block_table_row,
+                    hca_compress_state_block_table_row,
+                    csa_compress_state_block_table_row,
+                    csa_inner_compress_state_block_table_row,
+                    entry_header_window, entry_input_window, entry_ids_window, entry_tables_window, entry_ready,
+                    control,
+                    local_x_hc,
+                    local_input_ids,
+                    local_ori_block_table, local_hca_cmp_block_table, local_csa_cmp_block_table, local_idx_block_table,
+                    local_hca_compress_state_block_table,
+                    local_csa_compress_state_block_table,
+                    local_csa_inner_compress_state_block_table,
+                    my_rank,
+                )
             mode = pl.read(control, [0, 0])
             if mode == 1:
                 cp_ori_block_table = pl.reshape(local_ori_block_table, [CP_EXCHANGE_PREFILL_ORI_MAX_BLOCKS])
@@ -1844,7 +1854,7 @@ def _prefill_request(
 
 @pl.jit.host
 def l3_prefill_fwd(
-    x_hc: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, FWD_INPUT_STREAMS_DYN, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1934,6 +1944,7 @@ def l3_prefill_fwd(
 
     pl.static_assert(CP_SIZE == N_RANKS and CP_SIZE > 1, "Prefill requires CP=EP>1; CP1 is deferred.")
     x_hc.bind_dynamic(1, FWD_TOKENS_DYN)
+    x_hc.bind_dynamic(2, FWD_INPUT_STREAMS_DYN)
     hidden_out.bind_dynamic(1, FWD_TOKENS_DYN)
     ori_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
     position_ids.bind_dynamic(1, FWD_TOKENS_DYN)
