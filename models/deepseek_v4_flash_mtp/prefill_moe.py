@@ -48,13 +48,17 @@ from pypto.ir import DistributedConfig
 from config import FLASH as M, EP_WORLD_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
-from gate import gate
+from gate import make_gate
 from expert_shared import expert_shared
+
 from expert_routed import (
     ACT_INTER_TILE, D_OUT_TILE, D_OUT_ACT_TILE, INTER_K_TILE, K_TILE,
     MM_INTER_TILE, QUANT_TILE, RECV_TILE, W2_ACT_INNER, W2_INNER,
 )
 
+
+# Prefill router projection tiles.
+prefill_gate = pl.jit.inline(make_gate(token_tile_rows=128, hidden_tile_cols=256))
 
 # Per-rank capacity. --tokens picks a serving layout's share: a single 8192-token
 # batch over EP16 is 512 rows per rank.
@@ -1146,7 +1150,7 @@ def make_prefill_moe(layout: PrefillMoELayout):
         indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
         if num_tokens > 0:
-            gate(
+            prefill_gate(
                 x_mixed,
                 norm_w,
                 gate_w,

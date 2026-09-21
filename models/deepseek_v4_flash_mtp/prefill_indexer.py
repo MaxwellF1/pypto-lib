@@ -68,6 +68,8 @@ assert CP_INDEXER_SCORE_CAP % CP_INDEXER_LEAF_LEN == 0
 
 # tiling
 CACHE_TILE = 32
+CP_SCORE_CACHE_TILE = 128
+assert BLOCK_SIZE % CP_SCORE_CACHE_TILE == 0
 # Per-token sort-tile width. The sort32/mrgsort/gather path requires a wide tile: a narrow (256)
 # sort faults on device (507018) even with a proper prefix. 2048 matches the indexer KV length and
 # is the confirmed fault-free width. The real score occupies only the first INDEXER_SCORE_CAP
@@ -578,8 +580,8 @@ def _prefill_indexer_cp_score_topk(
         token0 = score_idx * SCORE_TOKEN_TILE
         last_pos = pl.read(position_ids, [num_tokens - 1])
         visible_limit = pl.min((last_pos + 1) // COMPRESS_RATIO, candidate_rows)
-        for cb in pl.range((visible_limit + CACHE_TILE - 1) // CACHE_TILE):
-            cache0 = cb * CACHE_TILE
+        for cb in pl.range((visible_limit + CP_SCORE_CACHE_TILE - 1) // CP_SCORE_CACHE_TILE):
+            cache0 = cb * CP_SCORE_CACHE_TILE
             logical_block = cache0 // BLOCK_SIZE
             page_offset = cache0 % BLOCK_SIZE
             if visible_limit > cache0 and logical_block < IDX_CACHE_MAX_BLOCKS:
@@ -587,9 +589,9 @@ def _prefill_indexer_cp_score_topk(
                 # Recipes page 0 is a zero sentinel, never a data page.
                 if physical_block_raw > 0 and physical_block_raw < idx_block_num:
                     kv_row0 = (pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE + page_offset)
-                    kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CACHE_TILE, 0:IDX_HEAD_DIM]
+                    kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, 0:IDX_HEAD_DIM]
                     kv_cache_scale_dq = pl.cast(
-                        kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :],
+                        kv_scale_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, :],
                         target_type=pl.FP32,
                         mode="none",
                     )
@@ -613,18 +615,18 @@ def _prefill_indexer_cp_score_topk(
                             weight_row = pl.cast(weights[t : t + 1, :], target_type=pl.FP32, mode="none")
                             weighted_heads = pl.col_expand_mul(relu_score_s, weight_row)
                             weighted_sum = pl.row_sum(weighted_heads)
-                            weighted_score_s = pl.reshape(weighted_sum, [1, CACHE_TILE])
+                            weighted_score_s = pl.reshape(weighted_sum, [1, CP_SCORE_CACHE_TILE])
                             pos = pl.read(position_ids, [t])
                             visible_t = pl.min((pos + 1) // COMPRESS_RATIO, candidate_rows)
                             if visible_t > cache0:
-                                valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
+                                valid_len_t = pl.min(CP_SCORE_CACHE_TILE, visible_t - cache0)
                             else:
                                 valid_len_t = 0
                             weighted_visible = pl.set_validshape(weighted_score_s, 1, valid_len_t)
                             weighted_valid_t = pl.fillpad(weighted_visible, pad_value=pl.PadValue.min)
-                            neg_inf_tile = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                            neg_inf_tile = pl.full([1, CP_SCORE_CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
                             weighted_valid_t = pl.maximum(weighted_valid_t, neg_inf_tile)
-                            score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
+                            score_wide[t : t + 1, cache0 : cache0 + CP_SCORE_CACHE_TILE] = weighted_valid_t
 
     # Select the model-configured TopK=512 with the incore tile path used by
     # #1080.  The old orchestration-level 4096 merge lowers to an illegal
