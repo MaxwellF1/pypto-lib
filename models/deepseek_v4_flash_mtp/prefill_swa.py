@@ -938,19 +938,19 @@ def prefill_attention_swa(
                     src = part * MAX_SEGMENT_TILES * TAIL_ROWS + tail_offset
                     local_hidden_tail[part * TAIL_ROWS + row: part * TAIL_ROWS + row + 1] = normed[src:src + 1]
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_tail_exchange", deps=[history_ready_tid]) as tail_exchange_tid:
-        _prefill_cp_hidden_tail_exchange_wave(
-            local_hidden_tail,
-            reverse_index,
-            owner_rank_table,
-            hidden_tail_window,
-            ready,
-            consumed,
-            logical_hidden,
-            my_rank,
-            pl.cast(0, pl.INT32),
-            current_tail_epoch,
-        )
+    tail_exchange_tid = _prefill_cp_hidden_tail_exchange_wave(
+        local_hidden_tail,
+        reverse_index,
+        owner_rank_table,
+        hidden_tail_window,
+        ready,
+        consumed,
+        logical_hidden,
+        my_rank,
+        pl.cast(0, pl.INT32),
+        current_tail_epoch,
+        history_ready_tid,
+    )
 
     # Recipes lowers [predecessor128, current512] for each owned segment,
     # then projects KV locally after the normalized hidden-tail exchange.

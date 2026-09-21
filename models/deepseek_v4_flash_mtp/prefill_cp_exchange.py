@@ -343,7 +343,7 @@ def _clear_prefill_cp_exchange_signals(
     return clear_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def _prefill_cp_hidden_tail_exchange_wave(
     local_hidden_tail: pl.Tensor[[EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
@@ -355,21 +355,21 @@ def _prefill_cp_hidden_tail_exchange_wave(
     my_rank: pl.Scalar[pl.INT32],
     payload_epoch: pl.Scalar[pl.INT32],
     comm_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]:
-    """Exchange hidden tails using per-layer ready/consumed epochs."""
+    exchange_ready_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Publish and gather hidden tails in parallel, then release the window."""
     cp_rank = my_rank % CP_SIZE
     cp_group_base = my_rank - cp_rank
     epoch_value = pl.cast(comm_epoch + 1, pl.INT32)
 
-    for peer in pl.range(CP_SIZE):
+    with pl.spmd(CP_SIZE, name_hint="cp_hidden_tail_publish", deps=[exchange_ready_tid]) as publish_tid:
+        peer = pl.tile.get_block_idx()
         if peer != cp_rank:
             pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_epoch, cmp=pld.WaitCmp.Ge)
-
-    for peer in pl.range(CP_SIZE):
         for part in pl.range(LOCAL_PARTS):
             publish_pos = cp_rank * LOCAL_PARTS + part
             publish_dst_row = publish_pos * TAIL_ROWS
-            src_row_base = (payload_epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS)
+            src_row_base = payload_epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS
             pld.tensor.put(
                 dst=hidden_window,
                 peer=cp_group_base + peer,
@@ -381,33 +381,32 @@ def _prefill_cp_hidden_tail_exchange_wave(
                 chunk_cols=D,
                 pipeline=True,
             )
-
-    for peer in pl.range(CP_SIZE):
         if peer != cp_rank:
             pld.system.notify(
                 target=ready, peer=cp_group_base + peer, offsets=[cp_rank, 0],
                 value=1, op=pld.NotifyOp.AtomicAdd,
             )
 
-    for seg in pl.range(NUM_SEGMENTS):
+    with pl.spmd(NUM_SEGMENTS, name_hint="cp_hidden_tail_gather", deps=[publish_tid]) as gather_tid:
+        seg = pl.tile.get_block_idx()
         gather_pos = reverse_index[seg]
         owner = owner_rank_table[seg]
         if owner != cp_rank:
             pld.system.wait(signal=ready, offsets=[owner, 0], expected=epoch_value, cmp=pld.WaitCmp.Ge)
         gather_src_row = gather_pos * TAIL_ROWS
-        gather_dst_row = (payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS)
+        gather_dst_row = payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
         for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
             hidden_tile = hidden_window[gather_src_row + t0:gather_src_row + t0 + ROW_TILE, 0:D]
             logical_hidden_out[gather_dst_row + t0:gather_dst_row + t0 + ROW_TILE, 0:D] = hidden_tile
 
-    for peer in pl.range(CP_SIZE):
-        if peer != cp_rank:
-            pld.system.notify(
-                target=consumed, peer=cp_group_base + peer, offsets=[cp_rank, 0],
-                value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-
-    return logical_hidden_out
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hidden_tail_release", deps=[gather_tid]) as release_tid:
+        for peer in pl.range(CP_SIZE):
+            if peer != cp_rank:
+                pld.system.notify(
+                    target=consumed, peer=cp_group_base + peer, offsets=[cp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+    return release_tid
 
 
 @pl.jit.inline
@@ -670,7 +669,7 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
     return commit_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def _prefill_cp_csa_compact_transport_wave(
     main_payload: pl.Tensor[[EPOCHS * ROWS_PER_RANK, MAIN_HEAD_DIM], pl.BF16],
     idx_payload: pl.Tensor[[EPOCHS * ROWS_PER_RANK, INNER_HEAD_DIM], pl.INT8],
@@ -693,20 +692,21 @@ def _prefill_cp_csa_compact_transport_wave(
     my_rank: pl.Scalar[pl.INT32],
     payload_epoch: pl.Scalar[pl.INT32],
     comm_epoch: pl.Scalar[pl.INT32],
-):
-    cp_rank = my_rank % CP_SIZE
-    cp_group_base = my_rank - cp_rank
-    comm_i32 = pl.cast(comm_epoch, pl.INT32)
-    ready_expected = pl.cast(comm_i32 + 1, pl.INT32)
-    for peer in pl.range(CP_SIZE):
+    history_ready_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    with pl.spmd(CP_SIZE, name_hint="cp_csa_compact_transport", deps=[history_ready_tid], allow_early_resolve=False) as transport_tid:
+        peer = pl.tile.get_block_idx()
+        cp_rank = my_rank % CP_SIZE
+        cp_group_base = my_rank - cp_rank
+        comm_i32 = pl.cast(comm_epoch, pl.INT32)
+        ready_expected = pl.cast(comm_i32 + 1, pl.INT32)
         if peer != cp_rank:
             pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_i32, cmp=pld.WaitCmp.Ge)
 
-    payload_row = payload_epoch * ROWS_PER_RANK
-    state_row = payload_epoch * STATE_ROWS_PER_RANK
-    destination_row = cp_rank * ROWS_PER_RANK
-    destination_state_row = cp_rank * STATE_ROWS_PER_RANK
-    for peer in pl.range(CP_SIZE):
+        payload_row = payload_epoch * ROWS_PER_RANK
+        state_row = payload_epoch * STATE_ROWS_PER_RANK
+        destination_row = cp_rank * ROWS_PER_RANK
+        destination_state_row = cp_rank * STATE_ROWS_PER_RANK
         pld.tensor.put(
             dst=main_window, peer=cp_group_base + peer, src=main_payload,
             dst_offsets=[destination_row, 0], src_offsets=[payload_row, 0], shape=[ROWS_PER_RANK, MAIN_HEAD_DIM],
@@ -752,15 +752,14 @@ def _prefill_cp_csa_compact_transport_wave(
             chunk_rows=4, chunk_cols=STATE_META_DIM, pipeline=True,
         )
 
-    for peer in pl.range(CP_SIZE):
         if peer != cp_rank:
             pld.system.notify(
                 target=ready, peer=cp_group_base + peer, offsets=[cp_rank, 0],
                 value=1, op=pld.NotifyOp.AtomicAdd,
             )
-    for peer in pl.range(CP_SIZE):
         if peer != cp_rank:
             pld.system.wait(signal=ready, offsets=[peer, 0], expected=ready_expected, cmp=pld.WaitCmp.Ge)
+    return transport_tid
 
 
 @pl.jit.inline

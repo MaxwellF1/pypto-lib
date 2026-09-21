@@ -195,6 +195,8 @@ CP_RAW_DATA_PAGES = NUM_SEGMENTS * MAX_SEGMENT_TILES
 CP_RAW_CACHE_PAGES = 1 + CP_RAW_DATA_PAGES + 1
 CP_HISTORY_ROW0 = (1 + CP_RAW_DATA_PAGES) * BLOCK_SIZE
 CP_RAW_CACHE_ROWS = CP_RAW_CACHE_PAGES * BLOCK_SIZE
+PAYLOAD_COMMIT_WORKERS = 4
+assert CMP_STORAGE_BLOCK_SIZE * 2 % 64 == 0
 CP_TMP_STATE_DATA_PAGES = 2
 CP_TMP_STATE_PAGES = 1 + CP_TMP_STATE_DATA_PAGES
 CP_TMP_STATE_ROWS = CP_TMP_STATE_PAGES * BLOCK_SIZE
@@ -1513,7 +1515,7 @@ def prefill_attention_csa(
         kv_proj_rope(normed_tile, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv_tile, late_dep)
 
     local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * T, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_assemble"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_assemble") as tail_assembled_tid:
         for part in pl.range(LOCAL_PARTS):
             active = pl.read(segment_active_lengths, [part])
             valid = pl.min(active, T)
@@ -1525,14 +1527,14 @@ def prefill_attention_csa(
                     local_hidden_tail[destination : destination + 1, :] = normed[source : source + 1, :]
 
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_hidden_tail_exchange") as tail_exchange_tid:
-        _prefill_cp_hidden_tail_exchange_wave(
-            local_hidden_tail,
-            reverse_index, owner_rank_table,
-            hidden_tail_window, tail_ready, tail_consumed,
-            logical_hidden,
-            my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
-        )
+    tail_exchange_tid = _prefill_cp_hidden_tail_exchange_wave(
+        local_hidden_tail,
+        reverse_index, owner_rank_table,
+        hidden_tail_window, tail_ready, tail_consumed,
+        logical_hidden,
+        my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
+        tail_assembled_tid,
+    )
 
     # Recipes exchanges normalized hidden tails only.  Reproject each owned
     # segment's predecessor window locally, plus the final decode window that
@@ -1894,41 +1896,40 @@ def prefill_attention_csa(
     compact_transport_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     receiver_commit_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     for epoch in pl.range(EPOCHS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_compact_transport", deps=[history_ready_tid]) as compact_transport_tid:
-            _prefill_cp_csa_compact_transport_wave(
-                packed_main_payload,
-                packed_idx_payload,
-                packed_idx_scale_payload,
-                packed_record_meta,
-                packed_main_state_payload,
-                packed_inner_state_payload,
-                packed_main_state_meta,
-                packed_inner_state_meta,
-                main_window,
-                idx_window,
-                scale_window,
-                record_window,
-                main_state_window, main_state_meta_window,
-                inner_state_window, inner_state_meta_window,
-                compact_ready, compact_consumed,
-                my_rank,
-                pl.cast(epoch, pl.INT32),
-                pl.cast(compact_epoch_base + epoch, pl.INT32),
-            )
+        compact_transport_tid = _prefill_cp_csa_compact_transport_wave(
+            packed_main_payload,
+            packed_idx_payload,
+            packed_idx_scale_payload,
+            packed_record_meta,
+            packed_main_state_payload,
+            packed_inner_state_payload,
+            packed_main_state_meta,
+            packed_inner_state_meta,
+            main_window,
+            idx_window,
+            scale_window,
+            record_window,
+            main_state_window, main_state_meta_window,
+            inner_state_window, inner_state_meta_window,
+            compact_ready, compact_consumed,
+            my_rank,
+            pl.cast(epoch, pl.INT32),
+            pl.cast(compact_epoch_base + epoch, pl.INT32),
+            history_ready_tid,
+        )
         # Store the captured TaskId for this epoch (idiom:
         # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
         compact_transport_tids[epoch] = compact_transport_tid
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="cp_csa_receiver_commit",
-            # PTOAS 0.60 does not infer a read-after-transport edge from the
-            # distributed windows.  Make receiver visibility depend on both
-            # the Recipes temporary-root seed and the completed CP exchange.
+        # Assign a physical page to one worker, including its packed scale
+        # cache lines. Aliased page-table entries retain source-rank order.
+        with pl.spmd(
+            PAYLOAD_COMMIT_WORKERS,
+            name_hint="cp_csa_payload_commit",
             deps=[compact_transport_tid, cp_tmp_seed_tid],
-        ) as receiver_commit_tid:
+        ) as payload_commit_tid:
+            commit_worker = pl.tile.get_block_idx()
             for source_rank in pl.range(CP_SIZE):
                 source_row = source_rank * ROWS_PER_RANK
-                source_state_row = source_rank * STATE_ROWS_PER_RANK
                 for row in pl.range(ROWS_PER_RANK):
                     meta_row = source_row + row
                     record_valid = pl.read(record_window, [meta_row, 0])
@@ -1937,7 +1938,12 @@ def prefill_attention_csa(
                     if record_valid > 0 and logical_segment >= 0 and boundary >= 0:
                         main_valid = pl.read(record_window, [meta_row, 4])
                         main_slot = pl.read(record_window, [meta_row, 5])
-                        if (main_valid > 0 and main_slot >= 0 and main_slot < cp_tmp_candidate_rows):
+                        main_commit_owner = (main_slot // CMP_STORAGE_BLOCK_SIZE) % PAYLOAD_COMMIT_WORKERS
+                        if main_slot >= 0 and main_slot // CMP_STORAGE_BLOCK_SIZE < PREFILL_CMP_MAX_BLOCKS:
+                            main_physical_page = pl.read(cmp_block_table, [main_slot // CMP_STORAGE_BLOCK_SIZE])
+                            if main_physical_page >= 0:
+                                main_commit_owner = main_physical_page % PAYLOAD_COMMIT_WORKERS
+                        if (main_valid > 0 and main_slot >= 0 and main_slot < cp_tmp_candidate_rows and main_commit_owner == commit_worker):
                             cp_tmp_destination = BLOCK_SIZE + main_slot
                             received_main_tile = main_window[meta_row : meta_row + 1, 0:HEAD_DIM]
                             cp_tmp_cmp_flat[
@@ -1960,7 +1966,12 @@ def prefill_attention_csa(
                                     cmp_flat[destination : destination + 1, 0:HEAD_DIM] = committed_main_tile
                         idx_valid = pl.read(record_window, [meta_row, 6])
                         idx_slot = pl.read(record_window, [meta_row, 7])
-                        if (idx_valid > 0 and idx_slot >= 0 and idx_slot < cp_tmp_candidate_rows):
+                        idx_commit_owner = (idx_slot // CMP_STORAGE_BLOCK_SIZE) % PAYLOAD_COMMIT_WORKERS
+                        if idx_slot >= 0 and idx_slot // CMP_STORAGE_BLOCK_SIZE < IDX_CACHE_MAX_BLOCKS:
+                            idx_physical_page = pl.read(idx_block_table, [idx_slot // CMP_STORAGE_BLOCK_SIZE])
+                            if idx_physical_page >= 0:
+                                idx_commit_owner = idx_physical_page % PAYLOAD_COMMIT_WORKERS
+                        if (idx_valid > 0 and idx_slot >= 0 and idx_slot < cp_tmp_candidate_rows and idx_commit_owner == commit_worker):
                             cp_tmp_idx_destination = BLOCK_SIZE + idx_slot
                             received_idx_tile = idx_window[meta_row : meta_row + 1, 0:IDX_HEAD_DIM]
                             cp_tmp_idx_flat[
@@ -1991,6 +2002,15 @@ def prefill_attention_csa(
                                     idx_flat[destination : destination + 1, 0:IDX_HEAD_DIM] = committed_idx_tile
                                     pl.write(idx_scale_flat, [destination, 0], committed_idx_scale)
 
+        # History roots are cyclic: preserve their ordered source-rank writes.
+        # Signal consumption only after payload and history commits complete.
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="cp_csa_receiver_commit",
+            deps=[payload_commit_tid],
+        ) as receiver_commit_tid:
+            for source_rank in pl.range(CP_SIZE):
+                source_state_row = source_rank * STATE_ROWS_PER_RANK
                 for state_row in pl.range(STATE_ROWS_PER_RANK):
                     meta_row = source_state_row + state_row
                     main_valid = pl.read(main_state_meta_window, [meta_row, 0])
@@ -2261,9 +2281,8 @@ def prefill_attention_csa(
                 raw_source = FINAL_REPROJECT_ROW0 + row
                 cache_flat[raw_destination : raw_destination + 1, :] = reproject_kv[raw_source : raw_source + 1, :]
 
-    # Preserve the two Recipes logical segments and reuse DSpark's direct
-    # physical-root TopK512 compute.  The two calls are serialized so their
-    # wave-local gather/head/o-projection scratch does not overlap.
+    # Each segment owns its attention scratch and disjoint output rows.
+    # Both read the completed cache; join their completions before releasing it.
     part0_active = pl.read(segment_active_lengths, [0])
     part1_active = pl.read(segment_active_lengths, [1])
     x_out_flat = pl.reshape(x_out, [LOCAL_ROWS, HC_MULT, D])
@@ -2284,7 +2303,7 @@ def prefill_attention_csa(
         wo_b_scale, residual_part0, post_part0, comb_part0,
         out_part0, part0_active, raw_attention_ready_tid, compressed_attention_ready_tid,
     )
-    part1_compressed_ready_tid = pl.system.task_dummy(deps=[part0_attn_tid, part1_indexer_ready_tid])
+    part1_compressed_ready_tid = pl.system.task_dummy(deps=[raw_mask_tid, part1_indexer_ready_tid])
     q_part1 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [SEGMENT_ROWS, 0, 0])
     raw_indices_part1 = pl.slice(raw_physical_indices, [SEGMENT_ROWS, WIN], [SEGMENT_ROWS, 0])
     cmp_indices_part1 = pl.slice(cmp_indices, [SEGMENT_ROWS, IDX_TOPK], [SEGMENT_ROWS, 0])
@@ -2295,13 +2314,14 @@ def prefill_attention_csa(
     post_part1 = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [SEGMENT_ROWS, 0])
     comb_part1 = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [SEGMENT_ROWS, 0])
     out_part1 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [SEGMENT_ROWS, 0, 0])
-    attention_done_tid = prefill_physical_attention(
+    part1_attn_tid = prefill_physical_attention(
         q_part1, cp_tmp_raw_kv, raw_indices_part1, cp_tmp_cmp_kv,
         cp_tmp_block_table, cmp_indices_part1, mask_part1, attn_sink,
         cos_part1, sin_part1, wo_a, wo_b,
         wo_b_scale, residual_part1, post_part1, comb_part1,
-        out_part1, part1_active, part0_attn_tid, part1_compressed_ready_tid,
+        out_part1, part1_active, raw_attention_ready_tid, part1_compressed_ready_tid,
     )
+    attention_done_tid = pl.system.task_dummy(deps=[part0_attn_tid, part1_attn_tid])
 
     # §8.17.8e.2 leaf-capture completion token. Fan the four leaf-internal
     # commit/transport TaskIds into a single resource_done_tid via

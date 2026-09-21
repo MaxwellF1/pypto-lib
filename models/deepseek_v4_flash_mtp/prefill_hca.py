@@ -572,7 +572,7 @@ def prefill_attention_hca(
     )
 
     local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_tail_assemble"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_tail_assemble") as tail_assembled_tid:
         for part in pl.range(LOCAL_PARTS):
             total = pl.read(segment_active_lengths, [part])
             tail_offset0 = pl.max(total - TAIL_ROWS, 0)
@@ -585,14 +585,14 @@ def prefill_attention_hca(
                     local_hidden_tail[destination : destination + 1, :] = normed[source : source + 1, :]
 
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_hca_hidden_tail_exchange") as tail_exchange_tid:
-        _prefill_cp_hidden_tail_exchange_wave(
-            local_hidden_tail,
-            reverse_index, owner_rank_table,
-            hidden_tail_window, tail_ready, tail_consumed,
-            logical_hidden,
-            my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
-        )
+    tail_exchange_tid = _prefill_cp_hidden_tail_exchange_wave(
+        local_hidden_tail,
+        reverse_index, owner_rank_table,
+        hidden_tail_window, tail_ready, tail_consumed,
+        logical_hidden,
+        my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
+        tail_assembled_tid,
+    )
 
     effective_x = pl.create_tensor([LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16)
     leaf_positions = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT32)
