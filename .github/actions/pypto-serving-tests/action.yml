@@ -88,9 +88,9 @@ runs:
         # bundle, and that venv carries no pip at all — so the installer is the
         # one it named in PYPTO_USE_UV, not a hardcoded `pip`.
         if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-          uv pip install transformers safetensors pytest fastapi uvicorn msgspec
+          uv pip install transformers safetensors pytest fastapi uvicorn msgspec prometheus-client
         else
-          pip install transformers safetensors pytest fastapi uvicorn msgspec
+          pip install transformers safetensors pytest fastapi uvicorn msgspec prometheus-client
         fi
 
     - name: Run pypto-serving Qwen tests
