@@ -106,6 +106,7 @@ SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 # Shared attention derives query extents from tensors. The query tile only
 # bounds reusable scratch in the paged sparse gather path.
 STAGED_SWA_QUERY_TILE = 128
+STAGED_SWA_QUERIES_PER_BLOCK = 6
 STAGED_SWA_QUERY_STATS_ROWS = (STAGED_SWA_QUERY_TILE * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
 STAGED_SWA_ROPE_CS_T_TILE = 8
 STAGED_SWA_PROJ_A_ROW_TILE = 256
@@ -207,8 +208,20 @@ def _staged_sparse_wave(
     source_ready_tid: pl.Scalar[pl.TASK_ID],
     merge_ready_tid: pl.Scalar[pl.TASK_ID],
     query_base: pl.Scalar[pl.INDEX],
+    kv_query_stride: pl.Scalar[pl.INDEX],
+    kv_row_origin: pl.Scalar[pl.INDEX],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Run a QK/PV/merge wave bounded by caller-owned statistics scratch."""
+    """Run a QK/PV/merge wave bounded by caller-owned statistics scratch.
+
+    ``kv_query_stride`` / ``kv_row_origin`` say where query ``t``'s sparse-K rows
+    start in ``sparse_kv``: ``t * kv_query_stride + kv_row_origin``.
+
+    * ``(PREFILL_SPARSE_PAD, 0)`` -- one private PAD-strided region per query.
+    * ``(1, 1)`` -- CP-SWA's shared window, one row per absolute key position for
+      the whole segment, so consecutive queries overlap by ``WIN - 1`` rows. The
+      slice stays a contiguous ``PREFILL_ATTN_TILE``-row block either way, so the
+      QK and PV matmuls are untouched.
+    """
     wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // (H * PREFILL_ATTN_BLOCKS)
     token_rows = pl.tensor.dim(q, 0)
     packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
@@ -219,41 +232,44 @@ def _staged_sparse_wave(
     o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
 
     # Statistics use wave-local row indices, so all waves reuse one scratch.
-    with pl.spmd(wave_rows, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
-        qk_local_t = pl.tile.get_block_idx()
-        qk_t = query_base + qk_local_t
-        if qk_t < active_rows:
-            qk_kv_base = qk_t * PREFILL_SPARSE_PAD
-            qk_token_base = (qk_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-            for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
-                qk_b0 = qk_sb * PREFILL_ATTN_TILE
-                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_b0 : qk_b0 + PREFILL_ATTN_TILE]
-                qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
-                if qk_sb == 0:
-                    qk_block_valid = pl.cast(1, pl.INT32)
-                if qk_block_valid > 0:
-                    qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                    qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                    for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                        qk_head_row = qk_t * H + qk_hb * QK_M_TILE
-                        qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
-                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                        qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                        qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                        qk_mi = pl.row_max(qk_scores)
-                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                        qk_li = pl.row_sum(qk_exp)
-                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                        for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                            qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
-                            qk_r0 = qk_sub * HEAD_TILE
-                            qk_blk_base = (qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                            qk_row = qk_blk_base + qk_sb * HEAD_TILE
-                            sparse_blk_mi[qk_row : qk_row + HEAD_TILE, :] = qk_mi[qk_r0 : qk_r0 + HEAD_TILE, :]
-                            sparse_blk_li[qk_row : qk_row + HEAD_TILE, :] = qk_li[qk_r0 : qk_r0 + HEAD_TILE, :]
-                            sparse_blk_oi[qk_row : qk_row + HEAD_TILE, :] = qk_oi[qk_r0 : qk_r0 + HEAD_TILE, :]
+    qk_query_blocks = (wave_rows + STAGED_SWA_QUERIES_PER_BLOCK - 1) // STAGED_SWA_QUERIES_PER_BLOCK
+    with pl.spmd(qk_query_blocks, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
+        qk_query_start = pl.tile.get_block_idx() * STAGED_SWA_QUERIES_PER_BLOCK
+        for qk_query_offset in pl.range(STAGED_SWA_QUERIES_PER_BLOCK):
+            qk_local_t = qk_query_start + qk_query_offset
+            qk_t = query_base + qk_local_t
+            if qk_local_t < wave_rows and qk_t < active_rows:
+                qk_kv_base = qk_t * kv_query_stride + kv_row_origin
+                qk_token_base = (qk_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
+                    qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
+                    qk_b0 = qk_sb * PREFILL_ATTN_TILE
+                    qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
+                    if qk_sb == 0:
+                        qk_block_valid = pl.cast(1, pl.INT32)
+                    if qk_block_valid > 0:
+                        qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_b0 : qk_b0 + PREFILL_ATTN_TILE]
+                        qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                        qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                            qk_head_row = qk_t * H + qk_hb * QK_M_TILE
+                            qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
+                            qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                            qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                            qk_mi = pl.row_max(qk_scores)
+                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                            qk_li = pl.row_sum(qk_exp)
+                            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                            qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                            for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                                qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
+                                qk_r0 = qk_sub * HEAD_TILE
+                                qk_blk_base = (qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                                qk_row = qk_blk_base + qk_sb * HEAD_TILE
+                                sparse_blk_mi[qk_row : qk_row + HEAD_TILE, :] = qk_mi[qk_r0 : qk_r0 + HEAD_TILE, :]
+                                sparse_blk_li[qk_row : qk_row + HEAD_TILE, :] = qk_li[qk_r0 : qk_r0 + HEAD_TILE, :]
+                                sparse_blk_oi[qk_row : qk_row + HEAD_TILE, :] = qk_oi[qk_r0 : qk_r0 + HEAD_TILE, :]
 
     with pl.spmd(wave_rows, name_hint="staged_swa_merge_rope_pack", deps=[qk_tid, merge_ready_tid]) as merge_tid:
         m_local_t = pl.tile.get_block_idx()
@@ -342,6 +358,8 @@ def _staged_swa_heads(
     o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
     packed_init_tid: pl.Scalar[pl.TASK_ID],
     prior_dep: pl.Scalar[pl.TASK_ID],
+    kv_query_stride: pl.Scalar[pl.INDEX],
+    kv_row_origin: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write a segment through serial reusable query waves."""
     token_rows = pl.tensor.dim(q, 0)
@@ -387,6 +405,8 @@ def _staged_swa_heads(
                     prior_merge_tid,
                     prior_merge_tid,
                     query_base,
+                    kv_query_stride,
+                    kv_row_origin,
                 )
             merge_tids[0] = merge_tid
 
@@ -526,6 +546,7 @@ def _physical_sparse_wave(
         active_rows, o_packed_heads, sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
         rope_cos_il, rope_sin_signed, rope_swap_idx,
         source_ready_tid, merge_ready_tid, pl.cast(0, pl.INDEX),
+        pl.const(PREFILL_SPARSE_PAD, pl.INDEX), pl.const(0, pl.INDEX),
     )
 
 
@@ -1260,20 +1281,22 @@ def staged_sparse_attn(
     attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
     active_rows: pl.Scalar[pl.INT32],
     prior_dep: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Consume one variable-length staged sparse segment and expose its final projection TaskId.
+    kv_query_stride: pl.Scalar[pl.INDEX],
+    kv_row_origin: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """Return projection completion and the last staged-source read completion.
 
-    The caller owns sparse source staging and may pass this completion TaskId as
-    the next segment's ``prior_dep``.  Inactive tail rows are projected from a
-    zero-initialized packed-head buffer and therefore remain zero.
+    Staging may overwrite its source, bias and mask after the heads merge has
+    finished; the output projection continues using its private packed heads.
     """
     token_rows = pl.tensor.dim(q, 0)
     projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
     packed_head_rows = projection_rows * H
     active = pl.cast(active_rows, pl.INDEX)
     active = pl.min(token_rows, pl.max(active, 0))
-    completion = pl.array.create(1, pl.TASK_ID)
+    completion = pl.array.create(2, pl.TASK_ID)
     completion[0] = prior_dep
+    completion[1] = prior_dep
     with pl.scope():
         o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
         with pl.spmd(
@@ -1297,15 +1320,18 @@ def staged_sparse_attn(
             o_packed_heads,
             packed_init_tid,
             prior_dep,
+            kv_query_stride,
+            kv_row_origin,
         )
         _attn_out, act_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
         completion[0] = act_tid
+        completion[1] = heads_dep
 
     # ``attn_out`` is caller-owned GM storage written by the projection tasks.
     # Returning its scoped SSA version makes the generated runtime C++ refer to
     # an inner-scope alias after that scope has ended.  Only the completion
     # token needs to cross this boundary.
-    return completion[0]
+    return completion[0], completion[1]
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1326,12 +1352,21 @@ def prefill_staged_attention(
     x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
     active_rows: pl.Scalar[pl.INT32],
     prior_dep: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Shared staged attention, output projection, and HC residual update."""
+    kv_query_stride: pl.Scalar[pl.INDEX],
+    kv_row_origin: pl.Scalar[pl.INDEX],
+    kv_span: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """Shared staged attention, output projection, and HC residual update.
+
+    ``kv_query_stride`` / ``kv_row_origin`` describe the caller's sparse-K layout
+    (see ``_staged_sparse_wave``); ``kv_span`` is how many rows past its base one
+    query can address, which is what narrows the staged view to the active rows.
+    """
     rows = pl.tensor.dim(q, 0)
     active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
     compute_rows = pl.max(active, 1)
-    source_rows = compute_rows * PREFILL_SPARSE_PAD
+    # Rows the last query can reach: its base plus its span.
+    source_rows = (compute_rows - 1) * kv_query_stride + kv_row_origin + kv_span
     q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
     kv_active = pl.slice(sparse_kv, [source_rows, HEAD_DIM], [0, 0])
     bias_active = pl.slice(sparse_bias, [compute_rows, PREFILL_SPARSE_PAD], [0, 0])
@@ -1340,17 +1375,18 @@ def prefill_staged_attention(
     sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
     attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
     attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
-    attention_done = staged_sparse_attn(
+    attention_done, sources_done = staged_sparse_attn(
         q_active, kv_active, bias_active, mask_active, attn_sink,
         cos_active, sin_active, wo_a, wo_b, wo_b_scale,
         attn_active, active_rows, prior_dep,
+        kv_query_stride, kv_row_origin,
     )
     residual_view = pl.reshape(residual, [rows, HC_MULT, D])
     post_view = pl.reshape(post, [rows, HC_MULT])
     comb_view = pl.reshape(comb, [rows, HC_COMB])
     output_view = pl.reshape(x_out, [rows, HC_MULT, D])
     hc_post_prefill(attn_out, residual_view, post_view, comb_view, output_view, active_rows)
-    return attention_done
+    return attention_done, sources_done
 
 
 @pl.jit.inline(auto_scope=False)
