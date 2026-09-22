@@ -39,7 +39,7 @@ from prefill_cp_zigzag import (
     cp_reverse_index,
     cp_segment_layout,
 )
-from prefill_cp_exchange import _prefill_cp_hidden_tail_exchange_wave
+from prefill_cp_exchange import _clear_prefill_cp_exchange_signals, _prefill_cp_hidden_tail_exchange_wave
 from golden import TensorSpec
 from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare
 from prefill_sparse_attn import (
@@ -1207,7 +1207,7 @@ def prefill_cp_swa_rank(
     """Standalone CP-SWA rank child. Delegates to the inline core so the
     standalone test preserves the original @pl.jit entry point."""
     completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
-    return prefill_attention_swa(
+    result = prefill_attention_swa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -1222,6 +1222,15 @@ def prefill_cp_swa_rank(
         hidden_tail_window, ready, consumed,
         x_out, completion_token, pl.read(cache_owner_rank_t, [0]), my_rank, tail_epoch,
     )
+
+    # Standalone requests restart their communication epoch on retained windows.
+    # Match the full forward's retirement after every local consumer has finished.
+    completed_epochs = pl.cast(tail_epoch + 1, pl.INT32)
+    if pl.read(segment_starts_t, [0]) > 0:
+        completed_epochs = pl.cast(tail_epoch + 2, pl.INT32)
+    completion_anchor = pl.slice(completion_token, [1, 1, 8], [0, 0, 0])
+    _clear_prefill_cp_exchange_signals(completion_anchor, ready, consumed, completed_epochs, my_rank)
+    return result
 
 
 @pl.jit.host
