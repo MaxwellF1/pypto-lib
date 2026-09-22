@@ -106,6 +106,9 @@ CP_REQUEST_TOKENS_DYN = pl.dynamic("CP_REQUEST_TOKENS_DYN")
 CP_REQUEST_HC_DIM = M.hc_mult * D
 CP_REQUEST_COPY_COLS = 512
 _CP_REQUEST_HIDDEN_TILE_COLS = 2048
+# A sender tile indexes one stream at a time (``[ROW_TILE, 1, TILE_COLS]``), so a
+# tile that straddled two streams would silently read the wrong columns.
+assert D % _CP_REQUEST_HIDDEN_TILE_COLS == 0, "Hidden tiles must not cross the stream boundary."
 CP_REQUEST_CAPACITY = CP_SIZE * LOCAL_ROWS
 CP_REQUEST_MAIN_TABLE_COLS = (MAX_SEQ_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
 CP_REQUEST_INNER_TABLE_COLS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
