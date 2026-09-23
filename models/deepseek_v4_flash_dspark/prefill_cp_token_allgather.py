@@ -70,24 +70,21 @@ def _prefill_cp_token_allgather_step(
     local_t = pl.cast(local_rows, pl.INT32)
     target_row = tp_rank * local_t
 
-    # Publish the payload and first-phase arrival from one producer task.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_push", allow_early_resolve=True,
-    ) as _push_tid:
-        for peer_tp in pl.range(TP_SIZE):
-            pld.tensor.put(
-                dst=gather_window, peer=group_base + peer_tp,
-                src=hidden_local,
-                dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
-                chunk_rows=COMM_ROW_TILE, chunk_cols=D,
-                pipeline=True,
+    # Each peer has an independent destination and arrival signal.
+    with pl.spmd(TP_SIZE, name_hint="prefill_cp_token_allgather_push", allow_early_resolve=True) as _push_tid:
+        peer_tp = pl.tile.get_block_idx()
+        pld.tensor.put(
+            dst=gather_window, peer=group_base + peer_tp,
+            src=hidden_local,
+            dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE, chunk_cols=D,
+            pipeline=True,
+        )
+        if peer_tp != tp_rank:
+            pld.system.notify(
+                target=gather_signal, peer=group_base + peer_tp,
+                offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
             )
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=gather_signal, peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-                )
 
     # Register the peer payload conditions as deferred completion.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_token_allgather_payload_wait") as _payload_wait_tid:
@@ -98,20 +95,25 @@ def _prefill_cp_token_allgather_step(
                     expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge,
                 )
 
-    # Copy peer payloads and publish local readback completion.
+    # Readers own disjoint row tiles; release the window after every reader.
     group_rows = TP_SIZE * local_rows
-    full_rows = (group_rows // READBACK_ROW_TILE) * READBACK_ROW_TILE
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
+    readback_tiles = (group_rows + READBACK_ROW_TILE - 1) // READBACK_ROW_TILE
+    with pl.spmd(
+        readback_tiles,
         name_hint="prefill_cp_token_allgather_readback",
         deps=[_push_tid, _payload_wait_tid],
     ) as _readback_tid:
-        for tile_row in pl.range(0, full_rows, READBACK_ROW_TILE):
-            window_tile = gather_window[tile_row : tile_row + READBACK_ROW_TILE, 0:D]
-            group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
-        for tail_row in pl.range(full_rows, group_rows):
-            window_row = gather_window[tail_row : tail_row + 1, 0:D]
-            group_out[tail_row : tail_row + 1, 0:D] = window_row
+        tile_row = pl.tile.get_block_idx() * READBACK_ROW_TILE
+        valid_rows = pl.min(READBACK_ROW_TILE, group_rows - tile_row)
+        window_tile = pl.slice(
+            gather_window, [READBACK_ROW_TILE, D], [tile_row, 0], valid_shape=[valid_rows, D],
+        )
+        group_out[tile_row : tile_row + READBACK_ROW_TILE, 0:D] = window_tile
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_cp_token_allgather_readback_notify",
+        deps=[_readback_tid],
+    ) as _readback_notify_tid:
         for peer_tp in pl.range(TP_SIZE):
             if peer_tp != tp_rank:
                 pld.system.notify(
@@ -131,7 +133,7 @@ def _prefill_cp_token_allgather_step(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="prefill_cp_token_allgather_retire",
-        deps=[_readback_tid, _readback_wait_tid],
+        deps=[_readback_notify_tid, _readback_wait_tid],
     ):
         completion_anchor = pl.read(group_out, [0, 0])
         reset_value = pl.cast(-2, pl.INT32)
