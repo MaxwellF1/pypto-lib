@@ -49,8 +49,10 @@ NUM_SEGMENTS = 2 * CP_SIZE
 # arena to the request the program is built for; without the flag the old
 # full-capacity default stands.
 _REQUEST_TOKENS = _parse_static_int("num-tokens", 0)
+# Capped at four: the staged CP-SWA wave sequence in prefill_sparse_attn is four
+# unrolled 128-row waves, so a larger arena would leave later rows unprocessed.
 MAX_SEGMENT_TILES = (
-    max(1, -(-_REQUEST_TOKENS // (NUM_SEGMENTS * TAIL_ROWS))) if _REQUEST_TOKENS > 0 else 4
+    min(4, max(1, -(-_REQUEST_TOKENS // (NUM_SEGMENTS * TAIL_ROWS)))) if _REQUEST_TOKENS > 0 else 4
 )
 CP_PREFILL_CMP_BLOCK_NUM = NUM_SEGMENTS * MAX_SEGMENT_TILES
 

@@ -431,7 +431,7 @@ def _staged_swa_compact_wave(
     o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
     sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
     sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP16],
+    sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],

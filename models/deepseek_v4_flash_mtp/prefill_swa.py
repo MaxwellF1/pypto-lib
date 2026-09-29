@@ -969,12 +969,9 @@ def prefill_attention_swa(
     # bounding the expensive mixing by each segment's live, cube-aligned rows.
     mixed = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     for hc_part in pl.unroll(LOCAL_PARTS):
-        hc_active = (
-            pl.read(overlay_active_lengths, [hc_part, 0, 1])
-            + pl.read(overlay_active_lengths, [hc_part, 1, 1])
-            + pl.read(overlay_active_lengths, [hc_part, 2, 1])
-            + pl.read(overlay_active_lengths, [hc_part, 3, 1])
-        )
+        hc_active = pl.cast(0, pl.INT32)
+        for hc_tile in pl.unroll(MAX_SEGMENT_TILES):
+            hc_active = hc_active + pl.read(overlay_active_lengths, [hc_part, hc_tile, 1])
         hc_rows = pl.min(SEGMENT_ROWS, pl.max(16, ((hc_active + 15) // 16) * 16))
         hc_offset = hc_part * SEGMENT_ROWS
         q_positions = pl.slice(q_pos_flat, [hc_rows], [hc_offset])
@@ -1002,12 +999,9 @@ def prefill_attention_swa(
         hc_pre_norm(hc_x, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, hc_mixed, hc_post, hc_comb, hc_normed)
     # Q projection is token-local; retain each part's physical row offset.
     for q_part in pl.unroll(LOCAL_PARTS):
-        q_active = (
-            pl.read(overlay_active_lengths, [q_part, 0, 1])
-            + pl.read(overlay_active_lengths, [q_part, 1, 1])
-            + pl.read(overlay_active_lengths, [q_part, 2, 1])
-            + pl.read(overlay_active_lengths, [q_part, 3, 1])
-        )
+        q_active = pl.cast(0, pl.INT32)
+        for q_tile in pl.unroll(MAX_SEGMENT_TILES):
+            q_active = q_active + pl.read(overlay_active_lengths, [q_part, q_tile, 1])
         q_rows = pl.min(SEGMENT_ROWS, pl.max(16, ((q_active + 15) // 16) * 16))
         q_offset = q_part * SEGMENT_ROWS
         q_input = pl.slice(normed, [q_rows, D], [q_offset, 0])
@@ -1149,12 +1143,9 @@ def prefill_attention_swa(
     # Each part keeps its 640-row physical region: predecessor tail, then current rows.
     # Project the complete tail and cube-aligned live current rows only.
     for kv_part in pl.unroll(LOCAL_PARTS):
-        kv_active = (
-            pl.read(overlay_active_lengths, [kv_part, 0, 1])
-            + pl.read(overlay_active_lengths, [kv_part, 1, 1])
-            + pl.read(overlay_active_lengths, [kv_part, 2, 1])
-            + pl.read(overlay_active_lengths, [kv_part, 3, 1])
-        )
+        kv_active = pl.cast(0, pl.INT32)
+        for kv_tile in pl.unroll(MAX_SEGMENT_TILES):
+            kv_active = kv_active + pl.read(overlay_active_lengths, [kv_part, kv_tile, 1])
         kv_current_rows = pl.min(SEGMENT_ROWS, ((kv_active + 15) // 16) * 16)
         kv_rows = TAIL_ROWS + kv_current_rows
         kv_offset = kv_part * ROWS_PER_AUGMENTED_PART
@@ -1196,12 +1187,9 @@ def prefill_attention_swa(
                 ]
         else:
             sc_local_row0 = sc_part * MAX_SEGMENT_TILES * TAIL_ROWS
-            sc_active = (
-                pl.read(overlay_active_lengths, [sc_part, 0, 1])
-                + pl.read(overlay_active_lengths, [sc_part, 1, 1])
-                + pl.read(overlay_active_lengths, [sc_part, 2, 1])
-                + pl.read(overlay_active_lengths, [sc_part, 3, 1])
-            )
+            sc_active = pl.cast(0, pl.INT32)
+            for sc_tile in pl.unroll(MAX_SEGMENT_TILES):
+                sc_active = sc_active + pl.read(overlay_active_lengths, [sc_part, sc_tile, 1])
             sc_rows = pl.min(SEGMENT_ROWS, ((sc_active + 15) // 16) * 16)
             for sc_row in pl.range(sc_row0 - TAIL_ROWS, sc_row0 - TAIL_ROWS + KV_SCATTER_ROWS, ROW_TILE):
                 if sc_row < sc_rows:
