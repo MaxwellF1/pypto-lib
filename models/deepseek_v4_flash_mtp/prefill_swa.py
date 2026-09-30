@@ -1259,18 +1259,12 @@ def prefill_attention_swa(
     # Each CP rank owns two logical segments. Tensor extents follow their
     # runtime lengths; storage offsets retain the rank-local capacity layout.
     # Staging reuse waits for the prior heads merge, independently of projection.
-    part0_active = (
-        pl.read(overlay_active_lengths, [0, 0, 1])
-        + pl.read(overlay_active_lengths, [0, 1, 1])
-        + pl.read(overlay_active_lengths, [0, 2, 1])
-        + pl.read(overlay_active_lengths, [0, 3, 1])
-    )
-    part1_active = (
-        pl.read(overlay_active_lengths, [1, 0, 1])
-        + pl.read(overlay_active_lengths, [1, 1, 1])
-        + pl.read(overlay_active_lengths, [1, 2, 1])
-        + pl.read(overlay_active_lengths, [1, 3, 1])
-    )
+    part0_active = pl.cast(0, pl.INT32)
+    for p0_tile in pl.unroll(MAX_SEGMENT_TILES):
+        part0_active = part0_active + pl.read(overlay_active_lengths, [0, p0_tile, 1])
+    part1_active = pl.cast(0, pl.INT32)
+    for p1_tile in pl.unroll(MAX_SEGMENT_TILES):
+        part1_active = part1_active + pl.read(overlay_active_lengths, [1, p1_tile, 1])
 
     x_out_flat = pl.reshape(x_out, [LOCAL_ROWS, HC_MULT, D])
     q_part0 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [0, 0, 0])
