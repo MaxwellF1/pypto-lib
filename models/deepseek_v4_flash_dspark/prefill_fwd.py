@@ -108,12 +108,15 @@ from prefill_o_proj import (
 )
 from hc_head import hc_head
 from lm_head import (
+    GRAMMAR_SEGMENT_WORDS,
+    GREEDY_GRID_ROWS,
     GROUP_LOGIT_ROWS,
     MAX_LOGIT_ROWS,
     SAMPLED_IDS_PAD,
     TP_SIZE as LM_HEAD_TP_SIZE,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
+    expected_sampled_id,
     greedy_sample,
     lm_head,
 )
@@ -365,6 +368,7 @@ def prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -1119,7 +1123,7 @@ def prefill_fwd(
                 group_base, tp_rank,
                 pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
             )
-            greedy_sample(logits, logit_row_indices, sampled_ids)
+            greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
         else:
             for token in pl.spmd(local_tokens, name_hint="prefill_fwd_inactive_target_hidden"):
                 for head in pl.range(MAIN_HIDDEN_DIM // D):
@@ -1242,6 +1246,7 @@ def l3_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, MAIN_HIDDEN_DIM], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Run layer-major DSA-CP over a caller-padded physical token extent.
@@ -1380,7 +1385,7 @@ def l3_prefill_fwd(
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
-            x_out[r], logits[r], sampled_ids[r],
+            x_out[r], logits[r], grammar_mask[r], sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done,
@@ -1965,6 +1970,15 @@ def build_tensor_specs(
         indices[::TP_SIZE, : len(last_rows)] = torch.tensor(last_rows, dtype=torch.int32)
         return indices
 
+    def init_grammar_mask():
+        mask = torch.full(
+            (N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS),
+            -1, dtype=torch.int16,
+        )
+        mask[0, 0] = 0
+        mask[0, 0, 0] = -32768
+        return mask
+
     head_specs = [
         TensorSpec("hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [N_RANKS, 1], torch.float32, init_value=init_hc_head_scale),
@@ -1979,6 +1993,10 @@ def build_tensor_specs(
         ),
         TensorSpec("x_out", [N_RANKS, stage_tokens, D], torch.bfloat16),
         TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32),
+        TensorSpec(
+            "grammar_mask", [N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS],
+            torch.int16, init_value=init_grammar_mask,
+        ),
         TensorSpec("sampled_ids", [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], torch.int32),
     ]
     for spec in head_specs:
@@ -2158,9 +2176,10 @@ def sampled_ids_compare(actual, _expected, **kwargs):
     import torch
 
     row_indices = kwargs.get("inputs", {}).get("logit_row_indices")
+    grammar_mask = kwargs.get("inputs", {}).get("grammar_mask")
     device_logits = kwargs.get("actual_outputs", {}).get("logits")
-    if row_indices is None or device_logits is None:
-        return False, "    missing logit_row_indices input or device logits output"
+    if row_indices is None or grammar_mask is None or device_logits is None:
+        return False, "    missing logit_row_indices/grammar_mask input or device logits output"
     active = row_indices >= 0
     inactive_values = actual.masked_select((~active).unsqueeze(-1).expand_as(actual))
     if inactive_values.numel() and not bool(torch.all(inactive_values == -1)):
@@ -2170,10 +2189,10 @@ def sampled_ids_compare(actual, _expected, **kwargs):
             if int(row_indices[rank, row]) < 0:
                 continue
             sampled = int(actual[rank, row, 0])
-            expected = int(torch.argmax(device_logits[rank][row]))
+            expected = expected_sampled_id(device_logits[rank][row], grammar_mask[rank, row])
             # Both scans keep the first maximum, over identical fp32 data.
             if sampled != expected:
-                return False, f"    rank {rank} row {row}: sampled id {sampled} != device logits argmax {expected}"
+                return False, f"    rank {rank} row {row}: sampled id {sampled} != masked logits argmax {expected}"
     return True, ""
 
 

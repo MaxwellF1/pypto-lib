@@ -71,6 +71,15 @@ decode_fwd
 
 `decode_fwd` is the plain forward: it takes its token ids, positions, and
 sequence lengths from the host and carries no persistent-state coupling.
+Both the prefill and decode forwards require a rank-sharded `grammar_mask`
+input for LM-head sampling. Its `int16` shape per rank is
+`[MAX_LOGIT_ROWS, VOCAB // 808, 64]`: each 808-token segment stores allowed
+tokens in consecutive words, with token offset `i` in bit `i % 16` of word
+`i // 16` (including signed bit 15). The last word of segment zero is a
+header: `-1` selects unconstrained argmax, while `0` selects masked argmax.
+An unconstrained row can fill the entire mask with `-1`; a constrained row
+must have at least one allowed vocabulary token and set its header to `0`.
+
 Speculative decoding brackets it with two device-state stages that
 [decode_prepare.py](../../../models/deepseek_v4_flash_dspark/decode_prepare.py)
 exports, and the fused DSpark L2 in
@@ -82,6 +91,11 @@ prepare_target_group_from_device_state   late-bind the step from request slots
 decode_fwd_inline                        the forward above, unchanged
 accept_target_into_device_state          accept the longest matching prefix
 ```
+
+The fused decode also requires rank-sharded `valid_draft_counts` with shape
+`[DECODE_BATCH]` per rank. For each request, preparation and acceptance cap
+the stored draft count by `max(valid_draft_counts[request], 0)`, so invalid
+proposals cannot enter the target or accepted prefix.
 
 Every `decode_{swa,csa,hca}` entry has a `_tp1` twin: the single-rank form runs
 the layer without the CP gather and the TP publish, and is what the golden
