@@ -652,24 +652,41 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
             valid_rows = pl.read(state_meta_window, [state_owner, 2])
             end_position = pl.read(state_meta_window, [state_owner, 3])
             if state_valid > 0 and my_rank == cache_owner_rank:
-                for row in pl.range(TAIL_ROWS):
-                    if row < valid_rows:
-                        absolute_position = end_position - valid_rows + row
-                        if absolute_position >= 0:
-                            if absolute_position < MAX_SEQ_LEN:
-                                logical_block = pl.cast(absolute_position // HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                                if logical_block < HCA_STATE_MAX_BLOCKS:
-                                    physical_block = pl.read(compress_state_block_table, [logical_block])
-                                    if physical_block >= 0 and physical_block < state_blocks:
-                                        intra = pl.cast(absolute_position % HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                                        state_source_row = state_owner * TAIL_ROWS + row
-                                        state_row_tile = pl.slice(
-                                            state_window,
-                                            [1, COMPRESS_STATE_DIM],
-                                            [state_source_row, 0],
-                                        )
-                                        state_row = pl.cast(physical_block, pl.INDEX) * HCA_STATE_BLOCK_SIZE + intra
-                                        state_flat[state_row : state_row + 1, 0:COMPRESS_STATE_DIM] = state_row_tile
+                state_begin = end_position - valid_rows
+                # A complete aligned snapshot covers whole physical pages.
+                # Keep page order, mapping checks, and the scalar tail fallback.
+                if valid_rows == TAIL_ROWS and state_begin >= 0 and end_position <= MAX_SEQ_LEN and state_begin % HCA_STATE_BLOCK_SIZE == 0:
+                    for page in pl.range(TAIL_ROWS // HCA_STATE_BLOCK_SIZE):
+                        logical_block = pl.cast(state_begin // HCA_STATE_BLOCK_SIZE + page, pl.INDEX)
+                        if logical_block < HCA_STATE_MAX_BLOCKS:
+                            physical_block = pl.read(compress_state_block_table, [logical_block])
+                            if physical_block >= 0 and physical_block < state_blocks:
+                                state_source_row = state_owner * TAIL_ROWS + page * HCA_STATE_BLOCK_SIZE
+                                state_page_tile = pl.slice(
+                                    state_window, [HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+                                    [state_source_row, 0],
+                                )
+                                state_row = pl.cast(physical_block, pl.INDEX) * HCA_STATE_BLOCK_SIZE
+                                state_flat[state_row:state_row + HCA_STATE_BLOCK_SIZE, 0:COMPRESS_STATE_DIM] = state_page_tile
+                else:
+                    for row in pl.range(TAIL_ROWS):
+                        if row < valid_rows:
+                            absolute_position = end_position - valid_rows + row
+                            if absolute_position >= 0:
+                                if absolute_position < MAX_SEQ_LEN:
+                                    logical_block = pl.cast(absolute_position // HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                                    if logical_block < HCA_STATE_MAX_BLOCKS:
+                                        physical_block = pl.read(compress_state_block_table, [logical_block])
+                                        if physical_block >= 0 and physical_block < state_blocks:
+                                            intra = pl.cast(absolute_position % HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                                            state_source_row = state_owner * TAIL_ROWS + row
+                                            state_row_tile = pl.slice(
+                                                state_window,
+                                                [1, COMPRESS_STATE_DIM],
+                                                [state_source_row, 0],
+                                            )
+                                            state_row = pl.cast(physical_block, pl.INDEX) * HCA_STATE_BLOCK_SIZE + intra
+                                            state_flat[state_row : state_row + 1, 0:COMPRESS_STATE_DIM] = state_row_tile
 
         for peer in pl.range(CP_SIZE):
             if peer != cp_rank:
