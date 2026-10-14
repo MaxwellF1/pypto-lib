@@ -983,29 +983,36 @@ def _cp_csa_compress_pack_part(
         main_state_map_leaf = pl.slice(leaf_main_state_slots, [T], [row0])
         inner_state_map_leaf = pl.slice(leaf_inner_state_slots, [T], [row0])
         active = pl.read(leaf_num_tokens, [leaf])
-        active_eff = pl.max(active, 1)
-
         main_completion = pl.array.create(1, pl.TASK_ID)
-        main_cache_written, main_state_written = compressor_ratio4(
-            x_leaf, main_state, main_state_block_table,
-            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-            freqs_cos, freqs_sin,
-            main_cache, pos_leaf, active_eff,
-            main_map_leaf, main_state_map_leaf,
-            main_completion,
-        )
         inner_completion = pl.array.create(1, pl.TASK_ID)
-        idx_cache_written, idx_scale_written, inner_state_written = _prefill_indexer_compressor_with_completion(
-            x_leaf, inner_state, inner_state_block_table,
-            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-            freqs_cos, freqs_sin, hadamard_idx,
-            idx_cache, idx_scale, idx_block_table,
-            pos_leaf, active_eff, idx_map_leaf, inner_state_map_leaf,
-            inner_completion,
-        )
+        main_completion[0] = part_meta_seed_tid
+        inner_completion[0] = part_meta_seed_tid
+        main_cache_written = main_cache
+        main_state_written = main_state
+        idx_cache_written = idx_cache
+        idx_scale_written = idx_scale
+        inner_state_written = inner_state
+        # Empty leaves still carry state below, but have no projections or writes.
+        if active > 0:
+            main_cache_written, main_state_written = compressor_ratio4(
+                x_leaf, main_state, main_state_block_table,
+                cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+                freqs_cos, freqs_sin,
+                main_cache, pos_leaf, active,
+                main_map_leaf, main_state_map_leaf,
+                main_completion,
+            )
+            idx_cache_written, idx_scale_written, inner_state_written = _prefill_indexer_compressor_with_completion(
+                x_leaf, inner_state, inner_state_block_table,
+                inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+                freqs_cos, freqs_sin, hadamard_idx,
+                idx_cache, idx_scale, idx_block_table,
+                pos_leaf, active, idx_map_leaf, inner_state_map_leaf,
+                inner_completion,
+            )
 
-        # The materialization task completes both compressors before recycling
-        # the buffer last used two leaves earlier.
+        # Each state family has its own materialization boundary before its
+        # buffer is recycled two leaves later.
         if leaf % 2 == 0:
             main_state_next = main_state_scratch
             inner_state_next = inner_state_scratch
@@ -1026,7 +1033,7 @@ def _cp_csa_compress_pack_part(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_materialize_leaf",
-            deps=[part_meta_seed_tid, main_completion[0], inner_completion[0]],
+            deps=[part_meta_seed_tid, main_completion[0]],
         ):
             # Later leaves read only the preceding ratio-4 window from state;
             # their current rows come from their own projections. Keep the final
@@ -1042,12 +1049,52 @@ def _cp_csa_compress_pack_part(
                 carry_position = carry_end - STATE_LEN + carry_row
                 if carry_position >= 0:
                     main_carry_block = pl.read(main_state_block_table, [carry_position // MAIN_STATE_BLOCK_SIZE])
-                    inner_carry_block = pl.read(inner_state_block_table, [carry_position // INNER_STATE_BLOCK_SIZE])
                     if main_carry_block >= 0:
                         main_carry_row = pl.cast(main_carry_block, pl.INDEX) * MAIN_STATE_BLOCK_SIZE + carry_position % MAIN_STATE_BLOCK_SIZE
                         main_state_next_flat[main_carry_row : main_carry_row + 1, :] = (
                             main_state_written_flat[main_carry_row : main_carry_row + 1, :]
                         )
+            if leaf > 0:
+                segment_slot0 = segment_start // COMPRESS_RATIO
+                for row in pl.range(T):
+                    if row < active:
+                        position = pl.read(pos_leaf, [row])
+                        main_source_i64 = pl.read(main_map_leaf, [row])
+                        idx_source_i64 = pl.read(idx_map_leaf, [row])
+                        if main_source_i64 >= 0 and idx_source_i64 >= 0:
+                            logical_slot = pl.cast((position + 1) // COMPRESS_RATIO - 1, pl.INT32)
+                            record_row = logical_slot - segment_slot0
+                            main_source = pl.cast(main_source_i64, pl.INDEX)
+                            for epoch in pl.range(EPOCHS):
+                                destination = (epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT + record_row)
+                                main_payload[destination : destination + 1, :] = main_cache_flat[
+                                    main_source : main_source + 1, :
+                                ]
+                                pl.write(record_meta, [destination, 0], pl.cast(1, pl.INT32))
+                                pl.write(record_meta, [destination, 1], segment)
+                                pl.write(record_meta, [destination, 2], position)
+                                pl.write(record_meta, [destination, 3], pl.cast(record_row, pl.INT32))
+                                pl.write(record_meta, [destination, 4], pl.cast(1, pl.INT32))
+                                pl.write(record_meta, [destination, 5], logical_slot)
+                                pl.write(record_meta, [destination, 6], pl.cast(1, pl.INT32))
+                                pl.write(record_meta, [destination, 7], logical_slot)
+        # Indexer history and payload do not consume the main compressor's
+        # cache or state. Keep one writer for the packed scale rows.
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="cp_csa_materialize_indexer_leaf",
+            deps=[part_meta_seed_tid, inner_completion[0]],
+        ):
+            idx_carry_end = pl.cast(segment_start, pl.INDEX)
+            for previous_leaf in pl.range(leaf + 1):
+                previous_active = pl.read(leaf_num_tokens, [previous_leaf])
+                if previous_active > 0:
+                    last_row = previous_leaf * T + previous_active - 1
+                    idx_carry_end = pl.read(leaf_positions, [last_row]) + 1
+            for carry_row in pl.range(STATE_LEN):
+                carry_position = idx_carry_end - STATE_LEN + carry_row
+                if carry_position >= 0:
+                    inner_carry_block = pl.read(inner_state_block_table, [carry_position // INNER_STATE_BLOCK_SIZE])
                     if inner_carry_block >= 0:
                         inner_carry_row = pl.cast(inner_carry_block, pl.INDEX) * INNER_STATE_BLOCK_SIZE + carry_position % INNER_STATE_BLOCK_SIZE
                         inner_state_next_flat[inner_carry_row : inner_carry_row + 1, :] = (
@@ -1063,27 +1110,15 @@ def _cp_csa_compress_pack_part(
                         if main_source_i64 >= 0 and idx_source_i64 >= 0:
                             logical_slot = pl.cast((position + 1) // COMPRESS_RATIO - 1, pl.INT32)
                             record_row = logical_slot - segment_slot0
-                            main_source = pl.cast(main_source_i64, pl.INDEX)
                             idx_source = pl.cast(idx_source_i64, pl.INDEX)
                             for epoch in pl.range(EPOCHS):
-                                destination = (epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT + record_row)
-                                main_payload[destination : destination + 1, :] = main_cache_flat[
-                                    main_source : main_source + 1, :
-                                ]
+                                destination = epoch * MAX_COMPRESSED_ROWS_PER_SEGMENT + record_row
                                 idx_payload[destination : destination + 1, :] = idx_cache_flat[
                                     idx_source : idx_source + 1, :
                                 ]
                                 scale_value = pl.cast(pl.read(idx_scale_flat, [idx_source, 0]), pl.FP16)
                                 for scale_col in pl.range(SCALE_TILE_COLS):
                                     pl.write(idx_scale_payload, [destination, scale_col], scale_value)
-                                pl.write(record_meta, [destination, 0], pl.cast(1, pl.INT32))
-                                pl.write(record_meta, [destination, 1], segment)
-                                pl.write(record_meta, [destination, 2], position)
-                                pl.write(record_meta, [destination, 3], pl.cast(record_row, pl.INT32))
-                                pl.write(record_meta, [destination, 4], pl.cast(1, pl.INT32))
-                                pl.write(record_meta, [destination, 5], logical_slot)
-                                pl.write(record_meta, [destination, 6], pl.cast(1, pl.INT32))
-                                pl.write(record_meta, [destination, 7], logical_slot)
         main_state = main_state_next
         inner_state = inner_state_next
 
@@ -1402,7 +1437,7 @@ def prefill_attention_csa(
     main_state_rows = main_state_blocks * MAIN_STATE_BLOCK_SIZE
     inner_state_rows = inner_state_blocks * INNER_STATE_BLOCK_SIZE
     # Recipes receives the CP all-gather into page-128 temporary roots.  Page
-    # zero is the sentinel and the block table maps logical pages to 1..N.
+    # zero is reserved; consumers compute the contiguous page offset directly.
     # Keep the serving/decode pools above as the stable public ABI; receiver
     # commit first lands in these roots, then copies through them to the
     # existing pools so the temporary ABI is part of the real dataflow.
@@ -1410,57 +1445,27 @@ def prefill_attention_csa(
     cp_tmp_candidate_rows = pl.min(history_base // COMPRESS_RATIO + CP_TMP_COMPRESSED_ROWS, CP_CANDIDATE_CAPACITY)
     cp_tmp_cache_pages = 1 + (cp_tmp_candidate_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
     cp_tmp_cache_rows = cp_tmp_cache_pages * BLOCK_SIZE
-    cp_tmp_scale_groups = cp_tmp_cache_rows // 16
     cp_tmp_cmp_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cp_tmp_idx_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
     cp_tmp_idx_scale = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, 1], dtype=pl.FP16)
     cp_tmp_main_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
     cp_tmp_inner_state = pl.create_tensor([CP_TMP_STATE_PAGES, BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
-    cp_tmp_block_table = pl.create_tensor([PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
     cp_tmp_cmp_flat = pl.reshape(cp_tmp_cmp_kv, [cp_tmp_cache_rows, HEAD_DIM])
     cp_tmp_idx_flat = pl.reshape(cp_tmp_idx_kv, [cp_tmp_cache_rows, IDX_HEAD_DIM])
     cp_tmp_idx_scale_flat = pl.reshape(cp_tmp_idx_scale, [cp_tmp_cache_rows, 1])
-    cp_tmp_idx_scale_aligned = pl.reshape(cp_tmp_idx_scale, [cp_tmp_scale_groups, 16])
     cp_tmp_main_state_flat = pl.reshape(cp_tmp_main_state, [CP_TMP_STATE_ROWS, MAIN_STATE_DIM])
     cp_tmp_inner_state_flat = pl.reshape(cp_tmp_inner_state, [CP_TMP_STATE_ROWS, INNER_STATE_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tmp_root_seed") as cp_tmp_seed_tid:
-        cp_tmp_cmp_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:HEAD_DIM] = pl.full(
-            [1, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16, value=0.0
-        )
-        cp_tmp_idx_kv[0:1, 0:BLOCK_SIZE, 0:1, 0:IDX_HEAD_DIM] = pl.cast(
-            pl.full([1, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.FP16, value=0.0),
-            target_type=pl.INT8,
-            mode="trunc",
-        )
-        # PTOAS 0.60 requires each tile row to occupy at least 32 bytes.  View
-        # the scalar FP16 scales in groups of 16 while seeding sentinel page 0.
-        cp_tmp_idx_scale_aligned[0 : BLOCK_SIZE // 16, 0:16] = pl.full([BLOCK_SIZE // 16, 16], dtype=pl.FP16, value=0.0)
-        for state_seed_row in pl.range(BLOCK_SIZE):
-            cp_tmp_main_state[
-                0:1,
-                state_seed_row : state_seed_row + 1,
-                0:MAIN_STATE_DIM,
-            ] = pl.full([1, 1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
-            cp_tmp_inner_state[
-                0:1,
-                state_seed_row : state_seed_row + 1,
-                0:INNER_STATE_DIM,
-            ] = pl.full([1, 1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
-        for table_col in pl.range(PREFILL_CMP_MAX_BLOCKS):
-            pl.write(cp_tmp_block_table, [table_col], pl.cast(0, pl.INT32))
-        for logical_page in pl.range(cp_tmp_cache_pages - 1):
-            pl.write(cp_tmp_block_table, [logical_page], pl.cast(logical_page + 1, pl.INT32))
     history_raw = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     history_main = pl.create_tensor([STATE_LEN, MAIN_STATE_DIM], dtype=pl.FP32)
     history_inner = pl.create_tensor([STATE_LEN, INNER_STATE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_history_seed"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_history_seed") as history_seed_tid:
         for row in pl.range(0, T, 8):
             history_raw[row:row + 8, :] = pl.full([8, HEAD_DIM], dtype=pl.BF16, value=0.0)
         for row in pl.range(STATE_LEN):
             history_main[row:row + 1, :] = pl.full([1, MAIN_STATE_DIM], dtype=pl.FP32, value=0.0)
             history_inner[row:row + 1, :] = pl.full([1, INNER_STATE_DIM], dtype=pl.FP32, value=0.0)
     history_phases = pl.cast(0, pl.INT32)
-    history_ready_tid = cp_tmp_seed_tid
+    history_ready_tid = history_seed_tid
     if history_base > 0:
         history_phases = pl.cast(1 + (history_base // COMPRESS_RATIO + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW, pl.INT32)
         history_ready_tid = _prefill_cp_csa_history_exchange(
@@ -1489,40 +1494,47 @@ def prefill_attention_csa(
     swa_indices_flat = pl.reshape(swa_indices, [LOCAL_ROWS, WIN])
     predecessor_segments_local = predecessor_segments
     segment_starts_local = segment_starts_t
-    for tile in pl.range(NUM_LOCAL_TILES):
-        row0 = tile * T
-        x_tile = pl.slice(x_flat, [T, HC_MULT, D], [row0, 0, 0])
-        post_tile = pl.slice(post, [T, HC_MULT], [row0, 0])
-        comb_tile = pl.slice(comb, [T, HC_MULT * HC_MULT], [row0, 0])
-        position_tile = pl.slice(query_positions_flat, [T], [row0])
-        cos_tile = pl.slice(rope_cos_flat, [T, ROPE_HEAD_DIM], [row0, 0])
-        sin_tile = pl.slice(rope_sin_flat, [T, ROPE_HEAD_DIM], [row0, 0])
-        normed_tile = pl.slice(normed, [T, D], [row0, 0])
-        q_tile = pl.slice(q, [T, H, HEAD_DIM], [row0, 0, 0])
-        kv_tile = pl.slice(local_kv, [T, HEAD_DIM], [row0, 0])
-        qr_tile = pl.slice(qr, [T, Q_LORA], [row0, 0])
-        qr_scale_tile = pl.slice(qr_scale, [T, 1], [row0, 0])
-        active = pl.read(overlay_active_flat, [tile, 1])
-        materialize_rope_rows(freqs_cos, freqs_sin, position_tile, active, cos_tile, sin_tile)
-        cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-        sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
-        swap_idx = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.INT32)
+    # Row-independent projections share one orchestration group per segment.
+    for part in pl.range(LOCAL_PARTS):
+        row0 = part * SEGMENT_ROWS
+        segment_x_tile = pl.slice(x_flat, [SEGMENT_ROWS, HC_MULT, D], [row0, 0, 0])
+        segment_post_tile = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [row0, 0])
+        segment_comb_tile = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [row0, 0])
+        segment_position_tile = pl.slice(query_positions_flat, [SEGMENT_ROWS], [row0])
+        segment_cos_tile = pl.slice(rope_cos_flat, [SEGMENT_ROWS, ROPE_HEAD_DIM], [row0, 0])
+        segment_sin_tile = pl.slice(rope_sin_flat, [SEGMENT_ROWS, ROPE_HEAD_DIM], [row0, 0])
+        segment_normed_tile = pl.slice(normed, [SEGMENT_ROWS, D], [row0, 0])
+        segment_q_tile = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [row0, 0, 0])
+        segment_kv_tile = pl.slice(local_kv, [SEGMENT_ROWS, HEAD_DIM], [row0, 0])
+        segment_qr_tile = pl.slice(qr, [SEGMENT_ROWS, Q_LORA], [row0, 0])
+        segment_qr_scale_tile = pl.slice(qr_scale, [SEGMENT_ROWS, 1], [row0, 0])
+        active = pl.read(segment_active_lengths, [part])
+        materialize_rope_rows(freqs_cos, freqs_sin, segment_position_tile, active, segment_cos_tile, segment_sin_tile)
+        segment_cos_il = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+        segment_sin_signed = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
+        segment_swap_idx = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
         rms_tid = prefill_attention_prolog(
-            x_tile, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-            wq_a, wq_b, wq_b_scale, gamma_cq, cos_tile, sin_tile,
-            normed_tile, post_tile, comb_tile, cos_il, sin_signed, swap_idx,
-            q_tile, qr_tile, qr_scale_tile,
+            segment_x_tile, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            wq_a, wq_b, wq_b_scale, gamma_cq, segment_cos_tile, segment_sin_tile,
+            segment_normed_tile, segment_post_tile, segment_comb_tile,
+            segment_cos_il, segment_sin_signed, segment_swap_idx,
+            segment_q_tile, segment_qr_tile, segment_qr_scale_tile,
         )
         late_dep = pl.system.task_dummy(deps=[rms_tid])
-        kv_proj_rope(normed_tile, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv_tile, late_dep)
+        kv_proj_rope(
+            segment_normed_tile, wkv, gamma_ckv,
+            segment_cos_il, segment_sin_signed, segment_swap_idx,
+            segment_kv_tile, late_dep,
+        )
 
     local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * T, D], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_assemble") as tail_assembled_tid:
+    with pl.spmd(T // 16, name_hint="cp_csa_tail_assemble") as tail_assembled_tid:
+        tail_row_start = pl.tile.get_block_idx() * 16
         for part in pl.range(LOCAL_PARTS):
             active = pl.read(segment_active_lengths, [part])
             valid = pl.min(active, T)
             tail0 = pl.max(active - T, 0)
-            for row in pl.range(T):
+            for row in pl.range(tail_row_start, tail_row_start + 16):
                 if row < valid:
                     source = part * MAX_SEGMENT_TILES * T + tail0 + row
                     destination = part * T + row
@@ -1596,8 +1608,9 @@ def prefill_attention_csa(
     reproject_rope_sin_signed = pl.create_tensor([LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
     reproject_rope_swap_idx = pl.create_tensor([LOCAL_REPROJECT_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     reproject_kv = pl.create_tensor([LOCAL_REPROJECT_ROWS, HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_reproject_rope_rows", deps=[remote_hidden_tid]) as reproject_rope_tid:
-        for reproject_row in pl.range(LOCAL_REPROJECT_ROWS):
+    with pl.spmd(LOCAL_REPROJECT_ROWS // 16, name_hint="cp_csa_reproject_rope_rows", deps=[remote_hidden_tid]) as reproject_rope_tid:
+        reproject_row_start = pl.tile.get_block_idx() * 16
+        for reproject_row in pl.range(reproject_row_start, reproject_row_start + 16):
             reproject_position = pl.cast(pl.read(reproject_positions, [reproject_row]), pl.INDEX)
             reproject_rope_cos[reproject_row : reproject_row + 1, :] = freqs_cos[
                 reproject_position : reproject_position + 1, :
@@ -1920,14 +1933,12 @@ def prefill_attention_csa(
     main_state_flat = pl.reshape(compress_state, [main_state_rows, MAIN_STATE_DIM])
     inner_state_flat = pl.reshape(inner_compress_state, [inner_state_rows, INNER_STATE_DIM])
 
-    # §8.17.8e.2 leaf-capture completion token: collect the TaskId of every
-    # leaf-internal commit/transport task so the terminal cp_csa_rank_complete
-    # task can fan them in via pl.system.task_dummy(deps=[...]). With EPOCHS==1
-    # each array holds one entry; the array form keeps the epoch loop's existing
-    # per-epoch structure (idiom: prefill_cp_csa.py:1084 pl.array.create(1, ...) +
-    # :1125 deps=[main_completion[0], inner_completion[0]]).
+    # Per-epoch transport and commit tokens join at rank completion.
     compact_transport_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     receiver_commit_tids = pl.array.create(EPOCHS, pl.TASK_ID)
+    indexer_commit_tids = pl.array.create(EPOCHS, pl.TASK_ID)
+    # Order blocking compact waits after hidden-tail exchange, including empty ranks.
+    compact_input_ready_tid = pl.system.task_dummy(deps=[history_ready_tid, tail_exchange_tid])
     for epoch in pl.range(EPOCHS):
         compact_transport_tid = _prefill_cp_csa_compact_transport_wave(
             packed_main_payload,
@@ -1948,7 +1959,7 @@ def prefill_attention_csa(
             my_rank,
             pl.cast(epoch, pl.INT32),
             pl.cast(compact_epoch_base + epoch, pl.INT32),
-            history_ready_tid,
+            compact_input_ready_tid,
         )
         # Store the captured TaskId for this epoch (idiom:
         # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
@@ -1958,7 +1969,7 @@ def prefill_attention_csa(
         with pl.spmd(
             PAYLOAD_COMMIT_WORKERS,
             name_hint="cp_csa_payload_commit",
-            deps=[compact_transport_tid, cp_tmp_seed_tid],
+            deps=[compact_transport_tid],
         ) as payload_commit_tid:
             commit_worker = pl.tile.get_block_idx()
             for source_rank in pl.range(CP_SIZE):
@@ -1983,10 +1994,7 @@ def prefill_attention_csa(
                                 cp_tmp_destination : cp_tmp_destination + 1,
                                 0:HEAD_DIM,
                             ] = received_main_tile
-                            committed_main_tile = cp_tmp_cmp_flat[
-                                cp_tmp_destination : cp_tmp_destination + 1,
-                                0:HEAD_DIM,
-                            ]
+                            committed_main_tile = received_main_tile
                             logical_block = main_slot // CMP_STORAGE_BLOCK_SIZE
                             if logical_block < PREFILL_CMP_MAX_BLOCKS:
                                 physical_block = pl.read(cmp_block_table, [logical_block])
@@ -1997,6 +2005,22 @@ def prefill_attention_csa(
                                         + main_slot % CMP_STORAGE_BLOCK_SIZE
                                     )
                                     cmp_flat[destination : destination + 1, 0:HEAD_DIM] = committed_main_tile
+        # The indexer and main attention roots are disjoint. Preserve page
+        # ownership and source-rank order without coupling their completion.
+        with pl.spmd(
+            PAYLOAD_COMMIT_WORKERS,
+            name_hint="cp_csa_indexer_payload_commit",
+            deps=[compact_transport_tid],
+        ) as indexer_commit_tid:
+            commit_worker = pl.tile.get_block_idx()
+            for source_rank in pl.range(CP_SIZE):
+                source_row = source_rank * ROWS_PER_RANK
+                for row in pl.range(ROWS_PER_RANK):
+                    meta_row = source_row + row
+                    record_valid = pl.read(record_window, [meta_row, 0])
+                    logical_segment = pl.read(record_window, [meta_row, 1])
+                    boundary = pl.read(record_window, [meta_row, 2])
+                    if record_valid > 0 and logical_segment >= 0 and boundary >= 0:
                         idx_valid = pl.read(record_window, [meta_row, 6])
                         idx_slot = pl.read(record_window, [meta_row, 7])
                         idx_commit_owner = (idx_slot // CMP_STORAGE_BLOCK_SIZE) % PAYLOAD_COMMIT_WORKERS
@@ -2014,15 +2038,8 @@ def prefill_attention_csa(
                             ] = received_idx_tile
                             received_idx_scale = pl.cast(pl.read(scale_window, [meta_row, 0]), pl.FP16)
                             pl.write(cp_tmp_idx_scale_flat, [cp_tmp_idx_destination, 0], received_idx_scale)
-                            committed_idx_tile = cp_tmp_idx_flat[
-                                cp_tmp_idx_destination :
-                                cp_tmp_idx_destination + 1,
-                                0:IDX_HEAD_DIM,
-                            ]
-                            committed_idx_scale = pl.cast(
-                                pl.read(cp_tmp_idx_scale_flat, [cp_tmp_idx_destination, 0]),
-                                pl.FP32,
-                            )
+                            committed_idx_tile = received_idx_tile
+                            committed_idx_scale = pl.cast(received_idx_scale, pl.FP32)
                             logical_block = idx_slot // CMP_STORAGE_BLOCK_SIZE
                             if logical_block < IDX_CACHE_MAX_BLOCKS:
                                 physical_block = pl.read(idx_block_table, [logical_block])
@@ -2035,12 +2052,13 @@ def prefill_attention_csa(
                                     idx_flat[destination : destination + 1, 0:IDX_HEAD_DIM] = committed_idx_tile
                                     pl.write(idx_scale_flat, [destination, 0], committed_idx_scale)
 
+        indexer_commit_tids[epoch] = indexer_commit_tid
         # History roots are cyclic: preserve their ordered source-rank writes.
         # Signal consumption only after payload and history commits complete.
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_receiver_commit",
-            deps=[payload_commit_tid],
+            deps=[payload_commit_tid, indexer_commit_tid],
         ) as receiver_commit_tid:
             for source_rank in pl.range(CP_SIZE):
                 source_state_row = source_rank * STATE_ROWS_PER_RANK
@@ -2117,7 +2135,7 @@ def prefill_attention_csa(
         cmp_indices[
             seed_row0 : seed_row0 + CSA_TOPK_SEED_ROWS, 0:IDX_TOPK
         ] = pl.full([CSA_TOPK_SEED_ROWS, IDX_TOPK], dtype=pl.INT32, value=-1)
-    indexer_input_ready_tid = pl.system.task_dummy(deps=[cmp_indices_seed_tid, receiver_commit_tids[0]])
+    indexer_input_ready_tid = pl.system.task_dummy(deps=[cmp_indices_seed_tid, indexer_commit_tids[0]])
     topk_tids = pl.array.create(NUM_LOCAL_TILES, pl.TASK_ID)
     for tile in pl.range(NUM_LOCAL_TILES):
         topk_tids[tile] = indexer_input_ready_tid
@@ -2138,7 +2156,7 @@ def prefill_attention_csa(
                 index_x_tile, qr_tile, qr_scale_tile,
                 idx_wq_b, idx_wq_b_scale, idx_weights_proj,
                 idx_cos, idx_sin, hadamard_idx,
-                cp_tmp_idx_kv, cp_tmp_idx_scale, cp_tmp_block_table,
+                cp_tmp_idx_kv, cp_tmp_idx_scale,
                 pos_tile, active, indexer_input_ready_tid, topk_tile,
             )
             cmp_indices[row0 : row0 + T, 0:IDX_TOPK] = topk_tile
@@ -2241,7 +2259,7 @@ def prefill_attention_csa(
     # consumed by the DSpark direct-gather donor.  The shared host input keeps
     # its old meaning for SWA/HCA; only this CSA-local tensor changes contract.
     with pl.spmd(((LOCAL_ROWS) + 8 - 1) // 8, name_hint="cp_csa_raw_physical_lower", deps=[raw_seed_tid]) as raw_index_tid:
-        # One block owns 8 rows; the rows are independent.
+        # Eight independent raw-index rows per block.
         lower_row_blk = pl.tile.get_block_idx()
         for lower_row_i in pl.range(8):
             lower_row = lower_row_blk * 8 + lower_row_i
@@ -2249,32 +2267,50 @@ def prefill_attention_csa(
             lower_query = pl.read(query_positions_flat, [lower_row])
             lower_request = pl.read(query_requests_flat, [lower_row])
             if lower_request >= 0:
-                for lower_col in pl.range(WIN):
-                    lower_pseudo = pl.read(swa_indices_flat, [lower_row, lower_col])
-                    if lower_pseudo >= 0:
-                        lower_key = lower_query - WIN + 1 + lower_col
-                        lower_relative = lower_key - request_start
-                        if lower_relative < 0:
-                            lower_history = T + lower_relative
-                            if lower_history >= 0:
-                                pl.write(
-                                    lower_stage, [0, lower_col],
-                                    pl.cast(CP_HISTORY_ROW0 + lower_history, pl.INT32),
-                                )
-                        if lower_relative >= 0:
-                            lower_logical_page = (lower_relative // BLOCK_SIZE)
-                            if lower_logical_page < CP_RAW_DATA_PAGES:
-                                lower_physical_page = pl.read(cp_tmp_raw_table, [lower_logical_page])
-                                if lower_physical_page > 0:
-                                    lower_physical_row = (lower_physical_page * BLOCK_SIZE + lower_relative % BLOCK_SIZE)
-                                    pl.write(lower_stage, [0, lower_col], pl.cast(lower_physical_row, pl.INT32))
+                lower_pseudo_row = swa_indices_flat[lower_row : lower_row + 1, 0:WIN]
+                lower_columns = pl.arange(0, [1, WIN], dtype=pl.INT32)
+                lower_first_relative = pl.cast(lower_query - WIN + 1 - request_start, pl.INT32)
+                lower_relative_row = pl.add(lower_columns, lower_first_relative)
+                lower_pseudo_plus_one = pl.add(lower_pseudo_row, 1)
+                lower_pseudo_nonnegative = pl.maximum(lower_pseudo_plus_one, 0)
+                lower_pseudo_valid = pl.minimum(lower_pseudo_nonnegative, 1)
+                lower_history_distance = pl.add(lower_relative_row, T + 1)
+                lower_history_nonnegative = pl.maximum(lower_history_distance, 0)
+                lower_history_bound = pl.minimum(lower_history_nonnegative, 1)
+                lower_negative_relative = pl.mul(lower_relative_row, -1)
+                lower_current_distance = pl.add(lower_negative_relative, CP_RAW_DATA_PAGES * BLOCK_SIZE)
+                lower_current_nonnegative = pl.maximum(lower_current_distance, 0)
+                lower_current_bound = pl.minimum(lower_current_nonnegative, 1)
+                lower_relative_plus_one = pl.add(lower_relative_row, 1)
+                lower_relative_nonnegative = pl.maximum(lower_relative_plus_one, 0)
+                lower_is_current = pl.minimum(lower_relative_nonnegative, 1)
+                # This private table is always page+1 (raw_root_seed above),
+                # unlike the externally paged persistent cache.
+                lower_base_delta = pl.mul(lower_is_current, BLOCK_SIZE - CP_HISTORY_ROW0 - T)
+                lower_base = pl.add(lower_base_delta, CP_HISTORY_ROW0 + T)
+                lower_address = pl.add(lower_relative_row, lower_base)
+                lower_history_valid = pl.mul(lower_pseudo_valid, lower_history_bound)
+                lower_valid = pl.mul(lower_history_valid, lower_current_bound)
+                lower_address_plus_one = pl.add(lower_address, 1)
+                lower_masked_address = pl.mul(lower_address_plus_one, lower_valid)
+                lower_stage = pl.add(lower_masked_address, -1)
             raw_physical_indices[lower_row : lower_row + 1, 0:WIN] = lower_stage
 
-    with pl.spmd(((LOCAL_ROWS) + 8 - 1) // 8, name_hint="cp_csa_physical_valid_mask", deps=[raw_index_tid]) as raw_mask_tid:
-        # One block owns 8 rows; the rows are independent.
+    with pl.spmd(((LOCAL_ROWS) + 32 - 1) // 32, name_hint="cp_csa_physical_valid_mask", deps=[raw_index_tid]) as raw_mask_tid:
+        # Thirty-two independent validity rows per block.
         mask_row_blk = pl.tile.get_block_idx()
-        for mask_row_i in pl.range(8):
-            mask_row = mask_row_blk * 8 + mask_row_i
+        mask_raw_maxima = pl.create_tensor([WIN // BLOCK_SIZE, 32], dtype=pl.FP32)
+        for raw_mask_block in pl.range(WIN // BLOCK_SIZE):
+            raw_mask_rows = raw_physical_indices[
+                mask_row_blk * 32 : mask_row_blk * 32 + 32,
+                raw_mask_block * BLOCK_SIZE : (raw_mask_block + 1) * BLOCK_SIZE,
+            ]
+            # The reduction rows satisfy the column-tile alignment contract.
+            raw_mask_rows_fp32 = pl.cast(raw_mask_rows, target_type=pl.FP32)
+            raw_mask_max = pl.row_max(raw_mask_rows_fp32)
+            mask_raw_maxima[raw_mask_block : raw_mask_block + 1, :] = pl.reshape(raw_mask_max, [1, 32])
+        for mask_row_i in pl.range(32):
+            mask_row = mask_row_blk * 32 + mask_row_i
             mask_tile = mask_row // T
             mask_tile_row = mask_row - mask_tile * T
             mask_active = pl.read(overlay_active_flat, [mask_tile, 1])
@@ -2290,10 +2326,9 @@ def prefill_attention_csa(
                 block_valid = pl.cast(0, pl.INT32)
                 block_col0 = sparse_block * BLOCK_SIZE
                 if block_col0 < WIN:
-                    for block_col in pl.range(BLOCK_SIZE):
-                        sparse_index = pl.read(raw_physical_indices, [mask_row, block_col0 + block_col])
-                        if sparse_index >= 0:
-                            block_valid = pl.cast(1, pl.INT32)
+                    # Float conversion preserves the sign of every INT32 index.
+                    if pl.read(mask_raw_maxima, [sparse_block, mask_row_i]) >= 0.0:
+                        block_valid = pl.cast(1, pl.INT32)
                 else:
                     # TopK writes a dense valid prefix followed by -1.  Recipes'
                     # block-liveness mask is therefore just a comparison against
@@ -2337,10 +2372,11 @@ def prefill_attention_csa(
     out_part0 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [0, 0, 0])
     part0_attn_tid = prefill_physical_attention(
         q_part0, cp_tmp_raw_kv, raw_indices_part0, cp_tmp_cmp_kv,
-        cp_tmp_block_table, cmp_indices_part0, mask_part0, attn_sink,
+        cmp_block_table, cmp_indices_part0, mask_part0, attn_sink,
         cos_part0, sin_part0, wo_a, wo_b,
         wo_b_scale, residual_part0, post_part0, comb_part0,
         out_part0, part0_active, raw_attention_ready_tid, compressed_attention_ready_tid,
+        CONTIGUOUS_CMP_PAGES=True,
     )
     part1_compressed_ready_tid = pl.system.task_dummy(deps=[raw_mask_tid, part1_indexer_ready_tid])
     q_part1 = pl.slice(q, [SEGMENT_ROWS, H, HEAD_DIM], [SEGMENT_ROWS, 0, 0])
@@ -2355,10 +2391,11 @@ def prefill_attention_csa(
     out_part1 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [SEGMENT_ROWS, 0, 0])
     part1_attn_tid = prefill_physical_attention(
         q_part1, cp_tmp_raw_kv, raw_indices_part1, cp_tmp_cmp_kv,
-        cp_tmp_block_table, cmp_indices_part1, mask_part1, attn_sink,
+        cmp_block_table, cmp_indices_part1, mask_part1, attn_sink,
         cos_part1, sin_part1, wo_a, wo_b,
         wo_b_scale, residual_part1, post_part1, comb_part1,
         out_part1, part1_active, raw_attention_ready_tid, part1_compressed_ready_tid,
+        CONTIGUOUS_CMP_PAGES=True,
     )
     attention_done_tid = pl.system.task_dummy(deps=[part0_attn_tid, part1_attn_tid])
 

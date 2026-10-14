@@ -439,7 +439,6 @@ def _prefill_indexer_cp_score_topk(
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP16],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     prior_dep: pl.Scalar[pl.TASK_ID],
@@ -448,25 +447,26 @@ def _prefill_indexer_cp_score_topk(
     pl.Tensor[[T, IDX_TOPK], pl.INT32],
     pl.Scalar[pl.TASK_ID],
 ]:
-    """Compute CP indexer query scores and top-k selections."""
+    """Score CP temporary roots with logical page p stored at physical page p + 1."""
     # Project quantized query rows.
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_cp_idx_qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
-            q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
-            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
-        wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            qr_acc_tile = qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            acc_fp32 = pl.cast(qr_acc_tile, target_type=pl.FP32, mode="none")
-            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            qr_scaled = pl.row_expand_mul(acc_fp32, scale_dq)
-            qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
-            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
+    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE // 2, name_hint="prefill_cp_idx_qr_proj"):
+        for tile_in_block in pl.range(2):
+            o0 = (idx * 2 + tile_in_block) * Q_OUT_TILE
+            qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+                q0 = kb * Q_TILE
+                qr_tile = qr[:, q0 : q0 + Q_TILE]
+                wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile, init_cond=(q0 == 0))
+            wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
+            for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
+                qr_acc_tile = qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :]
+                acc_fp32 = pl.cast(qr_acc_tile, target_type=pl.FP32, mode="none")
+                scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+                qr_scaled = pl.row_expand_mul(acc_fp32, scale_dq)
+                qr_dequant = pl.col_expand_mul(qr_scaled, wq_scale)
+                qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
     # Materialize interleaved RoPE rows.
     rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -504,7 +504,7 @@ def _prefill_indexer_cp_score_topk(
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     for token_idx_blk in pl.spmd((T) // 4, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=True):
-        # Four tiles per block; the tile size itself is unchanged.
+        # Four token tiles per block.
         for token_idx_g in pl.range(4):
             token_idx = token_idx_blk * 4 + token_idx_g
             r0 = token_idx * ROPE_ROW_TILE
@@ -523,7 +523,7 @@ def _prefill_indexer_cp_score_topk(
 
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
     for mm_idx_blk in pl.spmd((T * IDX_N_HEADS // QH_MM_TILE) // 4, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=True):
-        # Four tiles per block; the tile size itself is unchanged.
+        # Four Hadamard tiles per block.
         for mm_idx_g in pl.range(4):
             mm_idx = mm_idx_blk * 4 + mm_idx_g
             r0 = mm_idx * QH_MM_TILE
@@ -535,30 +535,29 @@ def _prefill_indexer_cp_score_topk(
     # QuantLightningIndexer consumes per-token-head query scales as FP16.
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP16)
     for quant_idx_blk in pl.spmd((T * IDX_N_HEADS // QH_QUANT_ROW_TILE) // 4, name_hint="prefill_cp_idx_qr_quant", allow_early_resolve=True):
-        # Four tiles per block; the tile size itself is unchanged.
+        # Four quantization tiles per block.
         for quant_idx_g in pl.range(4):
             quant_idx = quant_idx_blk * 4 + quant_idx_g
             r0 = quant_idx * QH_QUANT_ROW_TILE
             qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
-                qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
-                qh_row_max = pl.reshape(pl.row_max(qh_abs), [1, QH_QUANT_ROW_TILE])
-                qh_amax = pl.maximum(qh_amax, qh_row_max)
+            qh_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, :]
+            qh_neg = pl.neg(qh_tile)
+            qh_abs = pl.maximum(qh_tile, qh_neg)
+            qh_row_max_column = pl.row_max(qh_abs)
+            qh_row_max = pl.reshape(qh_row_max_column, [1, QH_QUANT_ROW_TILE])
+            qh_amax = pl.maximum(qh_amax, qh_row_max)
             scale_max = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
             scale_quant_row = pl.div(scale_max, qh_amax)
-            qr_scale_tile = pl.reshape(pl.recip(scale_quant_row), [QH_QUANT_ROW_TILE, 1])
-            qr_hadamard_scale_dq[
-                r0 : r0 + QH_QUANT_ROW_TILE, :
-            ] = pl.cast(qr_scale_tile, target_type=pl.FP16, mode="rint")
+            qr_scale_row = pl.recip(scale_quant_row)
+            qr_scale_tile = pl.reshape(qr_scale_row, [QH_QUANT_ROW_TILE, 1])
+            qr_scale_fp16 = pl.cast(qr_scale_tile, target_type=pl.FP16, mode="rint")
+            qr_hadamard_scale_dq[r0 : r0 + QH_QUANT_ROW_TILE, :] = qr_scale_fp16
             scale_quant = pl.reshape(scale_quant_row, [QH_QUANT_ROW_TILE, 1])
-            for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                qh_quant_tile = qh_acc_gm[r0 : r0 + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE]
-                qh_scaled = pl.row_expand_mul(qh_quant_tile, scale_quant)
-                qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
-                qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
-                qh_i8 = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
-                qr_hadamard_i8[r0 : r0 + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
+            qh_scaled = pl.row_expand_mul(qh_tile, scale_quant)
+            qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
+            qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
+            qh_i8 = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
+            qr_hadamard_i8[r0 : r0 + QH_QUANT_ROW_TILE, :] = qh_i8
 
     # Project per-head weights. Recipes rounds this LI input to FP16.
     weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP16)
@@ -580,7 +579,7 @@ def _prefill_indexer_cp_score_topk(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, IDX_HEAD_DIM])
     kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
-    # Page 0 of the scored root is the zero sentinel; the rest are candidate rows.
+    # Page 0 is reserved and never scored; the rest are candidate rows.
     candidate_rows = pl.min((idx_block_num - 1) * BLOCK_SIZE, CP_INDEXER_SCORE_CAP)
     score_cols = ((candidate_rows + CP_INDEXER_LEAF_LEN - 1) // CP_INDEXER_LEAF_LEN) * CP_INDEXER_LEAF_LEN
     score_wide = pl.create_tensor([T, score_cols], dtype=pl.FP32)
@@ -600,8 +599,8 @@ def _prefill_indexer_cp_score_topk(
             logical_block = cache0 // BLOCK_SIZE
             page_offset = cache0 % BLOCK_SIZE
             if visible_limit > cache0 and logical_block < IDX_CACHE_MAX_BLOCKS:
-                physical_block_raw = pl.read(idx_block_table, [logical_block])
-                # Recipes page 0 is a zero sentinel, never a data page.
+                physical_block_raw = pl.cast(logical_block + 1, pl.INT32)
+                # The CP temporary root never stores candidate data in page 0.
                 if physical_block_raw > 0 and physical_block_raw < idx_block_num:
                     kv_row0 = (pl.cast(physical_block_raw, pl.INDEX) * BLOCK_SIZE + page_offset)
                     kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CP_SCORE_CACHE_TILE, 0:IDX_HEAD_DIM]

@@ -753,6 +753,7 @@ def _physical_sparse_wave(
     raw_ready_tid: pl.Scalar[pl.TASK_ID],
     compressed_ready_tid: pl.Scalar[pl.TASK_ID],
     merge_ready_tid: pl.Scalar[pl.TASK_ID],
+    CONTIGUOUS_CMP_PAGES: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Run one DSpark-style gather/QK-PV/merge wave from physical roots."""
     token_rows = pl.tensor.dim(q, 0)
@@ -762,6 +763,10 @@ def _physical_sparse_wave(
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp_page_rows = pl.tensor.dim(cmp_kv, 1)
+    cmp_cache_rows = cmp_block_num * cmp_page_rows
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+    cmp_page_size = pl.cast(cmp_page_rows, pl.INT32)
+    cmp_page_count = pl.cast(cmp_block_num, pl.INT32)
     gather_blocks = (token_rows + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
     gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
 
@@ -794,6 +799,7 @@ def _physical_sparse_wave(
                 ori_stage = pl.tile.mgather(ori_kv_flat, gather_fix, coalesce="row")
                 pl.store(ori_stage, [block_base, 0], source_view)
 
+    cmp_block_table_view = pl.reshape(cmp_block_table, [1, CMP_MAX_BLOCKS])
     with pl.spmd(gather_cmp_blocks, name_hint="physical_sparse_gather_cmp", deps=[compressed_ready_tid]) as gather_cmp_tid:
         gather_block = pl.tile.get_block_idx()
         gather_schedule_block = (gather_block // (PREFILL_ATTN_BLOCKS - 1))
@@ -808,23 +814,108 @@ def _physical_sparse_wave(
                 gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
                 if gather_block_valid > 0:
                     block_base = (gather_local_t * PREFILL_SPARSE_PAD + gather_k0)
-                    stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                        gather_cmp_k = gather_k0 + gather_ki - WIN
-                        if gather_cmp_k < IDX_TOPK:
-                            logical_slot = pl.read(cmp_indices, [gather_t, gather_cmp_k])
-                            if logical_slot >= 0:
-                                logical_block = logical_slot // cmp_page_rows
-                                if logical_block < CMP_MAX_BLOCKS:
-                                    physical_block = pl.read(cmp_block_table, [logical_block])
-                                    # Validity comes from the indices; physical page 0 is valid
-                                    # in caller-owned MTP cache pools.
-                                    if physical_block >= 0 and physical_block < cmp_block_num:
-                                        page = pl.cast(physical_block, pl.INDEX)
-                                        row = logical_slot % cmp_page_rows
-                                        kv_row = cmp_kv[page:page + 1, row:row + 1, 0:1, 0:HEAD_DIM]
-                                        stage[gather_ki:gather_ki + 1, :] = pl.reshape(kv_row, [1, HEAD_DIM])
-                    source_view[block_base : block_base + PREFILL_ATTN_TILE, 0:HEAD_DIM] = stage
+                    if cmp_page_size == 128:
+                        gather_cmp_start = gather_k0 - WIN
+                        gather_cmp_valid = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_start)
+                        gather_slots = pl.load(
+                            cmp_indices, [gather_t, gather_cmp_start], [1, PREFILL_ATTN_TILE],
+                            valid_shape=[1, gather_cmp_valid],
+                        )
+                        gather_slots = pl.tile.fillpad(gather_slots, pad_value=pl.PadValue.min)
+                        gather_slots_plus_one = pl.add(gather_slots, 1)
+                        gather_slots_positive = pl.maximum(gather_slots_plus_one, 0)
+                        gather_slot_valid = pl.minimum(gather_slots_positive, 1)
+                        gather_slots_nonnegative = pl.maximum(gather_slots, 0)
+                        gather_logical_blocks = pl.tile.shrs(gather_slots_nonnegative, 7)
+                        gather_page_starts = pl.mul(gather_logical_blocks, 128)
+                        gather_rows = pl.sub(gather_slots_nonnegative, gather_page_starts)
+                        gather_negative_blocks = pl.mul(gather_logical_blocks, -1)
+                        gather_table_distance = pl.add(gather_negative_blocks, CMP_MAX_BLOCKS)
+                        gather_table_nonnegative = pl.maximum(gather_table_distance, 0)
+                        gather_table_valid = pl.minimum(gather_table_nonnegative, 1)
+                        gather_nonnegative_blocks = pl.maximum(gather_logical_blocks, 0)
+                        gather_table_indices = pl.minimum(gather_nonnegative_blocks, CMP_MAX_BLOCKS - 1)
+                        if CONTIGUOUS_CMP_PAGES:
+                            # CP roots reserve page zero and store logical page p at p + 1.
+                            gather_page_offset = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
+                            gather_pages = pl.add(gather_page_offset, gather_logical_blocks)
+                        else:
+                            gather_table = pl.load(cmp_block_table_view, [0, 0], [1, CMP_MAX_BLOCKS])
+                            gather_table_tmp = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
+                            gather_pages = pl.tile.gather(gather_table, gather_table_indices, gather_table_tmp)
+                        gather_pages_plus_one = pl.add(gather_pages, 1)
+                        gather_pages_positive = pl.maximum(gather_pages_plus_one, 0)
+                        gather_page_nonnegative = pl.minimum(gather_pages_positive, 1)
+                        gather_negative_pages = pl.mul(gather_pages, -1)
+                        gather_page_distance = pl.add(gather_negative_pages, cmp_page_count)
+                        gather_page_distance_positive = pl.maximum(gather_page_distance, 0)
+                        gather_page_in_range = pl.minimum(gather_page_distance_positive, 1)
+                        gather_logical_valid = pl.mul(gather_slot_valid, gather_table_valid)
+                        gather_physical_valid = pl.mul(gather_page_nonnegative, gather_page_in_range)
+                        gather_valid = pl.mul(gather_logical_valid, gather_physical_valid)
+                        gather_physical_page_starts = pl.mul(gather_pages, 128)
+                        gather_physical_rows = pl.add(gather_physical_page_starts, gather_rows)
+                        gather_rows_plus_one = pl.add(gather_physical_rows, 1)
+                        gather_masked_rows = pl.mul(gather_valid, gather_rows_plus_one)
+                        gather_vector_rows = pl.sub(gather_masked_rows, 1)
+                        gather_safe_rows = pl.maximum(gather_vector_rows, 0)
+                        # Eight INT32 rows satisfy the 32-byte reduction-column alignment.
+                        gather_reduce_ones = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
+                        gather_valid_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid)
+                        gather_reduce_tmp = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
+                        gather_count_tile = pl.tile.row_sum(gather_valid_matrix, gather_reduce_tmp)
+                        gather_count = pl.tile.read(gather_count_tile, [0, 0])
+                        gather_valid_count = pl.cast(gather_count, pl.INDEX)
+                        gather_lane_ends = pl.tile.arange(1, [1, PREFILL_ATTN_TILE], dtype=pl.INT32)
+                        gather_valid_ends = pl.mul(gather_lane_ends, gather_valid)
+                        gather_end_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid_ends)
+                        gather_end_tile = pl.tile.row_max(gather_end_matrix, gather_reduce_tmp)
+                        gather_end = pl.tile.read(gather_end_tile, [0, 0])
+                        gather_valid_end = pl.cast(gather_end, pl.INDEX)
+                        if gather_valid_count == 0:
+                            gather_empty_stage = pl.tile.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                            pl.store(gather_empty_stage, [block_base, 0], source_view)
+                        elif gather_valid_end == gather_valid_count:
+                            gather_prefix_indices = pl.tile.set_validshape(gather_safe_rows, 1, gather_valid_count)
+                            gather_prefix_stage = pl.tile.mgather(cmp_kv_flat, gather_prefix_indices, coalesce="row")
+                            gather_prefix_filled = pl.tile.fillpad_inplace(gather_prefix_stage)
+                            gather_prefix_full = pl.tile.set_validshape(gather_prefix_filled, PREFILL_ATTN_TILE, HEAD_DIM)
+                            pl.store(gather_prefix_full, [block_base, 0], source_view)
+                        else:
+                            gather_mask_ones = pl.tile.full([HEAD_DIM // 32, PREFILL_ATTN_TILE], dtype=pl.INT32, value=-1)
+                            gather_mask_columns = pl.tile.col_expand_mul(gather_mask_ones, gather_valid)
+                            gather_mask_words = pl.tile.transpose(gather_mask_columns, axis1=0, axis2=1)
+                            gather_mask = pl.tile.reinterpret_view(gather_mask_words, pl.UINT8)
+                            vector_stage = pl.tile.mgather(cmp_kv_flat, gather_safe_rows, coalesce="row")
+                            vector_stage_fp16 = pl.tile.reinterpret_view(vector_stage, pl.FP16)
+                            gather_select_tmp = pl.tile.full([1, HEAD_DIM], dtype=pl.FP16, value=0.0)
+                            gather_zero = pl.cast(0.0, pl.FP16)
+                            vector_selected_fp16 = pl.tile.sels(
+                                gather_mask, vector_stage_fp16, gather_select_tmp, gather_zero,
+                            )
+                            vector_selected = pl.tile.reinterpret_view(vector_selected_fp16, pl.BF16)
+                            pl.store(vector_selected, [block_base, 0], source_view)
+                    else:
+                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                            gather_cmp_k = gather_k0 + gather_ki - WIN
+                            if gather_cmp_k < IDX_TOPK:
+                                logical_slot = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                                if logical_slot >= 0:
+                                    logical_block = logical_slot // cmp_page_rows
+                                    if logical_block < CMP_MAX_BLOCKS:
+                                        if CONTIGUOUS_CMP_PAGES:
+                                            physical_block = pl.cast(logical_block + 1, pl.INT32)
+                                        else:
+                                            physical_block = pl.read(cmp_block_table, [logical_block])
+                                        # Validity comes from the indices; physical page 0 is valid
+                                        # in caller-owned MTP cache pools.
+                                        if physical_block >= 0 and physical_block < cmp_block_num:
+                                            page = pl.cast(physical_block, pl.INDEX)
+                                            row = logical_slot % cmp_page_rows
+                                            kv_row = cmp_kv[page:page + 1, row:row + 1, 0:1, 0:HEAD_DIM]
+                                            stage[gather_ki:gather_ki + 1, :] = pl.reshape(kv_row, [1, HEAD_DIM])
+                        source_view[block_base : block_base + PREFILL_ATTN_TILE, 0:HEAD_DIM] = stage
 
     with pl.spmd(
         (token_rows + BIAS_TOKEN_TILE - 1) // BIAS_TOKEN_TILE,
@@ -894,6 +985,7 @@ def _physical_sparse_heads(
     packed_init_tid: pl.Scalar[pl.TASK_ID],
     raw_ready_dep: pl.Scalar[pl.TASK_ID],
     compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+    CONTIGUOUS_CMP_PAGES: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Run a segment-sized physical-gather wave with split source dependencies."""
     token_rows = pl.tensor.dim(q, 0)
@@ -945,6 +1037,7 @@ def _physical_sparse_heads(
             raw_ready_dep,
             compressed_ready_dep,
             merge_ready_tid,
+            CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
         )
         completion[0] = merge_tid
 
@@ -1571,8 +1664,9 @@ def physical_sparse_attn(
     active_rows: pl.Scalar[pl.INT32],
     raw_ready_dep: pl.Scalar[pl.TASK_ID],
     compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+    CONTIGUOUS_CMP_PAGES: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Run variable-length TopK attention from Recipes physical roots."""
+    """Run TopK attention; contiguous compressed roots bypass cmp_block_table."""
     token_rows = pl.tensor.dim(q, 0)
     projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
     packed_head_rows = projection_rows * H
@@ -1614,6 +1708,7 @@ def physical_sparse_attn(
             packed_init_tid,
             raw_ready_dep,
             compressed_ready_dep,
+            CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
         )
         _attn_out, projection_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_tid)
         completion[0] = projection_tid
@@ -1784,6 +1879,7 @@ def prefill_physical_attention(
     active_rows: pl.Scalar[pl.INT32],
     raw_ready_dep: pl.Scalar[pl.TASK_ID],
     compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+    CONTIGUOUS_CMP_PAGES: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Shared physical-cache attention, output projection, and HC residual update."""
     rows = pl.tensor.dim(q, 0)
@@ -1801,6 +1897,7 @@ def prefill_physical_attention(
         q_active, ori_kv, raw_indices, cmp_kv, cmp_block_table, compressed_indices, mask_active, attn_sink,
         cos_active, sin_active, wo_a, wo_b, wo_b_scale,
         attn_active, active_rows, raw_ready_dep, compressed_ready_dep,
+        CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
     )
     residual_view = pl.reshape(residual, [rows, HC_MULT, D])
     post_view = pl.reshape(post, [rows, HC_MULT])
@@ -1846,6 +1943,7 @@ def _sparse_attn(
         cmp_indices, valid_block_mask, attn_sink,
         freqs_cos, freqs_sin, wo_a, wo_b, wo_b_scale,
         attn_out, num_tokens, sources_ready, sources_ready,
+        CONTIGUOUS_CMP_PAGES=False,
     )
     return attn_out
 
