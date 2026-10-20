@@ -1237,43 +1237,37 @@ def make_prefill_moe(layout: PrefillMoELayout):
             _completed = pl.read(dispatch_completion, [0, 0])
 
 
+        # Retain grouped output through reverse exchange; release expert input and scratch first.
+        grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
+        grouped_expert_tids = pl.array.create(1, pl.TASK_ID)
         with pl.scope():
             grouped_x = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.INT8)
             grouped_scale = pl.create_tensor(
                 [PREFILL_MOE_GROUPED_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32
             )
-            grouped_y = pl.create_tensor([PREFILL_MOE_GROUPED_TOTAL_CAP, D], dtype=pl.BF16)
             _prefill_moe_pack_grouped_experts(
-                dense_x,
-                dense_scale,
-                expert_counts,
-                grouped_x,
-                grouped_scale,
-                dispatch_tid,
+                dense_x, dense_scale, expert_counts,
+                grouped_x, grouped_scale, dispatch_tid,
             )
 
-            grouped_expert_tid = prefill_expert_grouped(
-                grouped_x,
-                grouped_scale,
-                expert_counts,
-                routed_w1,
-                routed_w1_scale,
-                routed_w3,
-                routed_w3_scale,
-                routed_w2,
-                routed_w2_scale,
+            grouped_expert_tids[0] = prefill_expert_grouped(
+                grouped_x, grouped_scale, expert_counts,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+                routed_w2, routed_w2_scale,
                 grouped_y,
             )
 
-            # Reverse exchange consumes the live rows of the aligned expert output.
-            with pl.scope():
-                prefill_moe_combine(
-                    grouped_y, expert_counts, recv_expert_counts,
-                    route_to_packed, send_counts,
-                    shared_y, ffn_out, returned_y,
-                    reverse_target, reverse_signal,
-                    num_tokens, dispatch_tid, grouped_expert_tid, moe_epoch,
-                )
+        grouped_expert_tid = pl.system.task_dummy(deps=[grouped_expert_tids])
+
+        # Reverse exchange consumes the live rows of the aligned expert output.
+        with pl.scope():
+            prefill_moe_combine(
+                grouped_y, expert_counts, recv_expert_counts,
+                route_to_packed, send_counts,
+                shared_y, ffn_out, returned_y,
+                reverse_target, reverse_signal,
+                num_tokens, dispatch_tid, grouped_expert_tid, moe_epoch,
+            )
 
         hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
         with pl.at(
