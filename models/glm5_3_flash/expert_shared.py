@@ -34,6 +34,7 @@ import torch
 from models.glm5_3_flash.config import D, FLASH, T_DYN
 from models.glm5_3_flash.golden import expert
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.glm5_3_flash.weights import pack_int8_nz, unpack_int8_nz
 
 # This directory owns a ``golden.py`` reference module, so the repository-root
 # ``golden`` harness package must come first on the path before any harness import.
@@ -76,9 +77,9 @@ def golden_expert_shared(
 def expert_shared(
     x_int8: pl.Tensor[[T_DYN, D], pl.INT8],
     x_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8],
+    w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
     w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     w_down_scale: pl.Tensor[[D], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
@@ -205,9 +206,9 @@ def expert_shared(
 def expert_shared_test(
     x_int8: pl.Tensor[[T_DYN, D], pl.INT8],
     x_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
-    w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8],
+    w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
     w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     w_down_scale: pl.Tensor[[D], pl.FP32],
     output: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
 ):
@@ -225,14 +226,14 @@ def expert_shared_test(
 
 
 def golden_expert_shared_fn(tensors):
-    """Torch reference for the shared expert over the fused gate/up layout."""
+    """Decode NZ INT8 weights, then evaluate the unchanged fused gate/up reference."""
     from models.glm5_3_flash.quantization import quantize_per_token_int8
 
     x_int8 = tensors["x_int8"].to(torch.int32)
     x_scale = tensors["x_scale"].float()
-    gate_up_i8 = tensors["w_gate_up"].to(torch.int32)
+    gate_up_i8 = unpack_int8_nz(tensors["w_gate_up"]).to(torch.int32)
     gate_up_scale = tensors["w_gate_up_scale"].float()
-    w_down_i8 = tensors["w_down"].to(torch.int32)
+    w_down_i8 = unpack_int8_nz(tensors["w_down"]).to(torch.int32)
     w_down_scale = tensors["w_down_scale"].float()
 
     gate_i = x_int8 @ gate_up_i8[:MOE_INTER].T
@@ -291,9 +292,9 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
     return [
         TensorSpec("x_int8", [num_tokens, D], torch.int8, init_value=init_x_int8),
         TensorSpec("x_scale", [num_tokens, 1], torch.float32, init_value=init_x_scale),
-        TensorSpec("w_gate_up", [2 * MOE_INTER, D], torch.int8, init_value=lambda: sw_gu_i8),
+        TensorSpec("w_gate_up", [2 * MOE_INTER, D], torch.int8, init_value=lambda: pack_int8_nz(sw_gu_i8)),
         TensorSpec("w_gate_up_scale", [2 * MOE_INTER], torch.float32, init_value=lambda: sw_gu_s),
-        TensorSpec("w_down", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
+        TensorSpec("w_down", [D, MOE_INTER], torch.int8, init_value=lambda: pack_int8_nz(sw2_i8)),
         TensorSpec("w_down_scale", [D], torch.float32, init_value=lambda: sw2_s),
         TensorSpec("output", [num_tokens, D], torch.float32),
     ]

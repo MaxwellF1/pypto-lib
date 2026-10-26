@@ -1396,7 +1396,7 @@ def _reload_from_dir(work_dir: Path, cfg: Any) -> Any:
     :func:`_validate_compiled_spec_abi` needs to stamp spec directions, which a
     dispatch straight at the directory cannot supply.
 
-    The run's backend and execution mode override the persisted target, so
+    The run's canonical platform and codegen backend override the persisted target, so
     ``--runtime-dir ... -p a2a3 -d 2,3`` replays on the requested target.
     """
     if (work_dir / "distributed_meta.json").exists():
@@ -1405,13 +1405,13 @@ def _reload_from_dir(work_dir: Path, cfg: Any) -> Any:
         return DistributedCompiledProgram.from_dir(
             work_dir,
             backend_type=cfg.backend_type,
-            execution_mode=cfg.execution_mode,
+            platform=cfg.platform,
             distributed_config=cfg.distributed_config,
         )
     from pypto.ir import CompiledProgram
 
     return CompiledProgram.from_dir(
-        work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+        work_dir, platform=cfg.platform, backend_type=cfg.backend_type,
     )
 
 

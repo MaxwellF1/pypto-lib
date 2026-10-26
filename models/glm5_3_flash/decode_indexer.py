@@ -69,7 +69,7 @@ from models.glm5_3_flash.prefill_indexer import LEAF
 from models.glm5_3_flash.prefill_indexer import golden_indexer_expand, golden_indexer_proj
 from models.glm5_3_flash.prefill_indexer import golden_indexer_score, golden_indexer_topk
 from models.glm5_3_flash.prefill_indexer import indexer_expand, indexer_proj
-from models.glm5_3_flash.prefill_indexer import indexer_score_token, indexer_topk
+from models.glm5_3_flash.prefill_indexer import indexer_score, indexer_topk
 from models.glm5_3_flash.prefill_indexer import sylvester_hadamard
 from models.glm5_3_flash.indexer_cache import golden_indexer_cache_write, golden_indexer_pool_write
 from models.glm5_3_flash.quantization import quantize_per_token_int8
@@ -157,7 +157,7 @@ def decode_indexer_step_test(
     indexer_pool_write(
         raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid
     )
-    indexer_score_token(
+    indexer_score(
         index_q,
         hadamard,
         pool_cache,
@@ -795,7 +795,7 @@ __all__ = [
     "indexer_cache_write",
     "indexer_expand",
     "indexer_proj",
-    "indexer_score_token",
+    "indexer_score",
     "indexer_topk",
     "indexer_pool_write",
 ]

@@ -35,8 +35,8 @@ remains here is the per-query half:
    segment in the compacted pool id space and ``pool_count`` is the causally
    visible pool count, ``(position + 1) // index_kpool`` clamped to the
    request's pool count. Lanes outside a query's visible window are
-   **undefined scratch**: prefill group tiles store their whole 128-lane span
-   and no init or post-mask pass cleans the rest, so only :func:`indexer_topk`
+   **undefined scratch**: score tiles mask their final tail but leave the
+   remaining matrix untouched, so only :func:`indexer_topk`
    — whose leaf loads clamp through their valid shape and ``PadValue.min``
    fill — may read this matrix.
 3. **Selection.** Exact top ``index_topk / index_kpool`` = 512 pools per query
@@ -128,11 +128,6 @@ PROJ_K_TILE = 128
 Q_OUT_TILE = 256
 QH_MM_TILE = 64
 SCORE_C_TILE = 64
-# Donor CP scorer shape: one block walks SCORE_TOKEN_TILE queries through
-# SCORE_KV_TILE-wide key tiles, loading each gathered key tile once for the
-# whole group. The token count must be a multiple of SCORE_TOKEN_TILE.
-SCORE_TOKEN_TILE = 4
-SCORE_KV_TILE = 128
 # The pooled table is addressed in INDEX_STATE_BLOCK_SIZE-row pages: the host
 # hands the page table down (one physical base per page, the granularity
 # :mod:`models.glm5_3_flash.metadata` maps pool slots at), so the gather walks
@@ -377,12 +372,12 @@ def _indexer_score_prepare(
     # already quantized — nothing here re-quantizes. Row moves are Tensor
     # slice-assignments: a tile-level TLOAD of an INT8 row hits an unsupported
     # layout, and the donor reads its C8 cache the same way.
-    # The scratch carries SCORE_KV_TILE of slack, the widest tile any score
+    # The scratch carries SCORE_C_TILE of slack, the widest tile any score
     # loop reads: the production page table is not padded to a tile boundary,
     # so a score loop's final tile always starts inside the live rows and its
     # full-width read must stay in bounds.
-    pool_i8 = pl.create_tensor([pools + SCORE_KV_TILE, INDEX_DIM], dtype=pl.INT8)
-    pool_scale_g = pl.create_tensor([pools + SCORE_KV_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
+    pool_i8 = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.INT8)
+    pool_scale_g = pl.create_tensor([pools + SCORE_C_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
     for page in pl.spmd(pl.tensor.dim(pool_blocks, 0), name_hint="indexer_pool_gather"):
         p0_idx = pl.cast(page, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
         base = pl.cast(pl.read(pool_blocks, [page]), pl.INDEX)
@@ -397,7 +392,7 @@ def _indexer_score_prepare(
     # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
     # The softmax scale rides along here (it is per-row constant), so the score
     # loops never multiply it per tile.
-    pool_scale_col = pl.create_tensor([pools + SCORE_KV_TILE, 1], dtype=pl.FP32)
+    pool_scale_col = pl.create_tensor([pools + SCORE_C_TILE, 1], dtype=pl.FP32)
     # pools is the page-table length times INDEX_STATE_BLOCK_SIZE and is NOT
     # padded to SCORE_C_TILE — the production page table ends at the last live
     # page — so the dispatch is ceiled: the final partial tile still packs its
@@ -426,142 +421,12 @@ def indexer_score(
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
     index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
 ):
-    """Score every query row against its request's pooled keys, prefill shape.
+    """Score each query's own pooled-key segment for prefill and decode.
 
-    ``pool_blocks`` holds one physical base row per compacted
-    INDEX_STATE_BLOCK_SIZE-row page — the host lowers the pool page table at
-    that granularity, the kernel gathers page by page. The table rows
-    are INT8 with per-row dequant scales, rotated into the Hadamard basis and
-    quantized once at pool close, so the
-    scorer only gathers them into contiguous scratch and never re-quantizes
-    (donor C8 shape). The score matrix width must be a multiple of
-    :data:`LEAF` with at least one leaf of slack beyond the last request's
-    window, so the scorer's stores and the top-k's leaf loads never address
-    past the tensor. Lanes outside a query's visible window are **undefined**:
-    a group's tiles store their whole 128-lane span and nothing cleans the
-    rest, so the only legal reader is :func:`indexer_topk`, whose leaf loads
-    clamp to the visible tail through their valid shape. The token count must
-    be a multiple of :data:`SCORE_TOKEN_TILE`.
-    """
-    t_dim = pl.tensor.dim(index_q, 0)
-    q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks
-    )
-
-    # Donor CP shape: one block owns SCORE_TOKEN_TILE consecutive queries and
-    # walks the group's combined pool span in SCORE_KV_TILE-wide tiles, so each
-    # gathered key tile is loaded once and multiplied against every query in the
-    # group (the donor's SCORE_TOKEN_TILE/CACHE_TILE reuse). The per-tile
-    # epilogue is minimal — cast, the pre-scaled key dequant, relu, one fused
-    # query multiplier (scale times head weight), the head row_sum — because
-    # per-tile vector ops dominate this loop (E8 anchors: the mmads alone run
-    # 15x faster than the full score). Overlap tiles store their whole lane
-    # span; lanes outside a query's window stay undefined for the top-k's
-    # valid-shaped leaf loads to clamp (no init fill, no post-mask pass).
-    for g in pl.spmd(t_dim // SCORE_TOKEN_TILE, name_hint="indexer_score"):
-        g0 = pl.cast(g, pl.INT32) * SCORE_TOKEN_TILE
-        t0 = pl.cast(g0, pl.INDEX)
-        t1 = pl.cast(g0 + 1, pl.INDEX)
-        t2 = pl.cast(g0 + 2, pl.INDEX)
-        t3 = pl.cast(g0 + 3, pl.INDEX)
-        seg_a = pl.read(seg_start, [g0])
-        seg_b = pl.read(seg_start, [g0 + 1])
-        seg_c = pl.read(seg_start, [g0 + 2])
-        seg_d = pl.read(seg_start, [g0 + 3])
-        vis_a = pl.cast(pl.max(pl.read(pool_count, [g0]), 0), pl.INT32)
-        vis_b = pl.cast(pl.max(pl.read(pool_count, [g0 + 1]), 0), pl.INT32)
-        vis_c = pl.cast(pl.max(pl.read(pool_count, [g0 + 2]), 0), pl.INT32)
-        vis_d = pl.cast(pl.max(pl.read(pool_count, [g0 + 3]), 0), pl.INT32)
-        end_a = pl.add(seg_a, vis_a)
-        end_b = pl.add(seg_b, vis_b)
-        end_c = pl.add(seg_c, vis_c)
-        end_d = pl.add(seg_d, vis_d)
-        span_end = pl.cast(pl.max(pl.max(end_a, end_b), pl.max(end_c, end_d)), pl.INT32)
-        q_a = q_i8[t0 * INDEX_H : t0 * INDEX_H + INDEX_H, :]
-        q_b = q_i8[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :]
-        q_c = q_i8[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :]
-        q_d = q_i8[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :]
-        # One fused per-head multiplier: the dequant scale is positive, so it
-        # commutes with the relu and folds with the head weight into one factor.
-        qs_a = pl.reshape(q_scale_dq[t0 * INDEX_H : t0 * INDEX_H + INDEX_H, :], [1, INDEX_H])
-        qs_b = pl.reshape(q_scale_dq[t1 * INDEX_H : t1 * INDEX_H + INDEX_H, :], [1, INDEX_H])
-        qs_c = pl.reshape(q_scale_dq[t2 * INDEX_H : t2 * INDEX_H + INDEX_H, :], [1, INDEX_H])
-        qs_d = pl.reshape(q_scale_dq[t3 * INDEX_H : t3 * INDEX_H + INDEX_H, :], [1, INDEX_H])
-        qsw_a = pl.mul(qs_a, head_weights[g0 : g0 + 1, 0:INDEX_H])
-        qsw_b = pl.mul(qs_b, head_weights[g0 + 1 : g0 + 2, 0:INDEX_H])
-        qsw_c = pl.mul(qs_c, head_weights[g0 + 2 : g0 + 3, 0:INDEX_H])
-        qsw_d = pl.mul(qs_d, head_weights[g0 + 3 : g0 + 4, 0:INDEX_H])
-        for c0 in pl.range(0, span_end, SCORE_KV_TILE):
-            c0_i = pl.cast(c0, pl.INT32)
-            c0_idx = pl.cast(c0_i, pl.INDEX)
-            kv_q_i8 = pool_i8[c0_idx : c0_idx + SCORE_KV_TILE, :]
-            kv_cache_scale_dq = pool_scale_col[c0_idx : c0_idx + SCORE_KV_TILE, :]
-            tile_hi = c0_i + SCORE_KV_TILE
-
-            lo = pl.cast(pl.max(seg_a, c0_i), pl.INT32)
-            hi = pl.cast(pl.min(end_a, tile_hi), pl.INT32)
-            if hi > lo:
-                dots_i32 = pl.matmul(kv_q_i8, q_a, out_dtype=pl.INT32, b_trans=True)
-                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
-                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                relu = pl.maximum(dots, 0.0)
-                weighted = pl.col_expand_mul(relu, qsw_a)
-                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                index_scores[t0 : t0 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
-
-            lo = pl.cast(pl.max(seg_b, c0_i), pl.INT32)
-            hi = pl.cast(pl.min(end_b, tile_hi), pl.INT32)
-            if hi > lo:
-                dots_i32 = pl.matmul(kv_q_i8, q_b, out_dtype=pl.INT32, b_trans=True)
-                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
-                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                relu = pl.maximum(dots, 0.0)
-                weighted = pl.col_expand_mul(relu, qsw_b)
-                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                index_scores[t1 : t1 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
-
-            lo = pl.cast(pl.max(seg_c, c0_i), pl.INT32)
-            hi = pl.cast(pl.min(end_c, tile_hi), pl.INT32)
-            if hi > lo:
-                dots_i32 = pl.matmul(kv_q_i8, q_c, out_dtype=pl.INT32, b_trans=True)
-                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
-                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                relu = pl.maximum(dots, 0.0)
-                weighted = pl.col_expand_mul(relu, qsw_c)
-                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                index_scores[t2 : t2 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
-
-            lo = pl.cast(pl.max(seg_d, c0_i), pl.INT32)
-            hi = pl.cast(pl.min(end_d, tile_hi), pl.INT32)
-            if hi > lo:
-                dots_i32 = pl.matmul(kv_q_i8, q_d, out_dtype=pl.INT32, b_trans=True)
-                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
-                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                relu = pl.maximum(dots, 0.0)
-                weighted = pl.col_expand_mul(relu, qsw_d)
-                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_KV_TILE])
-                index_scores[t3 : t3 + 1, c0_idx : c0_idx + SCORE_KV_TILE] = row_score
-
-
-@pl.jit.inline
-def indexer_score_token(
-    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
-    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-):
-    """Score every query row against its request's pooled keys, decode shape.
-
-    Identical numerics to :func:`indexer_score` on the shared prologue, but one
-    block per query: a decode dispatch carries only a handful of tokens per
-    request, and the prefill shape's ``SCORE_TOKEN_TILE`` groups would leave
-    most vector cores idle (a 16-token step makes four blocks). The donor keeps
-    the same split — its decode scorer is per-query too.
+    One work item per query starts at its request's segment and skips an empty
+    window. Sparse batches and separated request segments therefore use the
+    same per-query schedule. Hadamard rotation, INT8 quantization and FP32
+    dequantization/reduction share the unchanged preparation and golden.
     """
     t_dim = pl.tensor.dim(index_q, 0)
     q_i8, q_scale_dq, pool_i8, pool_scale_col = _indexer_score_prepare(
@@ -1231,13 +1096,11 @@ def build_indexer_score_specs(
 def build_indexer_score_tail_specs():
     """Score batch whose gathered row count misses both score tile boundaries.
 
-    Thirty-three live four-row pages hold 132 pooled rows: the scale pack
-    loop's final 64-row tile is partial (132 % 64 = 4), and the prefill score
-    loop's final 128-row KV tile starts at row 128, past the old 64-row
-    scratch slack (132 % 128 = 4) — both tail shapes the production page table
-    hands the scorer, which the leaf-padded fixtures above cannot reach. The
-    position ramp climbs from an empty window through the 64-row boundary to
-    the full 132-row one.
+    Thirty-three live four-row pages hold 132 pooled rows, so the scale pack
+    and per-query score loops both end with a partial 64-row tile. This is
+    the production page-table tail shape that the leaf-padded fixtures above
+    cannot reach. The position ramp climbs from an empty window through the
+    64-row boundary to the full 132-row one.
     """
     return build_indexer_score_specs(8, (132,), (1, 3, 7, 15, 31, 63, 255, 527), pad_pages=False)
 
@@ -1971,6 +1834,27 @@ def main():
                     compile_only=args.compile_only,
                 )
             )
+            # Stable request slots can leave a large leading pooled-key gap.
+            # Only sixteen queries are live in this capacity-192 batch.
+            sparse_specs = build_indexer_score_specs(192, (388,), (0,) * 192)
+            sparse_segments = torch.zeros(192, dtype=torch.int32)
+            sparse_segments[:16] = 384
+            sparse_counts = torch.zeros(192, dtype=torch.int32)
+            sparse_counts[:16] = torch.arange(1, 17, dtype=torch.int32) // INDEX_KPOOL
+            for spec in sparse_specs:
+                if spec.name == "seg_start":
+                    spec.init_value = sparse_segments
+                elif spec.name == "pool_count":
+                    spec.init_value = sparse_counts
+            results.append(
+                run(
+                    fn=indexer_score_test,
+                    specs=sparse_specs,
+                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    compile_only=args.compile_only,
+                    **extra,
+                )
+            )
     if args.case in ("topk", "all"):
         if args.bench:
             specs = build_indexer_topk_specs(args.tokens, bench_counts, bench_positions)
@@ -2097,7 +1981,6 @@ __all__ = [
     "indexer_proj_test",
     "indexer_score",
     "indexer_score_test",
-    "indexer_score_token",
     "indexer_topk",
     "indexer_topk_test",
     "sylvester_hadamard",

@@ -231,13 +231,29 @@ def kda_conv_prefill(
             w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
             w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
 
-            # out[u] = sum_j w[j] * full[u + j]
-            acc0 = pl.add(pl.add(pl.mul(st0, w0), pl.mul(st1, w1)),
-                          pl.add(pl.mul(st2, w2), pl.mul(x0, w3)))
-            acc1 = pl.add(pl.add(pl.mul(st1, w0), pl.mul(st2, w1)),
-                          pl.add(pl.mul(x0, w2), pl.mul(x1, w3)))
-            acc2 = pl.add(pl.add(pl.mul(st2, w0), pl.mul(x0, w1)),
-                          pl.add(pl.mul(x1, w2), pl.mul(x2, w3)))
+            # Match the bulk/reference's left-to-right FP32 tap sum. Pairwise
+            # sums can cross a BF16 rounding tie when a token starts a new chunk.
+            a00 = pl.mul(st0, w0)
+            a01 = pl.mul(st1, w1)
+            a02 = pl.mul(st2, w2)
+            a03 = pl.mul(x0, w3)
+            acc0 = pl.add(a00, a01)
+            acc0 = pl.add(acc0, a02)
+            acc0 = pl.add(acc0, a03)
+            a10 = pl.mul(st1, w0)
+            a11 = pl.mul(st2, w1)
+            a12 = pl.mul(x0, w2)
+            a13 = pl.mul(x1, w3)
+            acc1 = pl.add(a10, a11)
+            acc1 = pl.add(acc1, a12)
+            acc1 = pl.add(acc1, a13)
+            a20 = pl.mul(st2, w0)
+            a21 = pl.mul(x0, w1)
+            a22 = pl.mul(x1, w2)
+            a23 = pl.mul(x2, w3)
+            acc2 = pl.add(a20, a21)
+            acc2 = pl.add(acc2, a22)
+            acc2 = pl.add(acc2, a23)
 
             # SiLU and the masked stores, one row at a time. A request shorter than the
             # window leaves the later rows with zero valid rows, so nothing is written.
@@ -341,12 +357,18 @@ def kda_conv_decode(
         st1 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 1, c0]), pl.FP32)
         st2 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 2, c0]), pl.FP32)
         xt = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [t, c0]), pl.FP32)
-        acc = pl.add(
-            pl.add(pl.mul(st0, pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)),
-                   pl.mul(st1, pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32))),
-            pl.add(pl.mul(st2, pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)),
-                   pl.mul(xt, pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32))),
-        )
+        # Keep the same tap order as prefill's bulk/head paths and the golden.
+        w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
+        w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
+        w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
+        w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
+        p0 = pl.mul(st0, w0)
+        p1 = pl.mul(st1, w1)
+        p2 = pl.mul(st2, w2)
+        p3 = pl.mul(xt, w3)
+        acc = pl.add(p0, p1)
+        acc = pl.add(acc, p2)
+        acc = pl.add(acc, p3)
         activated = pl.mul(acc, pl.recip(pl.add(pl.exp(pl.neg(acc)), 1.0)))
         out_tile = pl.cast(activated, pl.BF16, mode="rint")
         if c0 < LOCAL_KDA_QKV_DIM:
@@ -476,6 +498,47 @@ def build_tensor_specs(case: str = "ragged", decode: bool = False):
     ]
 
 
+def build_boundary_tensor_specs(decode: bool = False):
+    """Reproduce a BF16 midpoint reached by distinct FP32 addition orders.
+
+    The key channel uses four exact BF16 inputs/taps. Sequential summation
+    rounds SiLU to -0.01556396484375; pairwise summation rounds to
+    -0.0155029296875. Prefill compares a bulk token with a continued head
+    carrying the same history; decode exercises that head directly.
+    """
+    from golden import TensorSpec
+
+    history = torch.tensor([0.003326416015625, 0.6796875, 0.625], dtype=torch.bfloat16)
+    current = 0.212890625
+    taps = torch.tensor([-0.0018157958984375, -0.011474609375,
+                         -0.03369140625, -0.0126953125], dtype=torch.bfloat16)
+    tokens = 1 if decode else 5
+    channel = LOCAL_KDA_QKV_DIM  # first key channel in q|k|v storage
+    mixed = torch.zeros(tokens, CONV_DIM, dtype=torch.bfloat16)
+    mixed[:, channel] = current
+    if not decode:
+        mixed[:3, channel] = history
+    weight = torch.zeros(KDA_CONV_K, CONV_DIM, dtype=torch.bfloat16)
+    weight[:, channel] = taps
+    state = torch.zeros(2, STATE_LEN, CONV_DIM, dtype=torch.bfloat16)
+    state[1, :, channel] = history
+    specs = [
+        TensorSpec("mixed_qkv", list(mixed.shape), mixed.dtype, init_value=mixed),
+        TensorSpec("weight", list(weight.shape), weight.dtype, init_value=weight),
+        TensorSpec("conv_state", list(state.shape), state.dtype, init_value=state),
+    ]
+    if not decode:
+        specs.append(TensorSpec("query_start_loc", [3], torch.int32,
+                                init_value=torch.tensor([0, 4, 5], dtype=torch.int32)))
+    rows = torch.tensor([1] if decode else [0, 1], dtype=torch.int32)
+    return specs + [
+        TensorSpec("state_rows", list(rows.shape), rows.dtype, init_value=rows),
+        TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
+        TensorSpec("key", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
+        TensorSpec("value", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
+    ]
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -504,4 +567,29 @@ if __name__ == "__main__":
     if not result.passed:
         if result.error:
             print(result.error)
+        raise SystemExit(1)
+
+    def boundary_key_compare(actual, expected, *, rtol, atol, **_kwargs):
+        from golden import ratio_allclose
+
+        compare = ratio_allclose(rtol=rtol, atol=atol, max_error_ratio=0.0)
+        passed, details = compare(actual, expected, rtol=rtol, atol=atol, **_kwargs)
+        if not passed:
+            return passed, details
+        rows = [0] if decode else [3, 4]
+        exact = torch.equal(actual[rows, 0, 0], expected[rows, 0, 0])
+        return exact, "" if exact else "boundary key crossed a BF16 rounding tie"
+
+    boundary = run(
+        fn=kda_conv_decode_test if decode else kda_conv_prefill_test,
+        specs=build_boundary_tensor_specs(decode),
+        golden_fn=_golden_decode_tensors if decode else _golden_prefill_tensors,
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+        rtol=2e-2,
+        atol=2e-2,
+        compare_fn={"key": boundary_key_compare},
+    )
+    if not boundary.passed:
+        if boundary.error:
+            print(boundary.error)
         raise SystemExit(1)

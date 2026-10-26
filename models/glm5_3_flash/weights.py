@@ -34,6 +34,37 @@ from models.glm5_3_flash.mla_prolog import golden_absorb_output
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
+# INT8 FRACTAL_NZ storage: 16 rows and one 32-byte C0 line per inner block.
+_NZ_ROWS = 16
+_NZ_INT8_C0 = 32
+
+
+def pack_int8_nz(logical: torch.Tensor) -> torch.Tensor:
+    """Pack a CPU INT8 tensor's trailing matrix into NZ order, preserving its shape."""
+    if not isinstance(logical, torch.Tensor) or logical.dtype != torch.int8 or logical.device.type != "cpu":
+        raise TypeError("NZ shared weights must be CPU INT8 tensors before packing")
+    if logical.ndim < 2 or any(extent <= 0 for extent in logical.shape):
+        raise ValueError("NZ weights require positive dimensions and a trailing matrix")
+    rows, cols = logical.shape[-2:]
+    if rows % _NZ_ROWS or cols % _NZ_INT8_C0:
+        raise ValueError("INT8 NZ weights require 16-row fractals and 32-element C0 lines")
+    blocks = logical.reshape(-1, rows // _NZ_ROWS, _NZ_ROWS, cols // _NZ_INT8_C0, _NZ_INT8_C0)
+    return blocks.permute(0, 3, 1, 2, 4).contiguous().reshape(logical.shape)
+
+
+def unpack_int8_nz(packed: torch.Tensor) -> torch.Tensor:
+    """Restore a CPU INT8 NZ tensor's trailing matrix to logical row-major order."""
+    if not isinstance(packed, torch.Tensor) or packed.dtype != torch.int8 or packed.device.type != "cpu":
+        raise TypeError("NZ shared weights must be CPU INT8 tensors before unpacking")
+    if packed.ndim < 2 or any(extent <= 0 for extent in packed.shape):
+        raise ValueError("NZ weights require positive dimensions and a trailing matrix")
+    rows, cols = packed.shape[-2:]
+    if rows % _NZ_ROWS or cols % _NZ_INT8_C0:
+        raise ValueError("INT8 NZ weights require 16-row fractals and 32-element C0 lines")
+    blocks = packed.reshape(-1, cols // _NZ_INT8_C0, rows // _NZ_ROWS, _NZ_ROWS, _NZ_INT8_C0)
+    return blocks.permute(0, 2, 3, 1, 4).contiguous().reshape(packed.shape)
+
+
 # Candidate checkpoint spellings, most specific first. ``{e}`` is the global
 # expert id; templates without it are for the single shared/dense FFN.
 ROLES: dict[str, tuple[str, ...]] = {
@@ -1535,9 +1566,11 @@ class ResidentPrefillWeights:
         before the next layer, so peak host memory is one layer of one family
         (about 20 MB for a KDA layer at TP16, 280 MB at TP1) or one MoE
         layer-slice (the model's largest single buffer), never the whole
-        stacked family doubled while ``torch.stack`` assembled it. The landed
-        bytes are unchanged: a per-layer ``put`` at ``layer_index`` writes the
-        same contiguous row-major slice ``torch.stack`` produced before.
+        stacked family doubled while ``torch.stack`` assembled it. Each
+        per-layer ``put`` at ``layer_index`` preserves the logical layer slice
+        ``torch.stack`` produced before. The two shared INT8
+        matrices use NZ bytes; checkpoint-reader tensors and all other stacks
+        retain logical row-major order.
         ``handles`` maps every layout name from :attr:`tensor_layouts` to a
         device handle carrying ``data_ptr``.
         """
@@ -1550,6 +1583,8 @@ class ResidentPrefillWeights:
 
         def put(name: str, data: torch.Tensor, layer_index: int | None = None) -> None:
             plan = self.stacks[name]
+            if name in ("moe.shared_w_gate_up", "moe.shared_w_down"):
+                data = pack_int8_nz(data)
             data = data.contiguous()
             expected = plan.shape if layer_index is None else plan.shape[1:]
             if tuple(data.shape) != expected or data.dtype != plan.dtype:
@@ -1822,7 +1857,7 @@ if __name__ == "__main__":
         index_kpool_always_select_tail=True, index_share_for_mtp_iteration=True,
         linear_num_heads=4, linear_head_dim=8, linear_conv_kernel_dim=4,
         linear_lower_bound=-5.0, n_routed_experts=16, n_shared_experts=1,
-        num_experts_per_tok=2, moe_intermediate_size=16, scoring_func="sigmoid",
+        num_experts_per_tok=2, moe_intermediate_size=32, scoring_func="sigmoid",
         topk_method="noaux_tc", norm_topk_prob=True, routed_scaling_factor=2.5,
         n_group=1, topk_group=1, mhc=True, hc_mult=2, hc_sinkhorn_iters=20,
         hc_eps=1e-6, num_nextn_predict_layers=1, dtype="bfloat16", quant_method="w8a8",
@@ -2249,10 +2284,9 @@ if __name__ == "__main__":
     if first_seen != expected_order:
         raise AssertionError(f"staging order {first_seen} != {expected_order}")
 
-    # Byte parity of the per-layer staging versus the retired whole-stack
-    # materialization: concatenating the staged layer copies of every
-    # stack must equal the bytes ``torch.stack`` assembly produced, the
-    # layout hard constraint of the per-layer staging change.
+    # Logical byte parity of per-layer staging versus whole-stack materialization:
+    # decode the two shared NZ stacks before comparing to the logical
+    # ``torch.stack`` reference. All other staged bytes stay unchanged.
     class _ByteRuntime(_RecordingRuntime):
         """Capture the staged source bytes at copy time (pointer valid there)."""
 
@@ -2288,7 +2322,11 @@ if __name__ == "__main__":
     if set(reference) != set(byte_runtime.blobs):
         raise AssertionError("the parity reference and the staged stacks disagree on names")
     for name, tensor in reference.items():
-        if bytes(byte_runtime.blobs[name]) != raw_bytes(tensor):
+        staged = bytes(byte_runtime.blobs[name])
+        if name in ("moe.shared_w_gate_up", "moe.shared_w_down"):
+            physical = torch.frombuffer(byte_runtime.blobs[name], dtype=tensor.dtype).reshape(tensor.shape)
+            staged = raw_bytes(unpack_int8_nz(physical))
+        if staged != raw_bytes(tensor):
             raise AssertionError(f"per-layer staging of {name} is not byte-identical to the stack")
     print(f"[GOLDEN] PASS weights upload byte parity ({len(reference)} stacks, rank 1 of TP2/EP2)")
 

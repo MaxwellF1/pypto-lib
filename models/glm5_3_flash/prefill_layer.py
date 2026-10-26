@@ -112,9 +112,9 @@ def l2_prefill_layer(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8],
+    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
     lane_x: pld.DistributedTensor[[TOTAL_CAP, D], pl.INT8],
@@ -321,6 +321,7 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         raise ValueError("hidden activations require checkpoint weights")
 
     from golden import ScalarSpec, TensorSpec
+    from models.glm5_3_flash.weights import pack_int8_nz
 
     num_tokens = max(0, min(T, int(num_tokens)))
 
@@ -393,11 +394,11 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32,
                    init_value=lambda: w2_s),
         TensorSpec("shared_w_gate_up", [N_RANKS, 2 * MOE_INTER, D], torch.int8,
-                   init_value=lambda: shared_gu_i8),
+                   init_value=lambda: pack_int8_nz(shared_gu_i8)),
         TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * MOE_INTER], torch.float32,
                    init_value=lambda: shared_gu_s),
         TensorSpec("shared_w_down", [N_RANKS, D, MOE_INTER], torch.int8,
-                   init_value=lambda: shared_w2_i8),
+                   init_value=lambda: pack_int8_nz(shared_w2_i8)),
         TensorSpec("shared_w_down_scale", [N_RANKS, D], torch.float32,
                    init_value=lambda: shared_w2_s),
         TensorSpec("y", [N_RANKS, T, D], torch.float32),

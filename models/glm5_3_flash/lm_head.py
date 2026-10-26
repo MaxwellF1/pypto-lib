@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""Selected-row RMSNorm, BF16 vocabulary projection, and the first local maximum."""
+"""Selected-row BF16 greedy projection and full-vocabulary FP32 logits."""
 
 import sys
 from pathlib import Path
@@ -25,9 +25,12 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.glm5_3_flash.config import D, EP_SIZE, LOCAL_VOCAB, LOGIT_ROWS_DYN, TP_SIZE, T_DYN
+from models.glm5_3_flash.config import D, EP_SIZE, FLASH, LOCAL_VOCAB, LOGIT_ROWS_DYN, TP_SIZE, T_DYN
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm, rmsnorm
 
+
+# Model configuration.
+FP32_HEAD_EPS = FLASH.rms_norm_eps
 
 # Padding.
 FP32_NEG_INF_BITS = -8388608
@@ -40,6 +43,10 @@ LM_K_TILE = 512
 MAX_M_TILE = 8
 MAX_N_TILE = 256
 TP_CANDIDATE_TILE = 8
+FP32_HEAD_N_TILE = 64
+FP32_HEAD_K_TILE = 128
+FP32_HEAD_REDUCE_TILE = 8
+FP32_HEAD_VOCAB_PAD = ((LOCAL_VOCAB + FP32_HEAD_N_TILE - 1) // FP32_HEAD_N_TILE) * FP32_HEAD_N_TILE
 
 # Validation shapes.
 TP_TEST_EPOCHS = 3
@@ -135,6 +142,68 @@ def lm_head_test(
     local_argmax.bind_dynamic(0, LOGIT_ROWS_DYN)
     lm_head(x, row_indices, norm_weight, weight, local_max_value, local_argmax)
     return local_max_value, local_argmax
+
+
+@pl.jit.inline
+def lm_head_logits(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+):
+    """Normalize BF16 rows in FP32 and project the complete local vocabulary.
+
+    The vocabulary shard contains exactly widened BF16 checkpoint weights and
+    zero padding to a complete projection tile. Normalized activations and the
+    output stay FP32. The caller strips padding before concatenating TP shards.
+    """
+    rows = pl.tensor.dim(x, 0)
+    normalized = pl.create_tensor([rows, D], dtype=pl.FP32)
+    for row in pl.spmd(rows, name_hint="lm_head_fp32_norm"):
+        hidden = pl.cast(x[row : row + 1, 0:D], pl.FP32)
+        squared = pl.mul(hidden, hidden)
+        squared_rows = pl.reshape(squared, [FP32_HEAD_REDUCE_TILE, D // FP32_HEAD_REDUCE_TILE])
+        partial_sum = pl.row_sum(squared_rows)
+        partial_row = pl.reshape(partial_sum, [1, FP32_HEAD_REDUCE_TILE])
+        reduction = pl.full([FP32_HEAD_REDUCE_TILE, FP32_HEAD_REDUCE_TILE], dtype=pl.FP32, value=0.0)
+        reduction[0:1, 0:FP32_HEAD_REDUCE_TILE] = partial_row
+        reduction = pl.set_validshape(reduction, 1, FP32_HEAD_REDUCE_TILE)
+        squared_sum = pl.row_sum(reduction)
+        mean_squared = pl.mul(squared_sum, 1.0 / D)
+        variance = pl.add(mean_squared, FP32_HEAD_EPS)
+        inverse_rms = pl.rsqrt(variance, high_precision=True)
+        inverse_rms_value = pl.read(inverse_rms, [0, 0])
+        scaled = pl.mul(hidden, inverse_rms_value)
+        gamma_values = pl.cast(norm_weight[0:D], pl.FP32)
+        gamma = pl.reshape(gamma_values, [1, D])
+        normalized_row = pl.mul(scaled, gamma)
+        normalized[row : row + 1, 0:D] = normalized_row
+
+    for row0 in pl.parallel(0, rows, LM_ROW_TILE):
+        for block in pl.spmd(FP32_HEAD_VOCAB_PAD // FP32_HEAD_N_TILE, name_hint="lm_head_fp32_projection"):
+            vocab0 = block * FP32_HEAD_N_TILE
+            valid_rows = pl.min(LM_ROW_TILE, rows - row0)
+            accum = pl.create_tensor([LM_ROW_TILE, FP32_HEAD_N_TILE], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, D, FP32_HEAD_K_TILE, stage=2):
+                projection_hidden = pl.slice(normalized, [LM_ROW_TILE, FP32_HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, FP32_HEAD_K_TILE])
+                projection_vocab = weight[vocab0 : vocab0 + FP32_HEAD_N_TILE, k0 : k0 + FP32_HEAD_K_TILE]
+                accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=(k0 == 0))
+            accum = pl.set_validshape(accum, valid_rows, FP32_HEAD_N_TILE)
+            logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + FP32_HEAD_N_TILE] = accum
+    return logits
+
+
+@pl.jit
+def lm_head_logits_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    x.bind_dynamic(0, T_DYN)
+    logits.bind_dynamic(0, T_DYN)
+    lm_head_logits(x, norm_weight, weight, logits)
+    return logits
 
 
 @pl.jit.inline(auto_scope=False)
@@ -276,6 +345,14 @@ def l3_lm_head_tp_reduce_test(
                 rank, epoch + 1,
                 device=rank,
             )
+
+
+def golden_lm_head_logits(tensors):
+    """Fill full FP32 logits with the production host normalization boundary."""
+    hidden = tensors["x"].to(torch.float32)
+    inverse_rms = torch.rsqrt(hidden.square().mean(dim=-1, keepdim=True) + FP32_HEAD_EPS)
+    normalized = hidden * inverse_rms * tensors["norm_weight"].to(torch.float32)
+    tensors["logits"].copy_(normalized @ tensors["weight"].to(torch.float32).t())
 
 
 def golden_lm_head(
@@ -520,8 +597,11 @@ def main():
 __all__ = [
     "golden_lm_head",
     "golden_lm_head_case",
+    "golden_lm_head_logits",
     "golden_lm_head_tp_reduce",
     "lm_head",
+    "lm_head_logits",
+    "lm_head_logits_test",
     "lm_head_test",
     "lm_head_tp_reduce",
 ]

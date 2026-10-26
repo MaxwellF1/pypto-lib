@@ -8,8 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """KDA front end: the q/k/v projections and every gate the delta rule consumes.
 
-For each of the 34 linear-attention layers (64 heads x 128, so 4 heads per rank at
-TP16):
+For each of the 34 linear-attention layers (64 heads x 128, sharded across TP):
 
 * ``q_proj`` / ``k_proj`` / ``v_proj``: ``[D] -> [KDA_H * KDA_DIM]``, head-sharded.
 * forget gate: ``g = gate_lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))``
@@ -30,7 +29,7 @@ Two details decide whether this matches the deployment numerics:
 
 * ``A_log`` is **per head** and broadcasts across all 128 channels, while ``dt_bias``
   is **per channel**. Swapping them is the classic fused-gate bug and no shape check
-  catches it, because both flatten to the same 512 values per rank.
+  catches it, because both broadcast to the same local channel shape.
 * Both bottleneck projections are BF16 ``nn.Linear`` layers upstream, so their outputs
   are rounded to BF16 *before* the FP32 gate arithmetic begins. Keeping them in FP32
   here would be more accurate than the reference and would show up as a systematic
@@ -59,13 +58,14 @@ from models.glm5_3_flash.config import LOCAL_KDA_QKV_DIM, T_DYN
 
 # tiling
 T_TILE = 16  # tokens per task
+N_TILE = min(512, LOCAL_KDA_QKV_DIM)  # projected channels per task
 # L1 holds 512 KiB with the first 64 KiB reserved for the cross-core ring, and a
 # weight tile is double-buffered by the pipeline. At K_TILE 128 one [512, 128] BF16
 # tile is 128 KiB, so a single 512-wide lane fits with room to spare; three lanes in
 # one pipeline, or K_TILE 512, do not. q/k/v therefore run as three separate
 # pipelines, and the three narrow projections share a fourth.
 K_TILE = 128
-# beta is one value per head, and LOCAL_KDA_H is 4 at TP16. Both the cube's N axis
+# beta is one value per head: 4 at TP16 and 8 at TP8. Both the cube's N axis
 # and the store path want 16, so beta carries that padding in its own shape rather
 # than being narrowed on the way out: narrowing a wider tile down to four FP32
 # columns does not work here in any of its spellings -- a slice's valid_shape, a
@@ -177,9 +177,10 @@ def kda_projection(
 
     tiles = (t_dim + T_TILE - 1) // T_TILE
 
-    with pl.spmd(tiles, name_hint="kda_projection", deps=[b_pad_tid]):
+    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint="kda_projection", deps=[b_pad_tid]):
         task = pl.tile.get_block_idx()
-        t0 = task * T_TILE
+        t0 = (task // (LOCAL_KDA_QKV_DIM // N_TILE)) * T_TILE
+        n0 = (task % (LOCAL_KDA_QKV_DIM // N_TILE)) * N_TILE
         # The last block spills past t_dim; valid_shape zero-fills what it reads and
         # set_validshape keeps the write inside the tensor.
         rows = pl.min(T_TILE, t_dim - t0)
@@ -192,32 +193,34 @@ def kda_projection(
         # with pl.matmul stamps the accumulator compact and keeps the two agreed.
         x_head = pl.slice(x, [T_TILE, K_TILE], [t0, 0], valid_shape=[rows, K_TILE])
 
-        acc_q = pl.matmul(x_head, w_q[0:LOCAL_KDA_QKV_DIM, 0:K_TILE], pl.FP32, b_trans=True)
+        acc_q = pl.matmul(x_head, w_q[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
         for kb in pl.pipeline(1, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             acc_q = pl.matmul_acc(
                 acc_q, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_q[0:LOCAL_KDA_QKV_DIM, k0 : k0 + K_TILE], b_trans=True)
-        mixed_qkv[t0 : t0 + T_TILE, 0:LOCAL_KDA_QKV_DIM] = pl.set_validshape(
-            pl.cast(acc_q, pl.BF16, mode="rint"), rows, LOCAL_KDA_QKV_DIM)
+                w_q[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
+        mixed_qkv[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
+            pl.cast(acc_q, pl.BF16, mode="rint"), rows, N_TILE)
 
-        acc_k = pl.matmul(x_head, w_k[0:LOCAL_KDA_QKV_DIM, 0:K_TILE], pl.FP32, b_trans=True)
+        acc_k = pl.matmul(x_head, w_k[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
         for kb in pl.pipeline(1, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             acc_k = pl.matmul_acc(
                 acc_k, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_k[0:LOCAL_KDA_QKV_DIM, k0 : k0 + K_TILE], b_trans=True)
-        mixed_qkv[t0 : t0 + T_TILE, LOCAL_KDA_QKV_DIM : 2 * LOCAL_KDA_QKV_DIM] = pl.set_validshape(
-            pl.cast(acc_k, pl.BF16, mode="rint"), rows, LOCAL_KDA_QKV_DIM)
+                w_k[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
+        k_out = LOCAL_KDA_QKV_DIM + n0
+        mixed_qkv[t0 : t0 + T_TILE, k_out : k_out + N_TILE] = pl.set_validshape(
+            pl.cast(acc_k, pl.BF16, mode="rint"), rows, N_TILE)
 
-        acc_v = pl.matmul(x_head, w_v[0:LOCAL_KDA_QKV_DIM, 0:K_TILE], pl.FP32, b_trans=True)
+        acc_v = pl.matmul(x_head, w_v[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
         for kb in pl.pipeline(1, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             acc_v = pl.matmul_acc(
                 acc_v, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_v[0:LOCAL_KDA_QKV_DIM, k0 : k0 + K_TILE], b_trans=True)
-        mixed_qkv[t0 : t0 + T_TILE, 2 * LOCAL_KDA_QKV_DIM : 3 * LOCAL_KDA_QKV_DIM] = pl.set_validshape(
-            pl.cast(acc_v, pl.BF16, mode="rint"), rows, LOCAL_KDA_QKV_DIM)
+                w_v[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
+        v_out = 2 * LOCAL_KDA_QKV_DIM + n0
+        mixed_qkv[t0 : t0 + T_TILE, v_out : v_out + N_TILE] = pl.set_validshape(
+            pl.cast(acc_v, pl.BF16, mode="rint"), rows, N_TILE)
 
         # --- the three narrow projections: both 128-wide bottlenecks and b_proj ---
         f_a = pl.matmul(x_head, w_f_a[0:KDA_DIM, 0:K_TILE], pl.FP32, b_trans=True)
@@ -236,13 +239,14 @@ def kda_projection(
         g_a_bf = pl.cast(g_a, pl.BF16, mode="rint")
 
         # --- forget gate: -5.0 * sigmoid(exp(A_log) * (f_b(f_a) + dt_bias)) ---
-        g_raw = pl.matmul(f_a_bf, w_f_b[0:LOCAL_KDA_QKV_DIM, 0:KDA_DIM], pl.FP32, b_trans=True)
+        g_raw = pl.matmul(f_a_bf, w_f_b[n0 : n0 + N_TILE, 0:KDA_DIM], pl.FP32, b_trans=True)
         # dt_bias is per channel, so it broadcasts down the token axis.
         biased = pl.col_expand_add(pl.cast(pl.cast(g_raw, pl.BF16, mode="rint"), pl.FP32),
-                                   dt_bias_row[0:1, 0:LOCAL_KDA_QKV_DIM])
+                                   dt_bias_row[0:1, n0 : n0 + N_TILE])
         # exp(A_log) is per head, so it scales a contiguous 128-channel block.
-        for h in pl.unroll(LOCAL_KDA_H):
+        for h in pl.unroll(N_TILE // KDA_DIM):
             c0 = h * KDA_DIM
+            head = n0 // KDA_DIM + h
             # An explicit slice: `biased` carries `rows` valid rows, so a plain
             # subview asking for T_TILE contradicts the inferred valid_row.
             biased_h = pl.slice(biased, [T_TILE, KDA_DIM], [0, c0], valid_shape=[rows, KDA_DIM])
@@ -250,33 +254,27 @@ def kda_projection(
             # columns is a 16-byte tile row ptoas rejects -- widening the load past the
             # tensor's 4 elements is rejected too, and pl.exp takes no Scalar. Multiply
             # by zero and add the scalar to fill a correctly shaped tile instead.
-            a_fill = pl.add(pl.mul(biased_h, 0.0), pl.read(a_log, [h]))
+            a_fill = pl.add(pl.mul(biased_h, 0.0), pl.read(a_log, [head]))
             scaled = pl.mul(biased_h, pl.exp(a_fill))
             # sigmoid, spelled out: the traced body takes only pl.* calls.
             gate_h = pl.recip(pl.add(pl.exp(pl.neg(scaled)), 1.0))
-            decay_flat[t0 : t0 + T_TILE, c0 : c0 + KDA_DIM] = pl.set_validshape(
+            decay_col = n0 + c0
+            decay_flat[t0 : t0 + T_TILE, decay_col : decay_col + KDA_DIM] = pl.set_validshape(
                 pl.mul(gate_h, KDA_GATE_LOWER_BOUND), rows, KDA_DIM
             )
 
         # --- output gate: the raw g_b(g_a) logit; o_norm applies the sigmoid ---
-        out_raw = pl.matmul(g_a_bf, w_g_b[0:LOCAL_KDA_QKV_DIM, 0:KDA_DIM], pl.FP32, b_trans=True)
-        out_gate_flat[t0 : t0 + T_TILE, 0:LOCAL_KDA_QKV_DIM] = pl.set_validshape(
-            pl.cast(out_raw, pl.BF16, mode="rint"), rows, LOCAL_KDA_QKV_DIM
+        out_raw = pl.matmul(g_a_bf, w_g_b[n0 : n0 + N_TILE, 0:KDA_DIM], pl.FP32, b_trans=True)
+        out_gate_flat[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
+            pl.cast(out_raw, pl.BF16, mode="rint"), rows, N_TILE
         )
 
         # --- input gate: sigmoid(b_proj(x)), one value per head ---
         # The upstream b_proj is a BF16 Linear, so its output rounds before the gate.
-        logits = pl.cast(pl.cast(acc_b, pl.BF16, mode="rint"), pl.FP32)
-        beta[t0 : t0 + T_TILE, 0:BETA_PAD] = pl.set_validshape(
-            pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), rows, BETA_PAD)
-
-    # beta is four FP32 columns, and a tile row must be 32-byte aligned, so the gate
-    # is computed eight columns wide and narrowed on the way out. The valid shape of
-    # that narrowing has to be *static*: with a runtime row count the allocator
-    # instantiates the tile at its valid shape, which is the illegal 16-byte row. Full
-    # tiles and the ragged tail are therefore written by two passes, each with a
-    # compile-time shape. models/deepseek_v4_flash_mtp/hc_pre.py writes its own 4-wide
-    # gate the same way, and sidesteps the tail by requiring an aligned token count.
+        if n0 == 0:
+            logits = pl.cast(pl.cast(acc_b, pl.BF16, mode="rint"), pl.FP32)
+            beta[t0 : t0 + T_TILE, 0:BETA_PAD] = pl.set_validshape(
+                pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), rows, BETA_PAD)
     return mixed_qkv, decay, beta, out_gate
 
 

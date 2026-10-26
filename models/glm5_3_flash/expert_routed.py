@@ -207,7 +207,7 @@ def expert_routed_test(
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
     route_weights: pl.Tensor[[RECV_DYN, 1], pl.FP32],
-    output: pl.Tensor[[RECV_DYN, D], pl.FP32],
+    output: pl.InOut[pl.Tensor[[RECV_DYN, D], pl.FP32]],
 ):
     x_int8.bind_dynamic(0, RECV_DYN)
     x_scale.bind_dynamic(0, RECV_DYN)
@@ -347,7 +347,7 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
         TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
         TensorSpec("expert_offsets", [N_LOCAL_EXPERTS + 1], torch.int32, init_value=lambda: offsets),
         TensorSpec("route_weights", [total, 1], torch.float32, init_value=lambda: torch.rand(total, 1)),
-        TensorSpec("output", [total, D], torch.float32),
+        TensorSpec("output", [total, D], torch.float32, init_value=torch.zeros),
     ]
 
 

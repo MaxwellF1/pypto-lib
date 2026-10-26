@@ -7,53 +7,56 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Run the GLM-5.3-Flash prefill: device composition and the host generation loop.
+"""GLM-5.3-Flash device composition, persistent chunk sessions and generation.
 
 Single-file form (PR #1497 round 3, committer feedback): the device
 composition -- the frozen extents, the per-sublayer L2/L3 entries, the six
 consolidated runtime-ordinal programs and their compile/load/dispatch
-machinery -- and the host runner (``generate()`` over one packed 16-rank batch
+machinery -- and the host runner (``generate()`` over one packed 16-request batch
 plus the CLI) live in this one module. The CI fixture case (design S9) ships
 as a follow-up PR; the per-layer constexpr path is retired (git tag
 ``glm53-pretrim-baseline``). Design of record ``prefill_fwd_arch_1015.md``;
 size review ``size_review_1016.md``.
 
+* ``ResidentPrefillSession.forward_chunks()``: new-token batches with request-local
+  MLA, Indexer and KDA state retained across chunks and decode steps. Cache slots
+  are cleared on release/reuse; callers manage optional prefix-state snapshots.
 * ``generate()``: tokenizer, resident stacked weights
   (:mod:`models.glm5_3_flash.weights`), ``--runtime-dir`` compile reuse, and a
-  full-prefix-recompute generation loop over one packed 16-rank batch with EOS
-  tracking, isfinite guards, a top-1 host LM head and a JSON report. Dispatch:
+  full-prefix-recompute generation loop over one packed 16-request batch with EOS
+  tracking, isfinite guards, an NPU FP32 vocabulary head and a JSON report. Dispatch:
   ``production_launch_plan`` walks the 89 steps (seed, 3 dense layers, 42
   sublayer pairs, head) on ONE shared multi-program L3 worker prepared with
-  the SIX consolidated programs (``RT_PROGRAMS``); the BF16 ``x_hc``
+  the six main programs (``RT_PROGRAMS``) and the auxiliary vocabulary head; the BF16 ``x_hc``
   four-stream ping-pongs over ``ws_x_hc_a``/``ws_x_hc_b``.
 * ``main()``: the production generate() mode (``--checkpoint`` required).
 
 Import-order contract: ``config`` and ``prefill_moe`` freeze kernel extents
-from argv at import time, so this module parses ``--capacity``/``--tokens``
-itself before the first kernel import. Parallel mode (design S0.1/S6):
-**TP16/EP16/DP1 only** (TP1/EP16 measured and rejected,
-``t5_tp1_shape_matrix.md``; the import-time gate below enforces it); TP2/EP2
-is legal only as a CI fixture's marker-pinned rung (the follow-up CI entry).
+from argv at import time, so this module parses query ``--capacity``/``--tokens``
+and persistent-cache ``--max-seq-len``
+itself before the first kernel import. Production parallel modes are
+**TP8/EP8/DP1** and **TP16/EP16/DP1**. The packed request count stays 16
+at both widths. TP2/EP2 is legal only as a CI fixture's marker-pinned rung
+(the follow-up CI entry).
 
-Window epochs are 1-based call ids, monotone within one window set
-(``tp_all_reduce`` takes two notifies per rank per call, so its fences read
-``2*(epoch-1)`` / ``2*epoch-1`` / ``2*epoch``): every launch -- diff or
-production -- owns a fresh window set (the persistent worker restores
-windows to zero before reuse) and runs each single-call collective at
-epoch 1 (attention reduce, MoE barriers and FFN reduce alike), exactly as the
-``attention_tp``/``prefill_moe`` barriers expect; the one two-call window set
-is the dense whole-layer entry's shared tp pair (epochs 1 then 2). The split
-MoE FFN entry once carried epoch 2 onto its own fresh window and deadlocked
-in the ``reuse`` fence -- the t22 16-card stall and the a2a3sim wedge both
-reduce to it (``logs_t23/``); scalar epoch params and the
-one-collective-per-entry rule encode the fix.
+Communication windows persist per prepared program. The resident session advances
+each program's collective epochs across layers, chunks and request-slot reuse;
+dense dispatches consume two TP epochs, attention one, and MoE one TP plus one
+MoE epoch. Host submissions keep at most two pending completion handles. Runtime
+FIFO execution completes each dispatch on all ranks before its successor runs.
+Epoch counters commit only after successful completion. TP publish/release/consumed
+fences remain active, and a failed dispatch invalidates the session until its
+runtime is closed and reopened. Fresh one-shot validation uses dispatch_index=0
+with freshly zeroed windows.
 """
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import inspect
 import json
+from math import gcd
 import os
 from pathlib import Path
 import sys
@@ -62,16 +65,18 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# prefill_moe.py freezes its per-rank token capacity from argv at import time
-# (the owner-compacted local batch is CAPACITY/16 rows rounded up to a
-# multiple of 16) -- shaped here, before any glm5_3_flash kernel import. The
-# production default is 2048; a CI entry appends its own t30-proven capacity
-# before importing this module (T_MOE 16 = the t22 sparse 'routed'
-# [16, 16, 4096] shape at the deployment width).
+import models.glm5_3_flash.config as C
+
+# prefill_moe.py freezes its owner-compacted row capacity from argv at import
+# time. Each owner holds ceil(CAPACITY / TP_SIZE) rows, padded to 16 rows.
+# The request batch size is independent of this device-owner partition.
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--capacity", type=int, default=2048)
-CAPACITY = _shape_parser.parse_known_args()[0].capacity
-T_MOE = ((CAPACITY + 255) // 256) * 16
+_shape_parser.add_argument("--max-seq-len", type=int)
+_shape_options = _shape_parser.parse_known_args()[0]
+CAPACITY = _shape_options.capacity
+MAX_SEQ_LEN = CAPACITY if _shape_options.max_seq_len is None else _shape_options.max_seq_len
+T_MOE = ((CAPACITY + C.TP_SIZE * 16 - 1) // (C.TP_SIZE * 16)) * 16
 if not any(tok == "--tokens" or tok.startswith("--tokens=") for tok in sys.argv):
     sys.argv += ["--tokens", str(T_MOE)]
 
@@ -80,7 +85,6 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from pypto.runtime import RunConfig, StackedDeviceTensor
 import torch
-import models.glm5_3_flash.config as C
 from models.glm5_3_flash.config import (
     BLOCK_SIZE,
     D,
@@ -101,6 +105,7 @@ from models.glm5_3_flash.config import (
     LOCAL_H,
     LOCAL_KDA_H,
     LOCAL_KDA_QKV_DIM,
+    LOCAL_VOCAB,
     MAX_BATCH_PER_DP,
     MIX_HC,
     MOE_INTER,
@@ -114,25 +119,17 @@ from models.glm5_3_flash.config import (
     V_DIM,
 )
 
-# Import-frozen parallel-mode gate (design S6): the t5-proven all-green shape, plus
-# the CI fixture's pinned TP2/EP2 rung (design S9) -- the narrow width is legal
-# ONLY for the CI composition subset, whose programs (seed, moe_ffn, head) hold no
-# TP-budget-bound kernel; every attention or dense program stays TP16-locked.
-# The pin arrives through the GLM53_PREFILL_CI_PIN marker: whichever entry
-# file runs bare (this module's two importers -- prefill_fwd.py's delegated
-# run or prefill_fwd_ci.py's direct run) shapes argv before importing this
-# module and sets the marker when it pins the narrow rung.
+# Production attention and Dense use TP8 or TP16; routed experts use EP at
+# the same width, and shared experts stay replicated. The TP2 CI rung covers
+# only seed, MoE FFN and head, and requires the entry's explicit marker.
 _ci_rung_pinned = os.environ.get("GLM53_PREFILL_CI_PIN") == "2"
 if (C.TP_SIZE, C.EP_SIZE, C.DP_SIZE) == (2, 2, 1) and _ci_rung_pinned:
     pass
-elif (C.TP_SIZE, C.EP_SIZE, C.DP_SIZE) != (16, 16, 1):
+elif (C.TP_SIZE, C.EP_SIZE, C.DP_SIZE) not in ((8, 8, 1), (16, 16, 1)):
     raise ValueError(
-        "glm5_3_flash prefill_fwd v1 requires TP16/EP16/DP1 (the t5-proven "
-        f"shape); got TP{C.TP_SIZE}/EP{C.EP_SIZE}/DP{C.DP_SIZE}. TP1/EP16 was "
-        "rejected on kernel budgets and contracts (t5_tp1_shape_matrix.md, "
-        "design S0.1/S10 R4); TP2/EP2 is accepted only for the CI fixture "
-        "rung an entry file pins itself into (GLM53_PREFILL_CI_PIN); pass "
-        "--tp/--ep explicitly to reach this gate for any other narrow shape"
+        "glm5_3_flash prefill_fwd requires TP8/EP8/DP1 or TP16/EP16/DP1; "
+        f"got TP{C.TP_SIZE}/EP{C.EP_SIZE}/DP{C.DP_SIZE}. TP2/EP2 is accepted "
+        "only for the marker-pinned CI subset (GLM53_PREFILL_CI_PIN)"
     )
 if not 16 <= CAPACITY <= PREFILL_MAX_TOKENS or CAPACITY % 16:
     raise ValueError(f"--capacity must be 16..{PREFILL_MAX_TOKENS} and a multiple of 16, got {CAPACITY}")
@@ -140,6 +137,8 @@ if not 16 <= CAPACITY <= PREFILL_MAX_TOKENS or CAPACITY % 16:
 # capacity straight in, so the capacity itself must be 64-aligned (design said 16).
 if CAPACITY % 64:
     raise ValueError(f"--capacity must be a multiple of 64 for indexer_proj, got {CAPACITY}")
+if not 1 <= MAX_SEQ_LEN <= PREFILL_MAX_TOKENS:
+    raise ValueError(f"--max-seq-len must be 1..{PREFILL_MAX_TOKENS}, got {MAX_SEQ_LEN}")
 
 from models.glm5_3_flash.attention_tp import tp_all_reduce
 from models.glm5_3_flash.dense_mlp import dense_mlp
@@ -155,7 +154,8 @@ from models.glm5_3_flash.indexer_cache import (
 from models.glm5_3_flash.kda_conv import CONV_DIM, STATE_LEN, kda_conv_prefill
 from models.glm5_3_flash.kda_output import kda_output
 from models.glm5_3_flash.kda_projection import BETA_PAD, kda_projection
-from models.glm5_3_flash.metadata import build_forward_metadata
+from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
+from models.glm5_3_flash.metadata import build_forward_metadata, build_indexer_chunk_metadata
 from models.glm5_3_flash.mhc import mhc_head, mhc_mixes, mhc_post, mhc_pre
 from models.glm5_3_flash.mla_cache import mla_cache_write
 from models.glm5_3_flash.mla_epilog import mla_epilog_prefill
@@ -197,14 +197,14 @@ from models.glm5_3_flash.weights import Checkpoint, ResidentPrefillWeights
 __all__ = (
     "BATCH", "CAPACITY", "CONSTANT_STEP_INPUTS", "D", "DP_SIZE", "DSA_NUM_LAYERS",
     "DENSE_NUM_LAYERS", "EP_SIZE", "GLM_TENSORS", "GLM_WEIGHT_STACKS", "HC_MULT",
-    "KDA_NUM_LAYERS", "LOGIT_ROWS", "MLA_STACK_LAYERS", "MOE_NUM_LAYERS",
+    "KDA_NUM_LAYERS", "LOGIT_ROWS", "MAX_SEQ_LEN", "MLA_STACK_LAYERS", "MOE_NUM_LAYERS",
     "MOE_STACK_LAYERS", "NORM_STACK_LAYERS", "NUM_LAYERS", "OUTPUTS", "RANKS",
     "ROUTER_STACK_LAYERS", "RT_PROGRAMS", "T_MOE", "TP_SIZE", "WORKSPACES",
     "X_H_PINGPONG", "Checkpoint", "MODEL", "ResidentPrefillWeights",
     "_PARAM_TO_STACK", "_STACK_TO_PARAM", "_alloc_name_of", "_l3_arg_arity",
     "_step_key", "compile_production", "l3_prefill_head_rows",
     "l3_prefill_layer_diff_dsa_attn_rt", "l3_prefill_layer_diff_kda_attn_rt",
-    "l3_prefill_layer_diff_kda_dense_rt", "l3_prefill_layer_diff_moe_ffn_rt",
+    "l3_prefill_layer_diff_kda_dense_rt", "ResidentPrefillSession", "l3_prefill_layer_diff_moe_ffn_rt",
     "l3_prefill_seed", "load_production", "prepare_step_inputs", "prefill_head_rows",
     "prefill_layer_diff_dsa_attn_rt", "prefill_layer_diff_kda_attn_rt",
     "prefill_layer_diff_kda_dense_rt", "prefill_layer_diff_moe_ffn_rt",
@@ -227,7 +227,7 @@ RANKS = EP_SIZE
 
 def _prefill_model():
     overrides = json.loads(os.environ.get("GLM53_PREFILL_MODEL", "{}"))
-    return dataclasses.replace(C.FLASH, **overrides)
+    return dataclasses.replace(C.FLASH, **overrides) if overrides else C.FLASH
 
 
 MODEL = _prefill_model()
@@ -251,28 +251,45 @@ LOGIT_ROWS = MAX_BATCH_PER_DP        # 32; covers BATCH with headroom (design S3
 LOCAL_DENSE_INTER = DENSE_INTER // TP_SIZE
 
 # --- derived cache geometry (design S3.3), all static capacity-bound -------------
-LATENT_BLOCKS = CAPACITY // BLOCK_SIZE + BATCH   # +BATCH: page fragmentation headroom
+TABLE_MAX = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+LATENT_BLOCKS = BATCH * TABLE_MAX
 LATENT_ROWS = LATENT_BLOCKS * BLOCK_SIZE
-# Every pool-shaped extent in this file is the ONE POOL_AXIS constant below: the
-# kernels spell the pool event axis, the pool page table and the score-matrix
-# width with the single dynamic symbol POOLS_DYN, which binds at launch to
-# whatever extent the host allocated, so all pool tensors here must use the same
-# POOL_AXIS or the bound symbol disagrees across an L3 -> L2 call. LEAF-aligned,
-# with one full leaf of slack beyond the packed window bound: indexer_score
-# stores whole LEAF-wide score tiles and its last tile can overrun the final
-# valid row by up to LEAF - 1 lanes (prefill_indexer.py score contract, whose
-# own fixtures size the width the same way), so the axis is the worst-case pool
-# count rounded up to a leaf, plus a leaf -- 4096 at every supported capacity
-# including the 8192 maximum (2048 pools).
-POOL_AXIS = ((CAPACITY // INDEX_KPOOL + 2 * LEAF - 2) // LEAF) * LEAF
+# Each request owns a page-aligned pooled-key segment. The score window includes
+# one full LEAF of slack for the scorer and top-k tile stores.
+POOL_STRIDE = (
+    ((MAX_SEQ_LEN + INDEX_KPOOL - 1) // INDEX_KPOOL + INDEX_STATE_BLOCK_SIZE - 1)
+    // INDEX_STATE_BLOCK_SIZE * INDEX_STATE_BLOCK_SIZE
+)
+POOL_AXIS = ((max(BATCH * POOL_STRIDE, CAPACITY // INDEX_KPOOL + BATCH) + 2 * LEAF - 2) // LEAF) * LEAF
 POOL_TABLE_ROWS = POOL_AXIS * INDEX_STATE_BLOCK_SIZE   # physical pooled-table rows
 KDA_ROWS = MAX_BATCH_PER_DP                      # per-request state pool depth (32)
-TABLE_MAX = (CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE   # max logical pages one request spans
 # max logical pool pages per request: pools of INDEX_KPOOL tokens, paged at
 # INDEX_STATE_BLOCK_SIZE pool rows (the field is only used by build_forward_metadata)
 POOL_TABLE_MAX = (
-    CAPACITY + INDEX_KPOOL * INDEX_STATE_BLOCK_SIZE - 1
+    MAX_SEQ_LEN + INDEX_KPOOL * INDEX_STATE_BLOCK_SIZE - 1
 ) // (INDEX_KPOOL * INDEX_STATE_BLOCK_SIZE)
+
+# Cache reset geometry.
+_RESET_MLA_ELEMENTS = TABLE_MAX * BLOCK_SIZE * KV_LORA
+_RESET_RAW_ELEMENTS = TABLE_MAX * BLOCK_SIZE * INDEX_STATE_WIDTH
+_RESET_POOL_ELEMENTS = POOL_STRIDE * INDEX_DIM
+_RESET_SCALE_ELEMENTS = POOL_STRIDE * POOL_SCALE_WIDTH
+_RESET_CONV_ELEMENTS = STATE_LEN * CONV_DIM
+_RESET_RECURRENT_ELEMENTS = LOCAL_KDA_H * KDA_DIM * KDA_DIM
+
+# Cache reset tiling.
+_RESET_MLA_TILE = gcd(4096, _RESET_MLA_ELEMENTS)
+_RESET_MLA_LANE_TILE = min(4, _RESET_MLA_ELEMENTS // _RESET_MLA_TILE)
+_RESET_RAW_TILE = gcd(4096, _RESET_RAW_ELEMENTS)
+_RESET_RAW_LANE_TILE = min(4, _RESET_RAW_ELEMENTS // _RESET_RAW_TILE)
+_RESET_POOL_TILE = gcd(4096, _RESET_POOL_ELEMENTS)
+_RESET_POOL_LANE_TILE = min(4, _RESET_POOL_ELEMENTS // _RESET_POOL_TILE)
+_RESET_SCALE_TILE = gcd(4096, _RESET_SCALE_ELEMENTS)
+_RESET_SCALE_LANE_TILE = min(4, _RESET_SCALE_ELEMENTS // _RESET_SCALE_TILE)
+_RESET_CONV_TILE = gcd(4096, _RESET_CONV_ELEMENTS)
+_RESET_CONV_LANE_TILE = min(4, _RESET_CONV_ELEMENTS // _RESET_CONV_TILE)
+_RESET_RECURRENT_TILE = gcd(4096, _RESET_RECURRENT_ELEMENTS)
+_RESET_RECURRENT_LANE_TILE = min(4, _RESET_RECURRENT_ELEMENTS // _RESET_RECURRENT_TILE)
 
 # Static packed extents (the donor's settled answer, ``deepseek_v4_1_flash/
 # prefill_layer.py`` ``make_layer_program``): every L2/L3 signature below carries
@@ -433,7 +450,7 @@ def gather_head_rows(
     row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
     output: pl.Tensor[[LOGIT_ROWS, D], pl.BF16],
 ):
-    """Gather the per-request last rows the host LM head consumes (S8.4)."""
+    """Gather per-request last rows into the padded head buffer."""
     with pl.spmd(LOGIT_ROWS, name_hint="gather_head_rows"):
         r = pl.tile.get_block_idx()
         src = pl.cast(pl.read(row_indices, [r]), pl.INDEX)
@@ -603,9 +620,9 @@ def moe_ffn_sublayer(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8],
+    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     lane_x: pld.DistributedTensor[[TOTAL_CAP, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[TOTAL_CAP, AUX_PAD], pl.FP32],
@@ -665,10 +682,11 @@ def moe_ffn_sublayer(
         expert_y, slab_route, slab_src, expert_offsets, expert_counts,
         routed, slot_out, return_ready, local_tokens, my_rank, epoch, dispatch_tid,
     )
-    expert_shared(
-        x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale,
-        shared_w_down, shared_w_down_scale, shared_out,
-    )
+    if local_tokens > 0:
+        expert_shared(
+            x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale,
+            shared_w_down, shared_w_down_scale, shared_out,
+        )
     moe_layer_add(routed, shared_out, y_local, local_tokens)
     scatter_local_tokens_fp32(y_local, ffn_partial, num_tokens, my_rank)
     return ffn_partial
@@ -680,6 +698,346 @@ def moe_ffn_sublayer(
 # degrades past one sublayer pair per function (logs_t16/README.md), so the file now
 # launches small per-sublayer entries instead -- see l3_prefill_fwd below.
 # =====================================================================================
+
+
+# Prefix snapshot bank geometry.
+PREFIX_SNAPSHOT_ENTRIES = 2
+PREFIX_CACHE_FAMILIES = (
+    "mla_latent_cache", "index_raw_cache", "index_pool_cache", "index_pool_scale",
+    "kda_conv_state", "kda_recurrent_state",
+)
+PREFIX_SNAPSHOT_LAYOUTS = {
+    "mla_latent_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS), torch.bfloat16),
+    "index_raw_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS), torch.float32),
+    "index_pool_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS), torch.int8),
+    "index_pool_scale": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS), torch.float32),
+    "kda_conv_state": ((PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS), torch.bfloat16),
+    "kda_recurrent_state": ((PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS), torch.float32),
+}
+PREFIX_SNAPSHOT_BYTES = sum(
+    shape[1] * shape[2] * torch.empty((), dtype=dtype).element_size()
+    for shape, dtype in PREFIX_SNAPSHOT_LAYOUTS.values()
+)
+
+
+# Prefix snapshot copy tiling.
+_PREFIX_COPY_TILE = 1024
+_PREFIX_COPY_LANE_TILE = 16
+
+
+@pl.jit(auto_scope=False)
+def copy_request_snapshot(
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    bank_mla_latent_cache: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS], pl.BF16]],
+    bank_index_raw_cache: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS], pl.FP32]],
+    bank_index_pool_cache: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS], pl.INT8]],
+    bank_index_pool_scale: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]],
+    bank_kda_conv_state: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]],
+    bank_kda_recurrent_state: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]],
+    request_slot: pl.Scalar[pl.INT32],
+    bank_id: pl.Scalar[pl.INT32],
+    restore: pl.Scalar[pl.INT32],
+):
+    """Copy all private request-cache bytes to or from one immutable bank."""
+    latent_flat = pl.reshape(mla_latent_cache, [DSA_NUM_LAYERS, LATENT_ROWS * KV_LORA])
+    bank_latent_flat = pl.reshape(bank_mla_latent_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS])
+    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_mla_latent_cache"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_MLA_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_MLA_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_MLA_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_latent_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                latent_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(latent_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_latent_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+
+    raw_flat = pl.reshape(index_raw_cache, [DSA_NUM_LAYERS, LATENT_ROWS * INDEX_STATE_WIDTH])
+    bank_raw_flat = pl.reshape(bank_index_raw_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS])
+    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_raw_cache"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_RAW_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_RAW_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_RAW_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_raw_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                raw_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(raw_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_raw_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+
+    pool_flat = pl.reshape(index_pool_cache, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * INDEX_DIM])
+    bank_pool_flat = pl.reshape(bank_index_pool_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS])
+    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_cache"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_POOL_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_POOL_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_POOL_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_pool_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                pool_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(pool_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_pool_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+
+    scale_flat = pl.reshape(index_pool_scale, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * POOL_SCALE_WIDTH])
+    bank_scale_flat = pl.reshape(bank_index_pool_scale, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS])
+    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_scale"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_SCALE_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_SCALE_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_SCALE_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_scale_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                scale_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(scale_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_scale_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+
+    conv_flat = pl.reshape(kda_conv_state, [KDA_NUM_LAYERS, KDA_ROWS * STATE_LEN * CONV_DIM])
+    bank_conv_flat = pl.reshape(bank_kda_conv_state, [PREFIX_SNAPSHOT_ENTRIES * KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS])
+    for block in pl.spmd(KDA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_kda_conv_state"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_CONV_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_CONV_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_CONV_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * KDA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_conv_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                conv_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(conv_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_conv_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+
+    recurrent_flat = pl.reshape(kda_recurrent_state, [KDA_NUM_LAYERS, KDA_ROWS * LOCAL_KDA_H * KDA_DIM * KDA_DIM])
+    bank_recurrent_flat = pl.reshape(bank_kda_recurrent_state, [PREFIX_SNAPSHOT_ENTRIES * KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS])
+    for block in pl.spmd(KDA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_kda_recurrent_state"):
+        layer = block // _PREFIX_COPY_LANE_TILE
+        lane = block % _PREFIX_COPY_LANE_TILE
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_RECURRENT_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, _RESET_RECURRENT_ELEMENTS - offset)
+            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_RECURRENT_ELEMENTS + offset
+            bank_row = pl.cast(bank_id, pl.INDEX) * KDA_NUM_LAYERS + layer
+            if restore != 0:
+                data = pl.slice(bank_recurrent_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                recurrent_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+            else:
+                data = pl.slice(recurrent_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.set_validshape(data, 1, valid)
+                bank_recurrent_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+    return (
+        mla_latent_cache, index_raw_cache, index_pool_cache, index_pool_scale,
+        kda_conv_state, kda_recurrent_state,
+        bank_mla_latent_cache, bank_index_raw_cache, bank_index_pool_cache, bank_index_pool_scale,
+        bank_kda_conv_state, bank_kda_recurrent_state,
+    )
+
+
+@pl.jit.host
+def l3_copy_request_snapshot(
+    mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    bank_mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS], pl.BF16]],
+    bank_index_raw_cache: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS], pl.FP32]],
+    bank_index_pool_cache: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS], pl.INT8]],
+    bank_index_pool_scale: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]],
+    bank_kda_conv_state: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]],
+    bank_kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]],
+    request_slot: pl.Scalar[pl.INT32],
+    bank_id: pl.Scalar[pl.INT32],
+    restore: pl.Scalar[pl.INT32],
+):
+    """Copy the same request state on every resident TP/EP rank."""
+    for rank in pl.unroll(RANKS):
+        copy_request_snapshot(
+            mla_latent_cache[rank], index_raw_cache[rank], index_pool_cache[rank],
+            index_pool_scale[rank], kda_conv_state[rank], kda_recurrent_state[rank],
+            bank_mla_latent_cache[rank], bank_index_raw_cache[rank], bank_index_pool_cache[rank],
+            bank_index_pool_scale[rank], bank_kda_conv_state[rank], bank_kda_recurrent_state[rank],
+            request_slot, bank_id, restore, device=rank,
+        )
+
+
+@pl.jit(auto_scope=False)
+def reset_request_caches(
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    slot_mask: pl.Scalar[pl.INT32],
+):
+    """Zero selected private segments, or all physical cache rows for a full reset."""
+    mla_layer_tiles = LATENT_ROWS * KV_LORA // _RESET_MLA_TILE
+    mla_slot_tiles = _RESET_MLA_ELEMENTS // _RESET_MLA_TILE
+    mla_flat_rows = DSA_NUM_LAYERS * mla_layer_tiles
+    mla_flat = pl.reshape(mla_latent_cache, [mla_flat_rows, _RESET_MLA_TILE])
+    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_MLA_LANE_TILE, name_hint="reset_mla"):
+        layer = block // _RESET_MLA_LANE_TILE
+        lane = block % _RESET_MLA_LANE_TILE
+        mla_zero = pl.tile.full([1, _RESET_MLA_TILE], dtype=pl.BF16, value=0)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, mla_layer_tiles, _RESET_MLA_LANE_TILE):
+                offset = layer * mla_layer_tiles + chunk
+                pl.tile.store(mla_zero, [offset, 0], mla_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, mla_slot_tiles, _RESET_MLA_LANE_TILE):
+                        offset = layer * mla_layer_tiles + slot * mla_slot_tiles + chunk
+                        pl.tile.store(mla_zero, [offset, 0], mla_flat)
+    raw_layer_tiles = LATENT_ROWS * INDEX_STATE_WIDTH // _RESET_RAW_TILE
+    raw_slot_tiles = _RESET_RAW_ELEMENTS // _RESET_RAW_TILE
+    raw_flat_rows = DSA_NUM_LAYERS * raw_layer_tiles
+    raw_flat = pl.reshape(index_raw_cache, [raw_flat_rows, _RESET_RAW_TILE])
+    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_RAW_LANE_TILE, name_hint="reset_raw"):
+        layer = block // _RESET_RAW_LANE_TILE
+        lane = block % _RESET_RAW_LANE_TILE
+        raw_zero = pl.tile.full([1, _RESET_RAW_TILE], dtype=pl.FP32, value=0)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, raw_layer_tiles, _RESET_RAW_LANE_TILE):
+                offset = layer * raw_layer_tiles + chunk
+                pl.tile.store(raw_zero, [offset, 0], raw_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, raw_slot_tiles, _RESET_RAW_LANE_TILE):
+                        offset = layer * raw_layer_tiles + slot * raw_slot_tiles + chunk
+                        pl.tile.store(raw_zero, [offset, 0], raw_flat)
+    pool_layer_tiles = POOL_TABLE_ROWS * INDEX_DIM // _RESET_POOL_TILE
+    pool_slot_tiles = _RESET_POOL_ELEMENTS // _RESET_POOL_TILE
+    pool_flat_rows = DSA_NUM_LAYERS * pool_layer_tiles
+    pool_flat = pl.reshape(index_pool_cache, [pool_flat_rows, _RESET_POOL_TILE])
+    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_POOL_LANE_TILE, name_hint="reset_pool"):
+        layer = block // _RESET_POOL_LANE_TILE
+        lane = block % _RESET_POOL_LANE_TILE
+        # A2/A3 has no INT8 tile fill; narrow an INT16 zero tile.
+        pool_zero_i16 = pl.tile.full([1, _RESET_POOL_TILE], dtype=pl.INT16, value=0)
+        pool_zero = pl.cast(pool_zero_i16, pl.INT8)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, pool_layer_tiles, _RESET_POOL_LANE_TILE):
+                offset = layer * pool_layer_tiles + chunk
+                pl.tile.store(pool_zero, [offset, 0], pool_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, pool_slot_tiles, _RESET_POOL_LANE_TILE):
+                        offset = layer * pool_layer_tiles + slot * pool_slot_tiles + chunk
+                        pl.tile.store(pool_zero, [offset, 0], pool_flat)
+    scale_layer_tiles = POOL_TABLE_ROWS * POOL_SCALE_WIDTH // _RESET_SCALE_TILE
+    scale_slot_tiles = _RESET_SCALE_ELEMENTS // _RESET_SCALE_TILE
+    scale_flat_rows = DSA_NUM_LAYERS * scale_layer_tiles
+    scale_flat = pl.reshape(index_pool_scale, [scale_flat_rows, _RESET_SCALE_TILE])
+    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_SCALE_LANE_TILE, name_hint="reset_scale"):
+        layer = block // _RESET_SCALE_LANE_TILE
+        lane = block % _RESET_SCALE_LANE_TILE
+        scale_zero = pl.tile.full([1, _RESET_SCALE_TILE], dtype=pl.FP32, value=0)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, scale_layer_tiles, _RESET_SCALE_LANE_TILE):
+                offset = layer * scale_layer_tiles + chunk
+                pl.tile.store(scale_zero, [offset, 0], scale_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, scale_slot_tiles, _RESET_SCALE_LANE_TILE):
+                        offset = layer * scale_layer_tiles + slot * scale_slot_tiles + chunk
+                        pl.tile.store(scale_zero, [offset, 0], scale_flat)
+    conv_layer_tiles = KDA_ROWS * STATE_LEN * CONV_DIM // _RESET_CONV_TILE
+    conv_slot_tiles = _RESET_CONV_ELEMENTS // _RESET_CONV_TILE
+    conv_flat_rows = KDA_NUM_LAYERS * conv_layer_tiles
+    conv_flat = pl.reshape(kda_conv_state, [conv_flat_rows, _RESET_CONV_TILE])
+    for block in pl.spmd(KDA_NUM_LAYERS * _RESET_CONV_LANE_TILE, name_hint="reset_conv"):
+        layer = block // _RESET_CONV_LANE_TILE
+        lane = block % _RESET_CONV_LANE_TILE
+        conv_zero = pl.tile.full([1, _RESET_CONV_TILE], dtype=pl.BF16, value=0)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, conv_layer_tiles, _RESET_CONV_LANE_TILE):
+                offset = layer * conv_layer_tiles + chunk
+                pl.tile.store(conv_zero, [offset, 0], conv_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, conv_slot_tiles, _RESET_CONV_LANE_TILE):
+                        offset = layer * conv_layer_tiles + slot * conv_slot_tiles + chunk
+                        pl.tile.store(conv_zero, [offset, 0], conv_flat)
+    recurrent_layer_tiles = KDA_ROWS * LOCAL_KDA_H * KDA_DIM * KDA_DIM // _RESET_RECURRENT_TILE
+    recurrent_slot_tiles = _RESET_RECURRENT_ELEMENTS // _RESET_RECURRENT_TILE
+    recurrent_flat_rows = KDA_NUM_LAYERS * recurrent_layer_tiles
+    recurrent_flat = pl.reshape(kda_recurrent_state, [recurrent_flat_rows, _RESET_RECURRENT_TILE])
+    for block in pl.spmd(KDA_NUM_LAYERS * _RESET_RECURRENT_LANE_TILE, name_hint="reset_recurrent"):
+        layer = block // _RESET_RECURRENT_LANE_TILE
+        lane = block % _RESET_RECURRENT_LANE_TILE
+        recurrent_zero = pl.tile.full([1, _RESET_RECURRENT_TILE], dtype=pl.FP32, value=0)
+        if slot_mask == (1 << BATCH) - 1:
+            for chunk in pl.range(lane, recurrent_layer_tiles, _RESET_RECURRENT_LANE_TILE):
+                offset = layer * recurrent_layer_tiles + chunk
+                pl.tile.store(recurrent_zero, [offset, 0], recurrent_flat)
+        else:
+            for slot in pl.range(BATCH):
+                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
+                if selected != 0:
+                    for chunk in pl.range(lane, recurrent_slot_tiles, _RESET_RECURRENT_LANE_TILE):
+                        offset = layer * recurrent_layer_tiles + slot * recurrent_slot_tiles + chunk
+                        pl.tile.store(recurrent_zero, [offset, 0], recurrent_flat)
+    return (
+        mla_latent_cache, index_raw_cache, index_pool_cache, index_pool_scale,
+        kda_conv_state, kda_recurrent_state,
+    )
+
+
+@pl.jit.host
+def l3_reset_request_caches(
+    mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    slot_mask: pl.Scalar[pl.INT32],
+):
+    """Clear the same selected request slots on every resident rank."""
+    for rank in pl.unroll(RANKS):
+        reset_request_caches(
+            mla_latent_cache[rank], index_raw_cache[rank],
+            index_pool_cache[rank], index_pool_scale[rank],
+            kda_conv_state[rank], kda_recurrent_state[rank], slot_mask, device=rank,
+        )
 
 
 @pl.jit(auto_scope=False)
@@ -702,8 +1060,7 @@ def prefill_head_rows(
     logit_row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
     head_hidden: pl.Out[pl.Tensor[[LOGIT_ROWS, D], pl.BF16]],
 ):
-    """Tail of the forward: unweighted-mean head collapse, then the per-request
-    logit-row gather the host LM head consumes (S8.4)."""
+    """Collapse the mHC stream by its unweighted mean and gather the logit rows."""
     head_all = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
     mhc_head(x_hc, head_all)
     gather_head_rows(head_all, logit_row_indices, head_hidden)
@@ -883,9 +1240,9 @@ def prefill_layer_diff_moe_ffn_rt(
     moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
-    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
     moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
-    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
     moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
     # -- windows (fresh per diff launch: the MoE barriers and this entry's
     #    single TP reduce all run at epoch 1 -- a fresh window's tp epoch IS
@@ -962,9 +1319,9 @@ def prefill_layer_diff_moe_ffn_rt(
     moe_w_gate_up_scale_l: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32] = moe_w_gate_up_scale[moe_ord]
     moe_w_down_l: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8] = moe_w_down[moe_ord]
     moe_w_down_scale_l: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32] = moe_w_down_scale[moe_ord]
-    moe_shared_w_gate_up_l: pl.Tensor[[2 * MOE_INTER, D], pl.INT8] = moe_shared_w_gate_up[moe_ord]
+    moe_shared_w_gate_up_l: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ] = moe_shared_w_gate_up[moe_ord]
     moe_shared_w_gate_up_scale_l: pl.Tensor[[2 * MOE_INTER], pl.FP32] = moe_shared_w_gate_up_scale[moe_ord]
-    moe_shared_w_down_l: pl.Tensor[[D, MOE_INTER], pl.INT8] = moe_shared_w_down[moe_ord]
+    moe_shared_w_down_l: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ] = moe_shared_w_down[moe_ord]
     moe_shared_w_down_scale_l: pl.Tensor[[D], pl.FP32] = moe_shared_w_down_scale[moe_ord]
 
     with pl.scope():
@@ -1346,7 +1703,7 @@ def prefill_layer_diff_dsa_attn_rt(
 
 
 # =====================================================================================
-# L3: rank axis + fresh communication windows (design S3.5)
+# L3: rank axis and per-program communication windows
 
 
 
@@ -1404,19 +1761,9 @@ def l3_prefill_layer_diff_kda_attn_rt(
     kda_v: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     bb_ord: pl.Scalar[pl.INT32],
     kda_ord: pl.Scalar[pl.INT32],
+    attn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Runtime-ordinal launcher twin: one artifact, any KDA attention half.
-
-    Same fresh-window contract as the retired ``l3_prefill_layer_diff_kda_attn``, but the
-    layer enters as two dispatch-time scalars -- ``bb_ord`` (backbone ordinal)
-    and ``kda_ord`` (KDA family ordinal) -- instead of a ``pl.constexpr``
-    ``layer_id``, so the SAME prepared program serves every KDA-attention
-    sublayer of the schedule (probe t29's per-kind consolidation candidate).
-    A scalar parameter has no shape in the dispatch ABI and is forwarded to
-    the entry as-is (one Python int per dispatch), so the ordinals stay host
-    arithmetic: the caller passes ``bb_ord=layer`` and
-    ``kda_ord=layer - layer // 4`` and the graph carries no layer arithmetic.
-    """
+    """Launch one KDA attention half at the caller's per-program TP epoch."""
     tp_partial_buffer = pld.alloc_window_buffer([CAPACITY, D], dtype=pl.FP32)
     tp_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.unroll(RANKS):
@@ -1439,7 +1786,7 @@ def l3_prefill_layer_diff_kda_attn_rt(
             out_attn_partial[rank], out_sublayer_out[rank], out_x_hc_mid[rank],
             kda_out[rank], mixed_qkv[rank], decay[rank], beta[rank],
             kda_q[rank], kda_k[rank], kda_v[rank],
-            bb_ord, kda_ord, rank, pl.cast(1, pl.INT32), device=rank,
+            bb_ord, kda_ord, rank, attn_epoch, device=rank,
         )
 
 
@@ -1471,16 +1818,10 @@ def l3_prefill_layer_diff_moe_ffn_rt(
     out_x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.BF16]],
     bb_ord: pl.Scalar[pl.INT32],
     moe_ord: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+    ffn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Runtime-ordinal launcher twin: one artifact, any MoE FFN half.
-
-    Same fresh-window contract as the retired ``l3_prefill_layer_diff_moe_ffn`` (all
-    barriers and the TP reduce at epoch 1), but the layer enters as two
-    dispatch-time scalars -- ``bb_ord`` (backbone ordinal) and ``moe_ord``
-    (the MoE family ordinal, ``layer - DENSE_NUM_LAYERS``) -- so one prepared
-    program serves all 42 FFN steps of the 45-layer schedule (probe t29's
-    biggest single consolidation win).
-    """
+    """Launch one MoE FFN half at the caller's per-program MoE and TP epochs."""
     lane_x_buffer = pld.alloc_window_buffer([TOTAL_CAP, D], dtype=pl.INT8)
     lane_aux_buffer = pld.alloc_window_buffer([TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
     lane_count_buffer = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
@@ -1515,7 +1856,7 @@ def l3_prefill_layer_diff_moe_ffn_rt(
             tp_partial, tp_arrived,
             out_ffn_pre[rank], out_ffn_post[rank], out_ffn_res[rank],
             out_ffn_input[rank], out_ffn_partial[rank], out_ffn_out[rank], out_x_hc_out[rank],
-            bb_ord, moe_ord, rank, pl.cast(1, pl.INT32), pl.cast(1, pl.INT32), device=rank,
+            bb_ord, moe_ord, rank, moe_epoch, ffn_epoch, device=rank,
         )
 
 
@@ -1588,17 +1929,10 @@ def l3_prefill_layer_diff_kda_dense_rt(
     bb_ord: pl.Scalar[pl.INT32],
     kda_ord: pl.Scalar[pl.INT32],
     dense_ord: pl.Scalar[pl.INT32],
+    attn_epoch: pl.Scalar[pl.INT32],
+    ffn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Runtime-ordinal launcher twin: one artifact, any dense KDA whole layer.
-
-    Same fresh-window contract as the retired ``l3_prefill_layer_diff_kda_dense`` (the
-    shared tp pair at epochs 1 then 2), but the layer enters as three
-    dispatch-time scalars -- ``bb_ord`` (backbone ordinal), ``kda_ord``
-    (``layer - layer // 4``) and ``dense_ord`` (``layer % DENSE_NUM_LAYERS``)
-    -- so the SAME prepared program serves the three dense steps of the
-    schedule. The ABI is exactly the live surface (see the L2 docstring: the
-    retired constexpr entry's dead cross-kind stacks/views are trimmed).
-    """
+    """Launch one dense KDA layer at two consecutive caller-owned TP epochs."""
     tp_partial_buffer = pld.alloc_window_buffer([CAPACITY, D], dtype=pl.FP32)
     tp_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.unroll(RANKS):
@@ -1627,7 +1961,7 @@ def l3_prefill_layer_diff_kda_dense_rt(
             kda_out[rank], mixed_qkv[rank], decay[rank], beta[rank],
             kda_q[rank], kda_k[rank], kda_v[rank], dense_x_int8[rank],
             bb_ord, kda_ord, dense_ord, rank,
-            pl.cast(1, pl.INT32), pl.cast(2, pl.INT32), device=rank,
+            attn_epoch, ffn_epoch, device=rank,
         )
 
 
@@ -1691,15 +2025,9 @@ def l3_prefill_layer_diff_dsa_attn_rt(
     selected_pools: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     bb_ord: pl.Scalar[pl.INT32],
     dsa_ord: pl.Scalar[pl.INT32],
+    attn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Runtime-ordinal launcher twin: one artifact, any DSA attention half.
-
-    Same fresh-window contract as the retired ``l3_prefill_layer_diff_dsa_attn`` (the
-    single collective at epoch 1), but the layer enters as two dispatch-time
-    scalars -- ``bb_ord`` (backbone ordinal) and ``dsa_ord``
-    (``layer // 4``, the DSA family ordinal) -- so the SAME prepared program
-    serves every DSA-attention sublayer of the schedule.
-    """
+    """Launch one DSA attention half at the caller's per-program TP epoch."""
     tp_partial_buffer = pld.alloc_window_buffer([CAPACITY, D], dtype=pl.FP32)
     tp_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.unroll(RANKS):
@@ -1727,7 +2055,7 @@ def l3_prefill_layer_diff_dsa_attn_rt(
             out_attn_partial[rank], out_sublayer_out[rank], out_x_hc_mid[rank],
             dsa_query[rank], attn_out[rank], index_q[rank], index_k[rank],
             index_scores[rank], selected_pools[rank],
-            bb_ord, dsa_ord, rank, pl.cast(1, pl.INT32), device=rank,
+            bb_ord, dsa_ord, rank, attn_epoch, device=rank,
         )
 
 
@@ -1750,6 +2078,32 @@ def l3_prefill_head_rows(
     """Collapse the head and gather the logit rows (the forward's last dispatch)."""
     for rank in pl.unroll(RANKS):
         prefill_head_rows(x_hc[rank], logit_row_indices[rank], head_hidden[rank], device=rank)
+
+
+@pl.jit
+def prefill_lm_head_logits(
+    head_hidden: pl.Tensor[[LOGIT_ROWS, D], pl.BF16],
+    final_norm: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    """Project the request prefix of the device's padded head-row buffer."""
+    selected = head_hidden[0:BATCH, 0:D]
+    lm_head_logits(selected, final_norm, weight, logits)
+    return logits
+
+
+@pl.jit.host
+def l3_prefill_lm_head_logits(
+    head_hidden: pl.Tensor[[RANKS, LOGIT_ROWS, D], pl.BF16],
+    final_norm: pl.Tensor[[RANKS, D], pl.BF16],
+    weight: pl.Tensor[[RANKS, FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[RANKS, BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    """Normalize the gathered rows and project each rank's vocabulary shard."""
+    for rank in pl.unroll(RANKS):
+        prefill_lm_head_logits(head_hidden[rank], final_norm[rank], weight[rank], logits[rank], device=rank)
+
 
 def production_launch_plan() -> tuple[tuple, ...]:
     """The dispatch sequence of one full forward (design S1 schedule).
@@ -1825,24 +2179,40 @@ def production_program_of_step(step: tuple) -> str:
     raise ValueError(f"unknown sublayer {sublayer!r} in step {step}")
 
 
-def production_step_ordinals(step: tuple) -> dict[str, int]:
-    """Host-side ordinal scalars available to one step's dispatch.
+def production_step_ordinals(step: tuple, *, dispatch_index: int = 0) -> dict[str, int]:
+    """Return layer ordinals and collective epochs for one program invocation.
 
-    A superset by design: the serving program's trailing scalar signature
-    picks the two or three ordinals it needs, and every value is pure host
-    arithmetic over the schedule (design S1) -- the graph itself never divides
-    or branches on a layer number.
+    ``dispatch_index`` counts completed invocations of this prepared program,
+    independent of other programs and request-cache slots. Zero selects a fresh
+    window set for standalone validation. TP counters receive two notifications
+    per epoch and must remain within signed INT32 range.
     """
-    if step in (("seed",), ("head",)):
+    if type(dispatch_index) is not int or dispatch_index < 0:
+        raise ValueError("dispatch_index must be a nonnegative integer")
+    program = production_program_of_step(step)
+    if program in ("seed", "head"):
         return {}
     layer = step[0]
-    return {
+    ordinals = {
         "bb_ord": layer,
         "kda_ord": layer - layer // 4,
         "dsa_ord": layer // 4,
         "dense_ord": layer % DENSE_NUM_LAYERS,
         "moe_ord": layer - DENSE_NUM_LAYERS,
     }
+    epoch = dispatch_index + 1
+    if program == "dense":
+        ordinals.update(attn_epoch=2 * epoch - 1, ffn_epoch=2 * epoch)
+        final_tp_epoch = 2 * epoch
+    elif program == "moe_ffn":
+        ordinals.update(moe_epoch=epoch, ffn_epoch=epoch)
+        final_tp_epoch = epoch
+    else:
+        ordinals["attn_epoch"] = epoch
+        final_tp_epoch = epoch
+    if final_tp_epoch > (2**31 - 1) // 2:
+        raise OverflowError("collective epochs exhausted; close and reopen the resident session")
+    return ordinals
 
 
 def _l3_arg_arity(entry) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1925,6 +2295,15 @@ def _alloc_name_of(param: str, overrides: dict[str, str]) -> str:
             return workspace
     return param
 
+def _production_geometry() -> dict[str, int]:
+    """Import-frozen query/cache dimensions, collective ABI and shared weight layout."""
+    return {
+        "version": 3, "shared_int8_nz": 1, "tp": TP_SIZE, "ep": EP_SIZE, "capacity": CAPACITY,
+        "max_seq_len": MAX_SEQ_LEN, "batch": BATCH, "latent_rows": LATENT_ROWS,
+        "pool_axis": POOL_AXIS,
+    }
+
+
 def compile_production(
     runtime_dir: Path, device_ids: list[int], *, platform: str = "a2a3", mode: str = "rt",
     programs: tuple[str, ...] | None = None,
@@ -1946,7 +2325,7 @@ def compile_production(
     )
     runtime_dir = Path(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"_mode": mode}
+    manifest = {"_mode": mode, "_geometry": _production_geometry()}
     if mode == "rt":
         for program in (programs if programs is not None else RT_PROGRAMS):
             if program not in RT_PROGRAMS:
@@ -1988,7 +2367,12 @@ def load_production(runtime_dir: Path, device_ids: list[int], *, platform: str =
             "with compile_production(mode='rt'), or recover the retired path "
             "from git tag glm53-pretrim-baseline"
         )
-    programs_present = [key for key in manifest if key != "_mode"]
+    if manifest.get("_geometry") != _production_geometry():
+        raise ValueError(
+            "runtime query/cache geometry, collective ABI or shared weight layout differs; recompile "
+            "with matching --tp, --ep, --capacity and --max-seq-len"
+        )
+    programs_present = [key for key in manifest if not key.startswith("_")]
     unknown = [key for key in programs_present if key not in RT_PROGRAMS]
     if unknown:
         raise ValueError(f"rt manifest carries unknown programs {unknown}")
@@ -2215,10 +2599,12 @@ WORKSPACES = {
 
 OUTPUTS = {"head_hidden": ((LOGIT_ROWS, D), torch.bfloat16)}
 
-# Step tensors that never change across generate steps: the resident stacks plus the
-# KDA/Hadamard constants (the hadamard table is a stack). Caches are deliberately NOT
-# constants -- full-prefix recompute re-zeroes them every step.
-CONSTANT_STEP_INPUTS = {"kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide"}
+# Resident stacks, KDA tables and fixed request-slot maps survive every dispatch.
+# Request caches are initialized once and cleared only by reset_requests().
+CONSTANT_STEP_INPUTS = {
+    "kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide",
+    "block_table", "kda_state_rows", "pool_blocks",
+}
 
 # =====================================================================================
 # Host-side metadata (design S5.2): the indexer step builder shared by the runner and
@@ -2236,89 +2622,6 @@ def _pad_to(tensor: torch.Tensor, rows: int, value: int) -> torch.Tensor:
     return torch.cat([tensor, pad])
 
 
-def build_block_tables(
-    lengths: torch.Tensor, block_size: int, table_max: int
-) -> torch.Tensor:
-    """Assign unique physical blocks per request, sequentially from zero.
-
-    ``-1`` pads unused columns; ``build_forward_metadata`` maps positions through
-    this table (``paged_slots``), so every packed row lands on its own physical
-    cache row and pool/table fragmentation headroom is only needed once per request.
-    """
-    table = torch.full((int(lengths.numel()), table_max), -1, dtype=torch.int32)
-    base = 0
-    for request, length in enumerate(lengths.tolist()):
-        pages = (length + block_size - 1) // block_size
-        table[request, :pages] = torch.arange(base, base + pages, dtype=torch.int32)
-        base += pages
-    return table
-
-
-def build_indexer_step_metadata(
-    metadata, *, capacity: int = CAPACITY, pools_cap: int = POOL_AXIS, pool_rows: int = POOL_TABLE_ROWS
-) -> dict[str, torch.Tensor]:
-    """Derive the per-token and per-pool indexer metadata of one packed batch.
-
-    The pooled table uses the **compacted** id space: request r's pools occupy ids
-    ``[seg_base[r], seg_base[r] + pools[r])`` with ``seg_base`` the running sum, the
-    physical mapping is the identity (one page of :data:`INDEX_STATE_BLOCK_SIZE` rows
-    per ``pool_blocks`` entry), and ``selected_pools`` are segment-local ids -- the
-    scheme the standalone step fixture proves (``prefill_indexer.py`` step specs).
-
-    Per-token values are causal: computed from the length through the token, with
-    the visible pool count clamped to the request's completed pools. Padded rows
-    carry zeros, so their expansion is empty (``-1`` everywhere) and every cache
-    writer skips them through the ``-1`` slot guard.
-
-    Padded pool-close events point ``pool_slots`` at the scratch tail row of the
-    pooled table: ``indexer_pool_write`` always writes the destination row of every
-    event (padding stages a zero row), so a ``-1`` destination would wrap. The tail
-    row sits beyond every reachable compacted id, so real pools are never touched.
-    """
-    qsl = metadata.query_start_loc.to(torch.int64)
-    requests = int(qsl.numel()) - 1
-    lengths = metadata.new_kv_seq_lens.to(torch.int64)  # kv_seq_lens is all zero here
-    pools = lengths // INDEX_KPOOL
-    seg_base = torch.cumsum(pools, 0) - pools
-
-    pos = metadata.position_ids.to(torch.int64)
-    req = metadata.request_ids.to(torch.int64)
-    valid = req >= 0
-    safe_req = req.clamp(min=0)
-    length_through = torch.where(valid, pos + 1, torch.zeros_like(pos))
-    tail_count_tok = torch.where(valid, length_through % INDEX_KPOOL, torch.zeros_like(pos))
-    visible = torch.where(
-        valid, torch.minimum(length_through // INDEX_KPOOL, pools[safe_req]), torch.zeros_like(pos)
-    )
-
-    # Pool-close events: one per completed pool, ordered by (request, local pool).
-    events = int(pools.sum().item())
-    if events > pools_cap:
-        raise ValueError(f"{events} pool-close events exceed the static capacity {pools_cap}")
-    pool_token_slots = torch.full((pools_cap, INDEX_KPOOL), -1, dtype=torch.int32)
-    pool_slots = torch.full((pools_cap,), pool_rows - 1, dtype=torch.int32)
-    slots = metadata.index_slots.to(torch.int64)
-    event = 0
-    for request in range(requests):
-        row_base = int(qsl[request].item())
-        for pool in range(int(pools[request].item())):
-            first = row_base + pool * INDEX_KPOOL
-            pool_token_slots[event] = slots[first : first + INDEX_KPOOL]
-            pool_slots[event] = int(seg_base[request].item()) + pool
-            event += 1
-
-    return {
-        "seg_start": torch.where(valid, seg_base[safe_req], torch.zeros_like(pos)).to(torch.int32),
-        "pool_count_tok": visible.to(torch.int32),
-        "tail_start": (length_through - tail_count_tok).to(torch.int32),
-        "tail_count": tail_count_tok.to(torch.int32),
-        "kv_len_tok": length_through.to(torch.int32),
-        "pool_token_slots": pool_token_slots,
-        "pool_slots": pool_slots,
-        "pool_blocks": (torch.arange(POOL_AXIS, dtype=torch.int32) * INDEX_STATE_BLOCK_SIZE),
-    }
-
-
 def kda_host_constants() -> dict[str, torch.Tensor]:
     """The shared KDA tables every rank uploads once (prefill_kda.py fixtures)."""
     return {
@@ -2332,7 +2635,7 @@ def kda_host_constants() -> dict[str, torch.Tensor]:
 
 
 def zeroed_caches() -> dict[str, torch.Tensor]:
-    """Fresh zero pools for one full-prefix-recompute forward (design S3.3)."""
+    """Fresh zero pools for session initialization or a complete request reset."""
     return {
         "mla_latent_cache": torch.zeros(
             DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA, dtype=torch.bfloat16
@@ -2355,63 +2658,59 @@ def zeroed_caches() -> dict[str, torch.Tensor]:
     }
 
 
-def prepare_step_inputs(weights: ResidentPrefillWeights, sequences: list[list[int]]) -> dict:
-    """Build every non-weight L2 input of one prefill step (design S8.3).
-
-    Padding convention: rows at or beyond the active prefix carry ``-1`` slots and
-    zero per-token metadata; ``query_start_loc`` is exactly ``BATCH + 1`` rows
-    (the cumsum with its leading zero -- nothing is padded). The embedding
-    gather is host-side (S8.5); the LM head never appears here.
-    """
+def prepare_step_inputs(
+    weights: ResidentPrefillWeights, sequences: list[list[int]],
+    *, kv_seq_lens: torch.Tensor | None = None,
+) -> dict:
+    """Pack only new query tokens into stable request-owned cache slots."""
     if len(sequences) != BATCH:
-        raise ValueError(f"the packed batch is compiled for {BATCH} prompts, got {len(sequences)}")
+        raise ValueError(f"the packed batch has {BATCH} request slots, got {len(sequences)}")
     lengths = torch.tensor([len(seq) for seq in sequences], dtype=torch.int64)
+    previous = torch.zeros(BATCH, dtype=torch.int32) if kv_seq_lens is None else kv_seq_lens.to(torch.int32)
+    if previous.shape != (BATCH,) or bool((previous < 0).any()):
+        raise ValueError("kv_seq_lens must contain one nonnegative prefix length per request slot")
+    if bool((previous.to(torch.int64) + lengths > MAX_SEQ_LEN).any()):
+        raise ValueError(f"request context exceeds the compiled maximum {MAX_SEQ_LEN}")
     total = int(lengths.sum().item())
     if total > CAPACITY:
-        raise ValueError(f"{total} packed tokens exceed the compiled capacity {CAPACITY}")
+        raise ValueError(f"{total} new query tokens exceed the compiled capacity {CAPACITY}")
 
-    ids = torch.zeros(CAPACITY, dtype=torch.int64)
-    ids[:total] = torch.tensor([token for seq in sequences for token in seq], dtype=torch.int64)
     embedding_rows = torch.zeros(CAPACITY, D, dtype=torch.bfloat16)
-    embedding_rows[:total] = weights.lookup_rows(ids[:total])
-
+    if total:
+        ids = torch.tensor([token for seq in sequences for token in seq], dtype=torch.int64)
+        embedding_rows[:total] = weights.lookup_rows(ids)
     query_start_loc = torch.cumsum(
         torch.cat([torch.zeros(1, dtype=torch.int64), lengths]), 0
     ).to(torch.int32)
-    mla_table = build_block_tables(lengths, BLOCK_SIZE, TABLE_MAX)
-    index_table = build_block_tables(lengths, BLOCK_SIZE, TABLE_MAX)
-    pool_table = torch.zeros(BATCH, POOL_TABLE_MAX, dtype=torch.int32)
-
+    block_table = torch.arange(BATCH * TABLE_MAX, dtype=torch.int32).reshape(BATCH, TABLE_MAX)
+    pool_table = torch.arange(BATCH * POOL_TABLE_MAX, dtype=torch.int32).reshape(BATCH, POOL_TABLE_MAX)
     metadata = build_forward_metadata(
-        query_start_loc,
-        kv_seq_lens=torch.zeros(BATCH, dtype=torch.int32),  # fresh prefill, always
-        mla_block_table=mla_table,
-        index_block_table=index_table,
-        pool_block_table=pool_table,  # per-token pool_slots unused; see builder below
-        kda_state_rows=torch.arange(BATCH, dtype=torch.int32),
+        query_start_loc, kv_seq_lens=previous,
+        mla_block_table=block_table, index_block_table=block_table,
+        pool_block_table=pool_table, kda_state_rows=torch.arange(BATCH, dtype=torch.int32),
         tp_size=TP_SIZE,
     )
-    step = build_indexer_step_metadata(metadata)
-    # The indexer builder answers packed-length per-token rows; the compiled
-    # signatures carry the full static capacity, so pad to CAPACITY with the
-    # documented padding convention (zero per-token metadata on inactive rows).
+    step = build_indexer_chunk_metadata(
+        metadata, block_table, torch.arange(BATCH, dtype=torch.int32) * POOL_STRIDE,
+        pools_cap=POOL_AXIS, pool_rows=POOL_TABLE_ROWS,
+    )
     for name in ("seg_start", "pool_count_tok", "tail_start", "tail_count", "kv_len_tok"):
         step[name] = _pad_to(step[name], CAPACITY, 0)
-    inputs = {
+    logit_rows = torch.where(lengths > 0, metadata.logit_row_indices, torch.zeros(BATCH, dtype=torch.int32))
+    return {
         "embedding_rows": embedding_rows,
         "query_start_loc": query_start_loc,
         "request_ids": _pad_to(metadata.request_ids, CAPACITY, -1),
         "mla_slots": _pad_to(metadata.mla_slots, CAPACITY, -1),
         "index_slots": _pad_to(metadata.index_slots, CAPACITY, -1),
         "kda_state_rows": metadata.kda_state_rows,
-        "block_table": mla_table,
-        "logit_row_indices": _pad_to(metadata.logit_row_indices, LOGIT_ROWS, 0),
+        "block_table": block_table,
+        "logit_row_indices": _pad_to(logit_rows, LOGIT_ROWS, 0),
         "active_tokens": torch.tensor([total], dtype=torch.int32),
         **step,
         **kda_host_constants(),
-        **zeroed_caches(),
     }
-    return inputs
+
 # GLM53_PREFILL_VERIFY_XHC=1 additionally reads the final stream workspace (the
 # last FFN launch's out_x_hc_out) back after every forward and refuses non-finite
 # values -- the plan-driven proof's stream evidence. Off by default because the
@@ -2434,10 +2733,10 @@ DEFAULT_CHAT_TEMPLATE = (
 def host_lm_head_logits(
     head_rows: torch.Tensor, final_norm_w: torch.Tensor, lm_head: torch.Tensor
 ) -> torch.Tensor:
-    """Final RMSNorm + full-vocabulary GEMM on the host (design S8.4).
+    """CPU reference for final FP32 RMSNorm and the full-vocabulary projection.
 
     ``head_rows`` is ``[rows, D]`` BF16; the result is FP32 ``[rows, VOCAB]`` with
-    the norm fused before the head, matching the planned device ABI (lm_head.py).
+    no BF16 rounding between normalization and projection.
     """
     hidden = head_rows.to(torch.float32)
     inverse_rms = torch.rsqrt(hidden.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
@@ -2507,6 +2806,519 @@ def _render_prompt(prompt: str, chat_template: str | None) -> str:
         print("GLM_CHAT_TEMPLATE_FALLBACK", repr(error), flush=True)
         return f"<|user|>\n{prompt}<|assistant|>\n"
 
+class ResidentPrefillSession:
+    """Resident weights and request-local caches for chunked GLM forwards."""
+
+    def __init__(
+        self, checkpoint: Checkpoint, programs: dict, device_ids: list[int],
+        *, platform: str = "a2a3", run_config: RunConfig | None = None,
+        host_num_threads: int | None = None,
+        prefix_snapshot_entries: int = 0, prefix_snapshot_max_bytes: int = 128 * 1024**2,
+        lm_head_backend: str | None = None,
+    ):
+        if host_num_threads is not None and (type(host_num_threads) is not int or host_num_threads <= 0):
+            raise ValueError("host_num_threads must be a positive integer or None")
+        if type(prefix_snapshot_entries) is not int or prefix_snapshot_entries not in (0, PREFIX_SNAPSHOT_ENTRIES):
+            raise ValueError("prefix_snapshot_entries must be zero or two")
+        required = prefix_snapshot_entries * PREFIX_SNAPSHOT_BYTES
+        if type(prefix_snapshot_max_bytes) is not int or prefix_snapshot_max_bytes < required:
+            raise ValueError(f"prefix snapshot allocation requires {required} bytes per rank")
+        self._prefix_snapshot_entries = prefix_snapshot_entries
+        self._snapshot_program = None
+        self._snapshot_banks = {}
+        self._snapshot_descriptors = [None] * prefix_snapshot_entries
+        self._snapshot_generations = [0] * prefix_snapshot_entries
+        self._host_num_threads = host_num_threads
+        self._previous_host_num_threads = None
+        self.checkpoint = checkpoint
+        self.programs = programs
+        self.device_ids = list(device_ids)
+        self.platform = platform
+        self.run_config = run_config
+        self.runtime = None
+        self._lm_head_program = None
+        self._device_lm_head = None
+        self._device_final_norm = None
+        self._device_logits = None
+        self._host_logits_shards = None
+        self.lm_head = None
+        self.lm_head_backend = (
+            os.environ.get("GLM53_LM_HEAD_BACKEND", "npu") if lm_head_backend is None else lm_head_backend
+        )
+        self._context = None
+        self.calls = 0
+        self.guard_events: list[str] = []
+        self._seq_lens = torch.zeros(BATCH, dtype=torch.int32)
+        self._invalid_slots: set[int] = set()
+        self._reset_program = None
+        self._dispatch_error: BaseException | None = None
+        self._collective_dispatches = {
+            program: 0 for program in RT_PROGRAMS if program not in ("seed", "head")
+        }
+        plan = production_launch_plan()
+        if set(programs) != set(RT_PROGRAMS):
+            raise ValueError(
+                f"programs must cover exactly the consolidated set {list(RT_PROGRAMS)} "
+                f"(got {sorted(programs)})"
+            )
+        # Signature names come from the entries, never from the compiled artifacts:
+        # the persisted param metadata carries post-SSA spellings (x_hc__ssa_v0).
+        # Every step dispatches its consolidated program by kind, with the layer
+        # riding the dispatch as trailing ordinal scalars.
+        arity = {program: _l3_arg_arity(production_program_entry(program))
+                 for program in RT_PROGRAMS}
+        step_program = {step: production_program_of_step(step) for step in plan}
+        for program, (tensor_names, scalar_names) in arity.items():
+            metadata = programs[program]._get_metadata()[0]
+            expected = [False] * len(tensor_names) + [True] * len(scalar_names)
+            if [info.shape is None for info in metadata] != expected:
+                raise ValueError(f"compiled {program} has a stale collective ABI; recompile --runtime-dir")
+        # Reject a different rank/capacity compile before loading any payload: the
+        # seed entry leads with embedding_rows [RANKS, CAPACITY, D].
+        seed_params = programs["seed"]._get_metadata()[0]
+        if list(seed_params[0].shape) != [RANKS, CAPACITY, D]:
+            raise ValueError(
+                f"--runtime-dir must contain glm prefill compiled for "
+                f"TP{TP_SIZE}/EP{EP_SIZE} with capacity {CAPACITY}"
+            )
+        if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
+            raise ValueError(f"prefill needs {RANKS} distinct devices")
+        dsa_params = programs["dsa_attn"]._get_metadata()[0]
+        dsa_names = arity["dsa_attn"][0]
+        expected_cache = [RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA]
+        if list(dsa_params[dsa_names.index("mla_latent_cache")].shape) != expected_cache:
+            raise ValueError("compiled request-cache shape differs; recompile for --max-seq-len")
+
+        self.plan, self.arity, self.step_program = plan, arity, step_program
+
+    @property
+    def lm_head_backend(self) -> str:
+        """Select full FP32 logits on the NPU or the CPU reference."""
+        return self._lm_head_backend
+
+    @lm_head_backend.setter
+    def lm_head_backend(self, value: str) -> None:
+        if value not in ("npu", "cpu"):
+            raise ValueError("lm_head_backend must be 'npu' or 'cpu'")
+        if self.runtime is not None:
+            if value == "npu" and self._lm_head_program is None:
+                raise ValueError("open the session with lm_head_backend='npu' to prepare the device head")
+            if value == "cpu" and self.lm_head is None:
+                self.lm_head = self.weights.lm_head().to(torch.float32)
+        self._lm_head_backend = value
+
+    def __enter__(self):
+        if self._context is not None:
+            raise RuntimeError("the resident prefill session is already open")
+        if self.run_config is not None and self.run_config.enable_chip_swimlane:
+            raise ValueError("resident chunk sessions cannot replay two-pass swimlane dispatches")
+        checkpoint_start = time.monotonic()
+        checkpoint, programs, device_ids = self.checkpoint, self.programs, self.device_ids
+        platform = self.platform
+        plan, arity, step_program = self.plan, self.arity, self.step_program
+        weights = ResidentPrefillWeights.load(
+            checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model()
+        )
+        final_norm_w = _load_final_norm(checkpoint)
+        lm_head = weights.lm_head().to(torch.float32) if self.lm_head_backend == "cpu" else None
+        print("GLM_LM_HEAD_BACKEND", self.lm_head_backend, flush=True)
+        config = self.run_config or RunConfig(
+            platform=platform, ring_heap=2 * 1024**3,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+        )
+
+        self.runtime_started_at = time.monotonic()
+        self.checkpoint_setup_seconds = self.runtime_started_at - checkpoint_start
+        print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
+        # Auxiliary cache maintenance shares the prepared worker, outside the forward manifest.
+        reset_program = l3_reset_request_caches.compile(config=config)
+        primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
+        extras.append(reset_program)
+        lm_head_program = None
+        if self.lm_head_backend == "npu":
+            lm_head_program = l3_prefill_lm_head_logits.compile(config=config)
+            extras.append(lm_head_program)
+        snapshot_program = None
+        if self._prefix_snapshot_entries:
+            snapshot_program = l3_copy_request_snapshot.compile(config=config)
+            extras.append(snapshot_program)
+        context = primary.prepare(
+            config, extra_compiled=extras, persistent=True, reset_persistent_windows=False,
+        )
+        runtime = context.__enter__()
+        try:
+            inputs = {**prepare_step_inputs(weights, [[] for _ in range(BATCH)]), **zeroed_caches()}
+            per_rank = [{} for _ in device_ids]
+            for rank in range(RANKS):
+                tensors = per_rank[rank]
+                for name in GLM_TENSORS:
+                    stack = _PARAM_TO_STACK.get(name)
+                    if stack is not None:
+                        shape, dtype = weights.tensor_layouts[stack]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    elif name in OUTPUTS:
+                        shape, dtype = OUTPUTS[name]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    elif name in WORKSPACES:
+                        shape, dtype = WORKSPACES[name]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    else:
+                        value = inputs[name]
+                        tensors[name] = runtime.alloc_tensor(
+                            value.shape, value.dtype, init=value, worker_id=rank
+                        )
+                # Stacks the graph ABI does not carry (final norm, MTP extras) still need
+                # allocation because weights.upload stages every resident stack.
+                for stack, (shape, dtype) in weights.tensor_layouts.items():
+                    if stack not in _STACK_TO_PARAM and stack not in tensors:
+                        tensors[stack] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+
+            def upload(rank):
+                handles = {
+                    stack: per_rank[rank][_STACK_TO_PARAM.get(stack, stack)]
+                    for stack in weights.tensor_layouts
+                }
+                weights.upload(runtime, rank, handles)
+                print("GLM_RANK_WEIGHTS_READY", rank, flush=True)
+
+            with ThreadPoolExecutor(max_workers=RANKS) as executor:
+                list(executor.map(upload, range(RANKS)))
+            stacked = {
+                name: StackedDeviceTensor(
+                    [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
+                )
+                for name in GLM_TENSORS
+            }
+            # Per-step parameter -> buffer binding (design S2.1 ping-pong): every
+            # launch's signature names must resolve to exactly one allocated tensor
+            # before any dispatch happens, so a plan/ABI drift fails loudly here
+            # instead of as an opaque dispatch-time shape error.
+            bindings = production_step_bindings(plan)
+            for step in plan:
+                tensor_names, _ = arity[step_program[step]]
+                unbound = [
+                    name for name in tensor_names
+                    if _alloc_name_of(name, bindings[step]) not in stacked
+                ]
+                if unbound:
+                    raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
+            head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
+            device_lm_head, device_final_norm, device_logits, host_logits_shards = None, None, None, None
+            if lm_head_program is not None:
+                head_weights, head_outputs = [], []
+                head = weights.lm_head()
+                for rank in range(RANKS):
+                    shard = torch.zeros((FP32_HEAD_VOCAB_PAD, D), dtype=torch.float32)
+                    shard[:LOCAL_VOCAB].copy_(head[rank * LOCAL_VOCAB : (rank + 1) * LOCAL_VOCAB])
+                    head_weights.append(runtime.alloc_tensor(shard.shape, shard.dtype, init=shard, worker_id=rank))
+                    output_shape = (BATCH, FP32_HEAD_VOCAB_PAD)
+                    head_outputs.append(runtime.alloc_tensor(output_shape, torch.float32, worker_id=rank))
+                workers = tuple(range(RANKS))
+                device_lm_head = StackedDeviceTensor(head_weights, (RANKS, FP32_HEAD_VOCAB_PAD, D), workers)
+                device_final_norm = StackedDeviceTensor(
+                    [rank["norm.final_norm"] for rank in per_rank], (RANKS, D), workers,
+                )
+                device_logits = StackedDeviceTensor(head_outputs, (RANKS, BATCH, FP32_HEAD_VOCAB_PAD), workers)
+                host_logits_shards = torch.empty((RANKS, BATCH, FP32_HEAD_VOCAB_PAD), dtype=torch.float32)
+                print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", FP32_HEAD_VOCAB_PAD * D * 4, flush=True)
+        except BaseException:
+            context.__exit__(*sys.exc_info())
+            raise
+        self._context = context
+        self.runtime, self.config = runtime, config
+        self._lm_head_program = lm_head_program
+        self._device_lm_head, self._device_final_norm = device_lm_head, device_final_norm
+        self._device_logits, self._host_logits_shards = device_logits, host_logits_shards
+        self._reset_program = reset_program
+        self._snapshot_program = snapshot_program
+        self._snapshot_generations = [0] * self._prefix_snapshot_entries
+        if self._prefix_snapshot_entries:
+            try:
+                for name, (shape, dtype) in PREFIX_SNAPSHOT_LAYOUTS.items():
+                    shards = [runtime.alloc_tensor(shape, dtype, worker_id=rank) for rank in range(RANKS)]
+                    self._snapshot_banks[name] = StackedDeviceTensor(shards, (RANKS, *shape), tuple(range(RANKS)))
+            except BaseException:
+                self.__exit__(*sys.exc_info())
+                raise
+        self.weights, self.final_norm_w, self.lm_head = weights, final_norm_w, lm_head
+        self.per_rank, self.stacked, self.bindings = per_rank, stacked, bindings
+        self.head_rows = head_rows
+        self._seq_lens.zero_()
+        self._invalid_slots.clear()
+        self._dispatch_error = None
+        for program in self._collective_dispatches:
+            self._collective_dispatches[program] = 0
+        try:
+            if self._host_num_threads is not None:
+                self._previous_host_num_threads = torch.get_num_threads()
+                torch.set_num_threads(self._host_num_threads)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+        return self
+
+    def __exit__(self, *exc_info):
+        context, self._context = self._context, None
+        self.runtime = None
+        self._reset_program = None
+        self._snapshot_program = None
+        self._lm_head_program = None
+        self._device_lm_head = None
+        self._device_final_norm = None
+        self._device_logits = None
+        self._host_logits_shards = None
+        self._snapshot_banks.clear()
+        self._snapshot_descriptors = [None] * self._prefix_snapshot_entries
+        self.lm_head = None
+        try:
+            if context is not None:
+                return context.__exit__(*exc_info)
+            return False
+        finally:
+            self._restore_host_num_threads()
+
+    def _restore_host_num_threads(self) -> None:
+        previous, self._previous_host_num_threads = self._previous_host_num_threads, None
+        if previous is not None:
+            torch.set_num_threads(previous)
+
+    def _require_healthy_runtime(self) -> None:
+        """Require an open runtime with valid per-program communication state."""
+        if self.runtime is None:
+            raise RuntimeError("open the resident session before accessing request state")
+        if self._dispatch_error is not None:
+            raise RuntimeError("a dispatch failed; close and reopen the resident session") from self._dispatch_error
+
+    def _snapshot_descriptor(self, descriptor):
+        if not isinstance(descriptor, (tuple, list)) or len(descriptor) != 3:
+            raise ValueError("prefix snapshot descriptor must contain bank, generation and length")
+        bank, generation, length = descriptor
+        if any(type(value) is not int for value in descriptor):
+            raise ValueError("prefix snapshot descriptor fields must be integers")
+        if not 0 <= bank < self._prefix_snapshot_entries or generation <= 0:
+            raise ValueError("prefix snapshot bank or generation is invalid")
+        if not 0 < length <= MAX_SEQ_LEN or length % CHUNK:
+            raise ValueError("prefix snapshot length must preserve the KDA recurrence boundary")
+        return bank, generation, length
+
+    def _copy_snapshot(self, slot: int, bank: int, *, restore: bool) -> None:
+        self._require_healthy_runtime()
+        if self._snapshot_program is None or type(slot) is not int or not 0 <= slot < BATCH:
+            raise ValueError("prefix snapshots are disabled or the request slot is invalid")
+        arguments = [self.stacked[name] for name in PREFIX_CACHE_FAMILIES]
+        arguments.extend(self._snapshot_banks[name] for name in PREFIX_CACHE_FAMILIES)
+        try:
+            self.runtime.run(self._snapshot_program, *arguments, slot, bank, int(restore), config=self.config)
+        except BaseException as error:
+            self._dispatch_error = error
+            raise
+
+    def capture_prefix(self, slot: int, descriptor) -> None:
+        """Capture a confirmed aligned prompt boundary into a new generation."""
+        self._require_healthy_runtime()
+        bank, generation, length = self._snapshot_descriptor(descriptor)
+        if type(slot) is not int or not 0 <= slot < BATCH or slot in self._invalid_slots:
+            raise ValueError("prefix capture requires a valid active request slot")
+        if generation <= self._snapshot_generations[bank] or int(self._seq_lens[slot]) != length:
+            raise ValueError("prefix capture generation or committed boundary is stale")
+        self._snapshot_descriptors[bank] = None
+        self._snapshot_generations[bank] = generation
+        try:
+            self._copy_snapshot(slot, bank, restore=False)
+        except BaseException:
+            self._invalid_slots.add(slot)
+            raise
+        self._snapshot_descriptors[bank] = (bank, generation, length)
+
+    def restore_prefix(self, slot: int, descriptor) -> None:
+        """Restore immutable state into a reset request slot and commit its length."""
+        self._require_healthy_runtime()
+        bank, generation, length = self._snapshot_descriptor(descriptor)
+        if self._snapshot_descriptors[bank] != (bank, generation, length):
+            raise ValueError("prefix snapshot generation or length is stale")
+        if type(slot) is not int or not 0 <= slot < BATCH or int(self._seq_lens[slot]) != 0:
+            raise ValueError("prefix restore requires a reset request slot")
+        self._invalid_slots.add(slot)
+        self._copy_snapshot(slot, bank, restore=True)
+        self._seq_lens[slot] = length
+        self._invalid_slots.discard(slot)
+
+    def reset_requests(self, request_slots: list[int]) -> None:
+        """Clear request-owned state and cache rows before releasing or reusing slots."""
+        self._require_healthy_runtime()
+        slots = list(request_slots)
+        if len(set(slots)) != len(slots) or any(slot < 0 or slot >= BATCH for slot in slots):
+            raise ValueError(f"request slots must be unique integers in 0..{BATCH - 1}")
+        if not slots:
+            return
+        # Mark requested slots invalid through the distributed clear.
+        self._invalid_slots.update(slots)
+        slot_mask = sum(1 << slot for slot in slots)
+        self.runtime.run(
+            self._reset_program,
+            self.stacked["mla_latent_cache"], self.stacked["index_raw_cache"],
+            self.stacked["index_pool_cache"], self.stacked["index_pool_scale"],
+            self.stacked["kda_conv_state"], self.stacked["kda_recurrent_state"],
+            slot_mask, config=self.config,
+        )
+        self._seq_lens[slots] = 0
+        self._invalid_slots.difference_update(slots)
+
+    def forward_chunks(
+        self, token_sequences: list[list[int]], request_slots: list[int],
+        kv_seq_lens: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Append only new query tokens to the selected persistent request slots."""
+        self._require_healthy_runtime()
+        slots = list(request_slots)
+        if len(token_sequences) != len(slots) or not slots:
+            raise ValueError("each nonempty query sequence needs one request slot")
+        if len(set(slots)) != len(slots) or any(slot < 0 or slot >= BATCH for slot in slots):
+            raise ValueError(f"request slots must be unique integers in 0..{BATCH - 1}")
+        if any(not tokens for tokens in token_sequences):
+            raise ValueError("active chunk sequences must contain at least one token")
+        if self._invalid_slots.intersection(slots):
+            raise RuntimeError("reset request slots after a failed dispatch before reusing their cache state")
+        previous = self._seq_lens[slots].tolist()
+        if kv_seq_lens is not None and list(kv_seq_lens) != previous:
+            raise ValueError("chunk prefix lengths disagree with committed request cache state")
+        sequences = [[] for _ in range(BATCH)]
+        for slot, tokens in zip(slots, token_sequences, strict=True):
+            sequences[slot] = list(tokens)
+        inputs = prepare_step_inputs(self.weights, sequences, kv_seq_lens=self._seq_lens)
+        try:
+            logits = self._run_step(inputs)
+        except BaseException:
+            # Device caches may have advanced even when the host call did not commit its lengths.
+            self._invalid_slots.update(slots)
+            raise
+        for slot, tokens in zip(slots, token_sequences, strict=True):
+            self._seq_lens[slot] += len(tokens)
+        return logits[slots]
+
+    def forward(self, sequences: list[list[int]]) -> torch.Tensor:
+        """Run an independent full-prefix batch through the chunk-capable session."""
+        if len(sequences) != BATCH or any(not tokens for tokens in sequences):
+            raise ValueError(f"full-prefix forward requires {BATCH} nonempty sequences")
+        self.reset_requests(list(range(BATCH)))
+        return self.forward_chunks(sequences, list(range(BATCH)), [0] * BATCH)
+
+    def _run_step(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Upload this query batch and dispatch the full backbone once."""
+        self._require_healthy_runtime()
+        runtime, config, programs = self.runtime, self.config, self.programs
+        plan, arity, step_program = self.plan, self.arity, self.step_program
+        per_rank, stacked, bindings = self.per_rank, self.stacked, self.bindings
+        head_rows, guard_events = self.head_rows, self.guard_events
+        final_norm_w, lm_head = self.final_norm_w, self.lm_head
+        step = self.calls
+        for rank in range(RANKS):
+            for name, value in inputs.items():
+                if name in CONSTANT_STEP_INPUTS or name in _PARAM_TO_STACK:
+                    continue
+                runtime.copy_to(
+                    per_rank[rank][name].data_ptr, value.data_ptr(),
+                    value.numel() * value.element_size(), worker_id=rank,
+                )
+        self.last_dispatch_started_at = time.monotonic()
+        print("GLM_DEVICE_START", self.calls, flush=True)
+        pending = deque()
+        next_dispatches = dict(self._collective_dispatches)
+
+        def complete_oldest():
+            handle, key, dispatch_index = pending[0]
+            handle.result()
+            pending.popleft()
+            if key in self._collective_dispatches:
+                self._collective_dispatches[key] = dispatch_index + 1
+
+        try:
+            for launch in plan:
+                if len(pending) == 2:
+                    complete_oldest()
+                overrides = bindings[launch]
+                key = step_program[launch]
+                tensor_names, scalar_names = arity[key]
+                if TRACE_DISPATCH:
+                    label = f"{_step_key(launch)} {key}"
+                    print("GLM_DISPATCH", label, flush=True)
+                dispatch_index = next_dispatches.get(key, 0)
+                ords = production_step_ordinals(launch, dispatch_index=dispatch_index)
+                arguments = [stacked[_alloc_name_of(name, overrides)] for name in tensor_names]
+                arguments.extend(ords[name] for name in scalar_names)
+                handle = runtime.submit(programs[key], *arguments, config=config)
+                pending.append((handle, key, dispatch_index))
+                if key in next_dispatches:
+                    next_dispatches[key] = dispatch_index + 1
+                if VERIFY_X_H_C and launch != ("head",):
+                    while pending:
+                        complete_oldest()
+                    written = overrides.get(
+                        "out_x_hc_out", overrides.get("out_x_hc_mid", overrides.get("x_hc"))
+                    )
+                    step_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
+                    runtime.copy_stacked_from(stacked[written], step_rows)
+                    finite_step = bool(torch.isfinite(step_rows.to(torch.float32)).all())
+                    print(
+                        "GLM_XHC_STEP", _step_key(launch), written, "finite=", finite_step,
+                        "absmax=", float(step_rows.to(torch.float32).abs().max()), flush=True,
+                    )
+                    if not finite_step:
+                        guard_events.append(f"nonfinite {written} after {_step_key(launch)}")
+                        raise FloatingPointError(f"nonfinite {written} after {_step_key(launch)}")
+            while pending:
+                complete_oldest()
+            if self.lm_head_backend == "npu":
+                runtime.run(
+                    self._lm_head_program, stacked["head_hidden"], self._device_final_norm,
+                    self._device_lm_head, self._device_logits, config=config,
+                )
+                runtime.copy_stacked_from(self._device_logits, self._host_logits_shards)
+            runtime.copy_stacked_from(stacked["head_hidden"], head_rows)
+        except BaseException as error:
+            self._dispatch_error = error
+            for handle, _, _ in pending:
+                try:
+                    handle.result()
+                except BaseException:
+                    pass
+            raise
+        if VERIFY_X_H_C:
+            print(
+                "GLM_HEAD_HIDDEN finite=", bool(torch.isfinite(head_rows).all()),
+                "absmax=", float(head_rows.to(torch.float32).abs().max()), flush=True,
+            )
+        if not bool(torch.isfinite(head_rows).all()):
+            guard_events.append(f"nonfinite head_hidden at step {step}")
+            raise FloatingPointError(f"nonfinite head_hidden at step {step}")
+        if VERIFY_X_H_C:
+            # The head's x_hc binding IS the last FFN launch's out_x_hc_out
+            # (the ping-pong returns the stream to its entry side), so this
+            # readback is the direct out_x_hc_out finiteness evidence.
+            stream_name = bindings[("head",)]["x_hc"]
+            stream_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
+            runtime.copy_stacked_from(stacked[stream_name], stream_rows)
+            finite_stream = bool(torch.isfinite(stream_rows.to(torch.float32)).all())
+            print(
+                "GLM_XHC_STREAM", stream_name, "finite=", finite_stream,
+                "absmax=", float(stream_rows.to(torch.float32).abs().max()), flush=True,
+            )
+            if not finite_stream:
+                guard_events.append(f"nonfinite {stream_name} at step {step}")
+                raise FloatingPointError(f"nonfinite {stream_name} at step {step}")
+        if self.lm_head_backend == "npu":
+            shards = (shard[:, :LOCAL_VOCAB] for shard in self._host_logits_shards.unbind(dim=0))
+            logits = torch.cat(tuple(shards), dim=1)
+        else:
+            # All ranks hold the same restored stream; rank 0's rows are the answer.
+            logits = host_lm_head_logits(head_rows[0, :BATCH], final_norm_w, lm_head)
+        if not bool(torch.isfinite(logits[:BATCH]).all()):
+            guard_events.append(f"nonfinite logits at step {step}")
+            raise FloatingPointError(f"nonfinite last-token logits at step {step}")
+        self.calls += 1
+        return logits[:BATCH]
+
+
 def generate(
     checkpoint: Checkpoint,
     programs: dict,
@@ -2519,50 +3331,16 @@ def generate(
     expect_tokens: dict[int, list[int]] | None = None,
     dump_path: Path | None = None,
 ):
-    """Generate with the resident checkpoint over one packed batch on 16 ranks.
+    """Generate tokens with the shared resident full-prefix forward session.
 
-    One full forward = the launch plan dispatched back to back on one shared
-    multi-program L3 worker (``runtime.run``; the ``rt(*args)`` shortcut is
-    single-program only). ``programs`` must be keyed by the six consolidated
-    names (:data:`RT_PROGRAMS`): every step dispatches its kind's ONE program
-    with the layer as trailing INT32 ordinal scalars (host arithmetic, the
-    graph carries none). Step arguments resolve via
-    :func:`production_step_bindings` + :func:`_alloc_name_of`: the carried
-    stream ping-pongs over ``ws_x_hc_a``/``ws_x_hc_b`` (seed writes ``a``,
-    attention moves to the far side, the FFN writes back, the head collapses
-    the final side), every other ``out_*`` answers its ``ws_*`` workspace,
-    ``head_hidden`` is the output alloc. Each forward gets fresh, zeroed
-    caches (full-prefix recompute, the v4.1 pattern) while weights, boundary
-    workspaces and the worker's windows survive across dispatches (windows
-    restored to zero before reuse: every single-call collective at epoch 1,
-    the dense whole-layer's shared tp pair at 1 then 2). The LM head and the
-    embedding gather stay on the host. ``platform`` picks the backend
-    (``a2a3`` in deployment, ``a2a3sim`` for plan-driven proof runs).
+    Report legacy ``seconds`` from runtime preparation and step ``seconds`` from
+    dispatch, plus separate checkpoint/input setup and end-to-end wall times.
     """
+    end_to_end_start = time.monotonic()
     from tokenizers import Tokenizer
 
-    plan = production_launch_plan()
-    if set(programs) != set(RT_PROGRAMS):
-        raise ValueError(
-            f"programs must cover exactly the consolidated set {list(RT_PROGRAMS)} "
-            f"(got {sorted(programs)})"
-        )
-    # Signature names come from the entries, never from the compiled artifacts:
-    # the persisted param metadata carries post-SSA spellings (x_hc__ssa_v0).
-    # Every step dispatches its consolidated program by kind, with the layer
-    # riding the dispatch as trailing ordinal scalars.
-    arity = {program: _l3_arg_arity(production_program_entry(program))
-             for program in RT_PROGRAMS}
-    step_program = {step: production_program_of_step(step) for step in plan}
-    # Reject a different rank/capacity compile before loading any payload: the
-    # seed entry leads with embedding_rows [RANKS, CAPACITY, D].
-    seed_params = programs["seed"]._get_metadata()[0]
-    if list(seed_params[0].shape) != [RANKS, CAPACITY, D]:
-        raise ValueError(
-            "--runtime-dir must contain glm prefill compiled for TP16/EP16 with the same capacity"
-        )
-    if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != BATCH:
-        raise ValueError(f"prefill needs {RANKS} distinct devices and exactly {BATCH} prompts")
+    if len(prompts) != BATCH:
+        raise ValueError(f"provide exactly {BATCH} prompts")
 
     tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
     tokenizer_config_path = checkpoint.root / "tokenizer_config.json"
@@ -2596,187 +3374,32 @@ def generate(
             f"exceeds the compiled capacity {CAPACITY}; compile a larger capacity"
         )
 
-    weights = ResidentPrefillWeights.load(
-        checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model()
-    )
-    final_norm_w = _load_final_norm(checkpoint)
-    lm_head = weights.lm_head()
-    config = RunConfig(
-        platform=platform, ring_heap=2 * 1024**3,
-        distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-    )
-
     generated: list[list[int]] = [[] for _ in prompts]
     finished = [False] * BATCH
     step_log: list[dict] = []
-    guard_events: list[str] = []
-    print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
-    start = time.monotonic()
-    # One shared multi-program L3 worker serves every launch-plan step,
-    # prepared with the SIX consolidated programs (seed + the 5 per-kind
-    # entries). Persistent windows are restored to zero before each reuse, so
-    # each dispatch's collectives run at their fresh-window first-call epochs
-    # (every single-call collective at 1; the dense whole-layer's shared tp
-    # pair at 1 then 2).
-    primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
-    with primary.prepare(config, extra_compiled=extras, persistent=True) as runtime:
-        per_rank = [{} for _ in device_ids]
-        for rank in range(RANKS):
-            tensors = per_rank[rank]
-            inputs = prepare_step_inputs(weights, sequences)
-            for name in GLM_TENSORS:
-                stack = _PARAM_TO_STACK.get(name)
-                if stack is not None:
-                    shape, dtype = weights.tensor_layouts[stack]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                elif name in OUTPUTS:
-                    shape, dtype = OUTPUTS[name]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                elif name in WORKSPACES:
-                    shape, dtype = WORKSPACES[name]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                else:
-                    value = inputs[name]
-                    tensors[name] = runtime.alloc_tensor(
-                        value.shape, value.dtype, init=value, worker_id=rank
-                    )
-            # Stacks the graph ABI does not carry (final norm, MTP extras) still need
-            # allocation because weights.upload stages every resident stack.
-            for stack, (shape, dtype) in weights.tensor_layouts.items():
-                if stack not in _STACK_TO_PARAM and stack not in tensors:
-                    tensors[stack] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-
-        def upload(rank):
-            handles = {
-                stack: per_rank[rank][_STACK_TO_PARAM.get(stack, stack)]
-                for stack in weights.tensor_layouts
-            }
-            weights.upload(runtime, rank, handles)
-            print("GLM_RANK_WEIGHTS_READY", rank, flush=True)
-
-        with ThreadPoolExecutor(max_workers=RANKS) as executor:
-            list(executor.map(upload, range(RANKS)))
-        stacked = {
-            name: StackedDeviceTensor(
-                [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
-            )
-            for name in GLM_TENSORS
-        }
-        # Per-step parameter -> buffer binding (design S2.1 ping-pong): every
-        # launch's signature names must resolve to exactly one allocated tensor
-        # before any dispatch happens, so a plan/ABI drift fails loudly here
-        # instead of as an opaque dispatch-time shape error.
-        bindings = production_step_bindings(plan)
-        for step in plan:
-            tensor_names, _ = arity[step_program[step]]
-            unbound = [
-                name for name in tensor_names
-                if _alloc_name_of(name, bindings[step]) not in stacked
-            ]
-            if unbound:
-                raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
-        head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
+    with ResidentPrefillSession(checkpoint, programs, device_ids, platform=platform) as session:
+        start = session.runtime_started_at
         for step in range(max_new_tokens):
-            if step:
-                for rank in range(RANKS):
-                    tensors = per_rank[rank]
-                    inputs = prepare_step_inputs(weights, sequences)
-                    for name, value in inputs.items():
-                        if name in CONSTANT_STEP_INPUTS or name in _PARAM_TO_STACK:
-                            continue
-                        runtime.copy_to(
-                            tensors[name].data_ptr, value.data_ptr(),
-                            value.numel() * value.element_size(), worker_id=rank,
-                        )
             tick = time.monotonic()
-            print("GLM_DEVICE_START", step, flush=True)
-            # The plan-driven loop: every launch dispatches on the ONE shared
-            # multi-program worker via runtime.run (rt(*args) is single-program
-            # only), each with its signature names resolved by the ping-pong
-            # binding -- x_hc/x_hc_mid and out_x_hc_mid/out_x_hc_out alternate
-            # over ws_x_hc_a/ws_x_hc_b, out_* lands in the ws_* workspaces.
-            # The step's ordinal scalars ride the dispatch as trailing INT32s
-            # the runner forwards as-is.
-            for launch in plan:
-                overrides = bindings[launch]
-                key = step_program[launch]
-                tensor_names, scalar_names = arity[key]
-                if TRACE_DISPATCH:
-                    label = f"{_step_key(launch)} {key}"
-                    print("GLM_DISPATCH", label, flush=True)
-                if scalar_names:
-                    ords = production_step_ordinals(launch)
-                    runtime.run(
-                        programs[key],
-                        *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
-                        *[ords[name] for name in scalar_names],
-                        config=config,
-                    )
-                else:
-                    runtime.run(
-                        programs[key],
-                        *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
-                        config=config,
-                    )
-                if VERIFY_X_H_C and launch != ("head",):
-                    # The stream buffer this launch wrote (seed: its x_hc Out;
-                    # whole-layer/FFN: out_x_hc_out; attention half: out_x_hc_mid)
-                    # -- per-step finiteness evidence up to any later stop point.
-                    written = overrides.get(
-                        "out_x_hc_out", overrides.get("out_x_hc_mid", overrides.get("x_hc"))
-                    )
-                    step_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-                    runtime.copy_stacked_from(stacked[written], step_rows)
-                    finite_step = bool(torch.isfinite(step_rows.to(torch.float32)).all())
-                    print(
-                        "GLM_XHC_STEP", _step_key(launch), written, "finite=", finite_step,
-                        "absmax=", float(step_rows.to(torch.float32).abs().max()), flush=True,
-                    )
-                    if not finite_step:
-                        guard_events.append(f"nonfinite {written} after {_step_key(launch)}")
-                        raise FloatingPointError(f"nonfinite {written} after {_step_key(launch)}")
-            runtime.copy_stacked_from(stacked["head_hidden"], head_rows)
-            if VERIFY_X_H_C:
-                print(
-                    "GLM_HEAD_HIDDEN finite=", bool(torch.isfinite(head_rows).all()),
-                    "absmax=", float(head_rows.to(torch.float32).abs().max()), flush=True,
-                )
-            if not bool(torch.isfinite(head_rows).all()):
-                guard_events.append(f"nonfinite head_hidden at step {step}")
-                raise FloatingPointError(f"nonfinite head_hidden at step {step}")
-            if VERIFY_X_H_C:
-                # The head's x_hc binding IS the last FFN launch's out_x_hc_out
-                # (the ping-pong returns the stream to its entry side), so this
-                # readback is the direct out_x_hc_out finiteness evidence.
-                stream_name = bindings[("head",)]["x_hc"]
-                stream_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-                runtime.copy_stacked_from(stacked[stream_name], stream_rows)
-                finite_stream = bool(torch.isfinite(stream_rows.to(torch.float32)).all())
-                print(
-                    "GLM_XHC_STREAM", stream_name, "finite=", finite_stream,
-                    "absmax=", float(stream_rows.to(torch.float32).abs().max()), flush=True,
-                )
-                if not finite_stream:
-                    guard_events.append(f"nonfinite {stream_name} at step {step}")
-                    raise FloatingPointError(f"nonfinite {stream_name} at step {step}")
-            # All ranks hold the same restored stream; rank 0's rows are the answer.
-            logits = host_lm_head_logits(head_rows[0], final_norm_w, lm_head)
-            if not bool(torch.isfinite(logits[:BATCH]).all()):
-                guard_events.append(f"nonfinite logits at step {step}")
-                raise FloatingPointError(f"nonfinite last-token logits at step {step}")
+            logits = session.forward(sequences)
             next_ids = logits[:BATCH].argmax(dim=-1).tolist()
             for request, token in enumerate(next_ids):
                 if not finished[request]:
                     generated[request].append(int(token))
                     sequences[request].append(int(token))
                     finished[request] = int(token) in eos_ids
+            step_end = time.monotonic()
             step_log.append({
-                "step": step, "seconds": time.monotonic() - tick, "token_ids": next_ids,
+                "step": step, "seconds": step_end - session.last_dispatch_started_at,
+                "input_setup_seconds": session.last_dispatch_started_at - tick,
+                "end_to_end_seconds": step_end - tick, "token_ids": next_ids,
                 "text": [tokenizer.decode(tokens, skip_special_tokens=False) for tokens in generated],
             })
             print("GLM_GENERATION_STEP", json.dumps(step_log[-1], ensure_ascii=False), flush=True)
             if all(finished):
                 break
+        resident_bytes_per_rank = session.weights.bytes_per_rank
+        guard_events = session.guard_events
 
     if dump_path is not None:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2799,9 +3422,11 @@ def generate(
         "capacity": CAPACITY, "full_prefix_recomputation": True,
         "layers_per_forward": NUM_LAYERS,
         "launch_mode": "rt",
-        "device_launches_per_rank_per_forward": len(plan),
-        "resident_bytes_per_rank": weights.bytes_per_rank,
+        "device_launches_per_rank_per_forward": len(session.plan),
+        "resident_bytes_per_rank": resident_bytes_per_rank,
         "seconds": time.monotonic() - start, "steps": step_log, "guard_events": guard_events,
+        "checkpoint_setup_seconds": session.checkpoint_setup_seconds,
+        "end_to_end_seconds": time.monotonic() - end_to_end_start,
         "cases": [
             {
                 "prompt": prompt,
@@ -2860,9 +3485,10 @@ def main(argv=None):
         "--devices", default=os.environ.get("TASK_DEVICE"),
         help=argparse.SUPPRESS,  # generate() device list, kept for the production CLI
     )
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[16, 2])
-    parser.add_argument("--ep", type=int, default=RANKS, choices=[16, 2])
+    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[16, 8, 2])
+    parser.add_argument("--ep", type=int, default=RANKS, choices=[16, 8, 2])
     parser.add_argument("--capacity", type=int, default=CAPACITY)
+    parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
     parser.add_argument("--prompt", action="append", help=f"one prompt of the packed batch; provide exactly {BATCH}")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--report", type=Path)
@@ -2887,6 +3513,8 @@ def main(argv=None):
         raise ValueError(
             f"--capacity must match compilation ({CAPACITY}); recompile to change it"
         )
+    if options.max_seq_len != MAX_SEQ_LEN:
+        raise ValueError(f"--max-seq-len must match compilation ({MAX_SEQ_LEN})")
     if (options.tp, options.ep) != (C.TP_SIZE, RANKS):
         raise ValueError(f"parallel sizes must match compilation: TP{C.TP_SIZE}/EP{RANKS}")
     if options.runtime_dir is None:

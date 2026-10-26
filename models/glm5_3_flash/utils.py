@@ -22,7 +22,7 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
     weights. This fixture does not execute the preceding Transformer layers.
     """
     from golden import ScalarSpec, TensorSpec
-    from models.glm5_3_flash.weights import Checkpoint
+    from models.glm5_3_flash.weights import Checkpoint, pack_int8_nz
 
     if num_ranks != EP_SIZE:
         raise ValueError(f"checkpoint fixture requires the compiled EP size {EP_SIZE}, got {num_ranks}")
@@ -81,6 +81,9 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
                 weights[name] = torch.empty((num_ranks, *shape), dtype=dtype)
             weights[name][rank].copy_(value)
         del local, value
+
+    for name in ("shared_w_gate_up", "shared_w_down"):
+        weights[name] = pack_int8_nz(weights[name])
 
     specs = [TensorSpec("x_mixed", list(x_mixed.shape), x_mixed.dtype, init_value=x_mixed)]
     specs += [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in weights.items()]

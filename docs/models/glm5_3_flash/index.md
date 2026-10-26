@@ -3,8 +3,8 @@
 `models/glm5_3_flash/` contains the implementation of
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
 `Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
-kernels, Torch goldens, W8A8 checkpoint staging, and composed MoE FFN entries.
-Complete prefill/decode forward composition is a separate integration step.
+kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
+and resident prefill and incremental decode forwards.
 
 ## Why W8A8, and why a2a3 forces it
 
@@ -94,22 +94,246 @@ scratch. Its live row count is `POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE`.
 
 ## Deployment target
 
-One Atlas 800 A3 node, 16 dies, TP16 with expert parallelism over the same 16
-ranks, mirroring vLLM Ascend's recipe for this checkpoint
-(`--tensor-parallel-size 16 --enable-expert-parallel --quantization ascend`,
-MTP with 3 speculative tokens, `FULL_DECODE_ONLY` graph capture). Smaller TP/EP
-shapes stay available for bring-up through `--tp` and `--ep`.
+The resident production forward supports TP8/EP8/DP1 on eight logical NPU
+devices and TP16/EP16/DP1 on sixteen logical devices. TP and EP overlap on the
+same device group. A dual-chip A3 board exposes two logical devices. The
+checkpoint's vLLM Ascend recipe uses sixteen ranks; smaller component-only
+bring-up shapes remain available through `--tp` and `--ep`.
 
-Per rank that gives 4 MLA heads, 4 KDA heads, 18 routed experts and 9,680
-vocabulary rows. The **indexer is replicated, not head-sharded**: its score sums
+| Per-device geometry | TP8 / EP8 | TP16 / EP16 |
+|---|---:|---:|
+| MLA heads / KDA heads | 8 / 8 | 4 / 4 |
+| Dense intermediate width | 1,536 | 768 |
+| Routed experts | 36 | 18 |
+| Resident weight plan | 39.42 GiB | 20.54 GiB |
+| MoE padded owner rows at packed capacity 576 | 80 | 48 |
+
+The packed batch has 16 stable request slots for either device count. Each MoE source
+owns interleaved token rows, padded to `ceil(capacity / (TP * 16)) * 16` rows.
+Shared experts remain complete and replicated. KDA projection tasks cover at
+most 512 channels, and KDA output normalization tasks cover at most 64 head
+rows, so the wider TP8 shapes fit the local buffers. Use separate compilation
+directories and processes for each topology; dimensions freeze at import time.
+
+The **indexer is replicated, not head-sharded**: its score sums
 over all 32 heads before the top-k, so sharding would force a cross-rank reduction
 of partial scores on every sparse layer, and the kernel is small enough that 16-way
-redundant compute is the cheaper trade. Weights come to about 21.6 GB per rank, of
-which 19.5 GB is the routed experts; the remaining budget on a 64 GiB die
-(~61.3 GiB visible) goes to the hybrid cache, which is the binding constraint and
-is sized by the cache-manager work item.
+redundant compute is the cheaper trade. Weight plans exclude caches, activations,
+communication buffers, and upload temporaries. TP8/EP8 has been exercised with
+the published W8A8 checkpoint at packed capacity 576 on eight 64-GiB A3 devices;
+larger capacities require their own memory and numerical validation.
+
+### Chunked prefill and incremental requests
+
+`ResidentPrefillSession.forward_chunks()` consumes only the new tokens for each
+participating request. Callers pass stable request slots and their committed
+prefix lengths; returned logits follow the caller's request order. MLA latent
+cache, raw/pooled Indexer cache, KDA convolution state and KDA recurrent state
+remain resident between chunks. `reset_requests()` clears only the selected
+slots before release or reuse. Empty request segments retain unique KDA state
+rows and do not participate in sampling. Prefix sharing is opt-in in Serving.
+If a dispatch or partial cache reset fails, the affected slots require a
+successful reset before another chunk can use them. Host sequence lengths
+commit only after a successful forward.
+
+`ResidentPrefillSession(..., prefix_snapshot_entries=2)` enables two immutable
+device snapshot banks; the default 0 allocates none. `capture_prefix(slot,
+(bank, generation, length))` copies all six request-cache families after an
+aligned prompt boundary completes. `restore_prefix()` copies a confirmed
+descriptor into a reset slot and publishes its committed length only after
+successful completion. Generations must increase on capture; stale or
+unaligned descriptors are rejected. A copy failure poisons the Session and
+requires close/reopen. Serving owns snapshot admission, in-flight leases,
+worker acknowledgement and eviction.
+
+The two banks retain 57.625 MiB per rank at TP8/context 512 or about 40.03 MiB
+at TP16/context 512, without reducing the sixteen live slots. The constructor
+checks the full payload against `prefix_snapshot_max_bytes` before allocation
+(default 128 MiB per rank); runtime overhead is additional. Larger contexts
+need an explicit budget and their own memory/numerical validation. Snapshot
+copies use an auxiliary typed program registered before worker preparation;
+the six production programs and layout manifest version 3 remain unchanged.
+
+The resident session defaults to NPU final RMSNorm and full-vocabulary
+projection for its 16 returned rows. BF16 hidden rows and final norm weights
+are widened to FP32; normalized activations, projection weights and logits
+remain FP32. Each rank owns a vocabulary shard, padded with zero weights to a
+multiple of 64 rows: 19,392 rows at TP8 and 9,728 at TP16. The additional device weight is
+317,718,528 bytes (303 MiB) per rank at TP8 or 159,383,552 bytes (152 MiB) at
+TP16, excluding workspace and runtime overhead. The host strips each shard's
+padding before concatenating the complete logits in vocabulary order.
+
+`ResidentPrefillSession(..., lm_head_backend="cpu")` or
+`GLM53_LM_HEAD_BACKEND=cpu` selects the CPU reference. That backend retains
+the complete widened FP32 head, adding 2,537,553,920 bytes (about 2.36 GiB) of
+host RAM alongside the loader's BF16 table. Embedding lookup remains on the
+CPU. Both head backends retain the full 32-row readback and finiteness checks
+on every rank. The selected backend and device weight allocation are logged
+as `GLM_LM_HEAD_BACKEND` and `GLM_DEVICE_LM_HEAD_BYTES_PER_RANK`.
+
+An optional `ResidentPrefillSession(..., host_num_threads=16)` sets the
+dedicated owner process's PyTorch CPU thread count after all weight uploads
+complete. Startup and rank workers retain their initial setting. Close and
+entry-error cleanup restore the previous owner count. The default `None`
+preserves the existing setting. The process-wide option assumes one exclusive
+owner session; it does not configure device AICPU threads.
+
+Under the frozen TP8/EP8 A3 workload (128 input tokens, eight output tokens,
+32-token chunks, one warmup and three timed groups), selecting sixteen owner
+threads raises concurrency 1/2/4 throughput from 0.953/1.890/3.699 to
+1.054/2.094/4.081 tokens/s. Startup stays at four threads and is excluded.
+All 25 saved request outputs remain bitwise identical.
+
+The query `--capacity` and per-request `--max-seq-len` are independent compiled
+dimensions. Query capacity bounds the sum of new chunk tokens; context capacity
+sizes private per-request cache segments. Indexer pool-close events include
+only newly completed pools and may read members written by earlier chunks.
+Saved artifacts include both dimensions and must be recompiled when either
+changes. The `forward()` and `generate()` full-prefix interfaces remain available
+for independent offline batches.
+
+The standalone `generate()` report preserves its timing boundaries: total
+`seconds` starts at runtime preparation, after CPU checkpoint setup; each
+step's `seconds` starts after input preparation and H2D copies. Separate
+`checkpoint_setup_seconds`, step `input_setup_seconds`, and total/step
+`end_to_end_seconds` retain the excluded setup costs. These are host wall times,
+including dispatch, completion waits and output processing, rather than
+device-only kernel times.
+
+Serving accepts 1–16 active requests and uses the common scheduler to split
+prefill into chunks, sample completed prompts, batch incremental decode and
+release finished/cancelled requests. Configure the new-token budget with
+`--max-num-batched-tokens`, the per-request context with `--max-model-len`, and
+the prompt chunk limit with `--long-prefill-token-threshold`. Serving keeps
+nonterminal prompt chunks aligned to the KDA recurrence's 16-token boundary,
+deferring unfinished work when the remaining budget is too small. The final
+prompt tail can have any length, and decode still appends one token. Direct
+low-level callers can choose other partitions, but these change the existing
+BF16 KDA rounding boundaries; numerical comparisons must use the same
+partitions in the kernel and reference paths.
+Convolution bulk rows, request-head rows and decode use the same sequential
+four-tap FP32 accumulation before SiLU and BF16 conversion. Reassociating the
+request-head sum can cross a BF16 midpoint at a new chunk boundary and amplify
+through later quantized layers. Aligned internal KDA chunks therefore also
+require strict agreement with the whole-prefix execution.
+
+Indexer scoring uses the same per-query implementation in prefill and decode.
+The previous four-query scorer could produce zero valid scores on repeated A3
+runs with fixed inputs and private pool segments. The per-query path preserves
+the original score formula, quantization, TopK ordering and owning numerical
+checks; changing attention index order would not correct those score values.
+
+### Serving optimization sequence
+
+Fixed physical request-slot maps (`block_table`, `kda_state_rows` and
+`pool_blocks`) are uploaded once per session, alongside the KDA constants.
+Dynamic step uploads drop from 17 to 14 per rank; metadata values, kernels
+and request-cache ownership are unchanged. A future physical page allocator
+must revisit this fixed-map contract.
+
+Measure one persistent Serving engine with the published checkpoint, fixed
+prompt/output lengths, explicit chunk boundaries and prefix sharing disabled.
+Report startup separately from warm TTFT, inter-token latency and total output
+tokens per second. Host dispatch spans include runtime and synchronization
+overhead and must not be presented as device-only kernel times.
+
+The resident session clears selected request caches with one distributed
+device operation. It preserves unselected slots byte for byte; resetting all
+sixteen slots also clears unused physical KDA rows and pooled Indexer scratch.
+Lengths commit only after the clear completes, and failed clears leave the
+touched slots invalid until a successful reset.
+
+On TP8/EP8 A3, query capacity 128 and context capacity 512, alternating the
+device reset and the frozen host-copy implementation on the same allocations
+gave the following synchronous API medians (three warmups, ten timed rounds):
+
+| Reset scope | Host copies (ms) | Device clear (ms) |
+|---|---:|---:|
+| First slot | 923.099 | 1.853 |
+| Last slot | 929.052 | 1.360 |
+| Two sparse slots | 1850.579 | 1.394 |
+| All slots and physical padding | 6767.180 | 2.041 |
+
+These timings include host dispatch and completion waiting. Exact-byte NPU
+checks cover all six cache families at TP8 and TP16, including unselected
+NaN/Inf payloads, repeated resets and full physical clearing. The TP8 full-model
+chunk/reorder/decode/reuse matrix also retains bitwise-identical logits.
+
+Communication windows persist independently of request caches. Each resident
+program keeps its own invocation count across layers, forwards and slot resets.
+Dense layers use TP epochs `2*n+1` and `2*n+2`; attention halves use `n+1`;
+MoE FFN halves use `n+1` for both MoE exchange and TP token restoration.
+Host submissions retain at most two pending handles through the public
+`DistributedWorker.submit()` API. Native FIFO execution orders the programs,
+and existing reader fences remain active. Collective counters commit only
+after successful completion; all pending handles drain before the vocabulary
+head and output readback. Errors drain returned handles and invalidate the session.
+This removes repeated whole-window zero restoration.
+It does not change expert sharding or add TP slices to shared experts.
+
+A failed dispatch invalidates the communication state for the whole session.
+Close and reopen the runtime before further forwards or request resets.
+Old scalar ABIs and exhausted INT32 notification counters are rejected.
+Two-pass chip-swimlane replay is also rejected for these stateful sessions.
+Real-weight TP8 and TP16 chunk/decode/reuse checks pass; the TP8 disposal probe
+additionally completes one MoE dispatch, injects a host failure before epoch
+publication, and verifies that all later state operations stop before native
+API calls.
+
+The earlier retained FP32 CPU LM-head weight preserved all 25 saved request outputs
+bitwise. Under the frozen TP8/EP8 A3 Serving workload (128 input tokens, eight
+output tokens, 32-token chunks, concurrency 1/2/4, one warmup and three timed
+groups), output throughput rises from 0.843/1.681/3.292 to
+0.909/1.803/3.489 tokens/s versus the preceding output-budget step. Startup is
+excluded. A separate full-FP32 NPU head trial failed nine of 4,956,160 values
+at the unchanged all-point `rtol=atol=1e-5` gate and was rejected.
+
+The new opt38 head performs final normalization on the NPU and uses complete,
+padded vocabulary tiles. Its TP8 and TP16 real-weight component checks pass all
+2,478,080 values (16 rows by 154,880 logits) at the unchanged all-point
+`rtol=atol=1e-5` CPU gate, with identical top-1 IDs. Native full-network and
+Serving measurements are complete. Native hidden rows match the CPU path;
+token histories and top-1 IDs match in both measurements.
+The native comparison has 3 of 4,956,160 values outside the existing CPU gate;
+Serving has 11 of 12,390,400. Independent FP64 diagnostics pass all native
+values at the same numeric limits. Acceptance remains pending a reference
+decision; the CPU gate has not been relaxed and opt38 is not recorded as accepted.
+
+The following groups describe reference mechanisms. Current execution order,
+completed trials and per-item measurements are maintained in PyPTO Serving's
+single report, `docs/models/glm53-optimization.md`.
+
+| Group | GLM work | DeepSeek reference | Acceptance |
+|---|---|---|---|
+| 1 | Sweep chunk sizes 32/64/128, bound async tail dispatch, batch request-cache clearing, remove obsolete query headroom, and compute only active CPU head rows with a retained FP32 head. | Serving DSpark `e114182`, `a816a74`; V4 `eec9235` | Retain the frozen baseline; preserve token IDs, request reuse, chunk alignment and budget limits; measure both client latency and throughput. |
+| 2 | Profile and optimize the 42 MoE FFN transactions: separate device work from communication/window-reset/runtime costs, then specialize W8A8 tiles and active-row work. GLM already uses direct expert slabs and reverse-window combination. | V4 `e3673ca`; V4.1 `eeda7fb` | Keep original operator gates, complete shared experts and EP8/16; accept changes only when whole-step wall time improves. |
+| 3 | Fuse attention and FFN submissions to target 89 to 47 launches first, reuse scratch/metadata slots, and retire collective signals before reducing window resets. | V4.1 `3652e16`, `de44572`; Serving DSpark `a816a74`, `9db614a` | Validate one fused layer before the full backbone; preserve reader-consumed fences and request-cache lifecycle at TP8/16. |
+| 4 | Complete acceptance of the new FP32 device vocabulary head, then integrate device embedding. Keep complete logits for general sampling; use compact candidates only for supported greedy execution. | V4.1 `3627f8f`; Serving DSpark `bc8a830` | Opt38 component, native and Serving measurements are complete; acceptance awaits the reference decision with existing CPU-gate differences retained. Device embedding is not integrated. |
+| 5 | Pack streamed weights in dtype-correct NZ, evaluate single-use weight cache bypass and reuse attention operands. | V4 `3ff92eb`; V4.1 `a47e652` | Benchmark layout/cache policy separately, retain INT8/BF16 formats and require end-to-end wall-time improvement. |
+| 6 | Revisit grouped Indexer scoring after its defect is isolated, extend context/concurrency coverage, and evaluate compiler/runtime upgrades as a separate pinned stack. | PyPTO/simpler optimization history; existing DeepSeek whole-forward compositions | Run the frozen scorer repro, operator gates and chunk/reorder/reuse matrix before comparing service performance. |
+
+These references supply mechanisms, not projected GLM speedups. In particular,
+`3ff92eb` reports an A3 DeepSeek decode result, while V4.1 `eeda7fb` and
+`a47e652` report A5 component results. Their percentages do not establish a GLM
+gain. GLM currently keeps weights and six programs resident and ping-pongs the
+hidden stream, so those existing features are baseline behavior. A whole
+45-layer L2 fusion previously exceeded this compiler's dimension-proof limits;
+the submission work starts with bounded combinations. Cross-request prefix
+sharing uses the opt-in snapshot contract described above.
+
+The pinned PyPTO revision `6a7c862` also rejects bounded attention-plus-MoE
+compositions with Error104 dimension-equality checks in KDA recurrence and
+sparse attention. Single-attention controls compile. Both a combined L2 entry
+and a paired-L2 L3 entry reproduce the failure, so the 89-to-47 submission
+target requires compiler support before it can be measured.
 
 ### MoE expert parallelism
+
+The resident forward skips the complete shared expert on ranks with no
+locally owned source tokens. Such ranks still receive and compute routed
+experts for peers and participate in EP exchange and TP token restoration.
+The local add and scatter publish zeros without reading inactive shared
+scratch. This preserves active-row arithmetic and complete shared weights.
 
 `decode_layer.py` and `prefill_layer.py` process each rank's local token rows.
 Routed experts are distributed by expert ID across EP ranks; every local expert
@@ -147,7 +371,7 @@ IDs and replicates each row into the four BF16 mHC streams. IDs outside that
 shard contribute exact zeros. The caller sums these contributions within its TP
 group before entering the backbone.
 
-`lm_head.py` selects the hidden rows requested by `row_indices`, applies the
+The `lm_head` greedy operator selects the hidden rows requested by `row_indices`, applies the
 loaded final RMSNorm, rounds the normalized inputs to BF16, and projects against
 one BF16 vocabulary shard with FP32 accumulation. It returns each selected row's
 maximum score and **shard-local** token index; ties choose the lowest index.
@@ -159,6 +383,15 @@ the global maximum within its TP group, breaking ties by the lowest global ID.
 These local operators do not perform TP communication. The LM-head Torch golden
 returns the full local FP32 logits; its executable adapter selects the requested
 rows and compares the maximum and local index.
+
+The separate `lm_head_logits` operator accepts BF16 hidden rows and final norm
+weights, performs FP32 RMSNorm without an intermediate BF16 cast, and projects
+against one FP32 vocabulary shard. Its FP32 output includes padding to a
+multiple of 64 vocabulary rows. The caller removes that padding and concatenates
+TP shards to obtain complete logits for general sampling. The thin
+`lm_head_logits_test` entry and `golden_lm_head_logits` reference use this
+full-logits contract; the original greedy operator and its BF16 normalization
+boundary remain unchanged.
 
 `lm_head_tp_reduce` combines the local LM-head candidates through TP windows. It
 adds each rank's vocabulary offset, selects the maximum score and resolves ties
@@ -207,6 +440,9 @@ stored dtype agree.
 | Indexer state cache | FP32 today, 256 wide per token; the sibling port quantizes its indexer cache to INT8 with a per-row FP32 scale, which would save about 2.3 KB per token here |
 | Hyper-connection stream | BF16 — see above, this is where GLM departs from DeepSeek-V4's FP32 stream |
 | Logits | FP32 |
+
+The checkpoint LM-head table remains BF16. The resident NPU head stages each
+vocabulary shard as exactly widened FP32 values with zero-padded rows.
 
 The loader requires `W8A8_DYNAMIC` with `group_size: 0`. For every requested
 quantized weight it checks INT8 storage, positive finite scales, and zero offsets.
@@ -259,6 +495,23 @@ replicated. Dense FFNs are TP-sharded along their intermediate dimension.
 Routed experts are EP-sharded by expert ID, and shared experts remain complete
 on every EP rank. Attention follows the existing head partition; the indexer
 remains replicated. Prefill and decode can reuse the same staged weights.
+
+Shared-expert INT8 gate/up and down matrices are packed into NZ order once
+per layer at resident upload. The fused gate/up matrix is packed after fusion;
+INT8 uses 16-row blocks and 32-element C0 lines. Checkpoint-reader tensors remain
+logical ND, and shared FP32 scales, routed expert weights and Dense weights remain
+ND. The 43 stored MoE slices include the reserved MTP tail; the backbone executes
+42 MoE layers. Standalone/default/checkpoint FFN fixtures pack the same shared
+inputs, and their goldens only undo the layout before the existing reference math.
+Runtime manifest version 3 records the shared INT8 NZ contract; recompile older
+runtime directories before using these uploaded weights.
+
+On A3, frozen shared-expert cases with 16 and 17 rows retained bitwise-identical
+FP32 outputs. With five warmups and 100 timed rounds, median effective device
+latency changed from 67.60 to 59.27 us and 78.16 to 65.35 us, respectively.
+Separate real-weight TP8 and TP16 resident regressions retained all 25 and 29
+saved output vectors bitwise. These layout comparisons preserve the reference
+math and acceptance thresholds.
 
 The existing FFN validation entries keep generated weights as their default.
 Add `--checkpoint` to load real weights into the same kernels, goldens and
@@ -365,6 +618,10 @@ Each of these was a compile or simulator failure, not a guess:
   `from golden import run` resolves to this directory's own `golden.py`.
 
 ## How this directory is organised for parallel work
+
+The remaining planning sections preserve the original implementation roadmap
+and donor inventory. The deployment, loading and serving sections above
+describe the current execution interfaces.
 
 Every operator has one ownership file. Each file carries the exact maths in its
 module docstring, a `golden_*` Torch reference, and a typed `@pl.jit.inline` ABI

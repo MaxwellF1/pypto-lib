@@ -2183,37 +2183,39 @@ class TestReloadFromDir:
 
     @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
     def test_l2_build_reconstructs_single_chip_handle(self, tmp_path, platform):
-        """No distributed_meta.json: CompiledProgram.from_dir, given both target axes."""
+        """The L2 reload API receives the canonical platform and codegen backend."""
         sentinel = object()
-        from_dir = MagicMock(return_value=sentinel)
+        calls = []
+
+        def from_dir(output_dir, *, platform=None, backend_type=None):
+            calls.append((output_dir, platform, backend_type))
+            return sentinel
+
         cfg = _run_config(platform=platform)
         with patch.dict(
             sys.modules, {"pypto.ir": self._fake_ir(from_dir, "CompiledProgram")}
         ):
             assert _reload_from_dir(tmp_path, cfg) is sentinel
-        from_dir.assert_called_once()
-        assert "platform" not in from_dir.call_args.kwargs
-        assert from_dir.call_args.kwargs["backend_type"] == cfg.backend_type
-        assert from_dir.call_args.kwargs["execution_mode"] == cfg.execution_mode
+        assert calls == [(tmp_path, platform, cfg.backend_type)]
 
     @pytest.mark.parametrize("platform", ["a2a3", "a2a3sim", "a5", "a5sim"])
     def test_l3_build_reconstructs_with_run_overrides(self, tmp_path, platform):
-        """distributed_meta.json present: DistributedCompiledProgram.from_dir,
-        threading the run's target axes and distributed_config as overrides."""
+        """The strict L3 reload signature also preserves distributed overrides."""
         (tmp_path / "distributed_meta.json").write_text("{}")
         sentinel = object()
-        from_dir = MagicMock(return_value=sentinel)
+        calls = []
+
+        def from_dir(output_dir, *, platform=None, backend_type=None, distributed_config=None):
+            calls.append((output_dir, platform, backend_type, distributed_config))
+            return sentinel
+
         cfg = _run_config(platform=platform, distributed_config="DC")
         with patch.dict(
             sys.modules,
             {"pypto.ir": self._fake_ir(from_dir, "DistributedCompiledProgram")},
         ):
             assert _reload_from_dir(tmp_path, cfg) is sentinel
-        from_dir.assert_called_once()
-        assert "platform" not in from_dir.call_args.kwargs
-        assert from_dir.call_args.kwargs["backend_type"] == cfg.backend_type
-        assert from_dir.call_args.kwargs["execution_mode"] == cfg.execution_mode
-        assert from_dir.call_args.kwargs["distributed_config"] == "DC"
+        assert calls == [(tmp_path, platform, cfg.backend_type, "DC")]
 
 
 class TestShareInPlace:

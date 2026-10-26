@@ -11,9 +11,9 @@
 GLM-5.3-Flash has a **hybrid** cache, so one dispatch carries three different kinds
 of per-token addressing:
 
-* the 12 MLA layers write a 512-wide latent row into a paged pool of
+* the 11 backbone MLA layers write a 512-wide latent row into a paged pool of
   :data:`BLOCK_SIZE`-token blocks;
-* the same 12 layers write a 256-wide indexer state row — ``[key(128),
+* the same 11 layers write a 256-wide indexer state row — ``[key(128),
   gate_scores(128)]`` — into a second paged pool, and separately read a **pooled**
   state addressed one row per ``index_kpool`` tokens. Those are two different
   mappings and must not be conflated: ``index_slots`` is per token at
@@ -21,8 +21,8 @@ of per-token addressing:
 * the 34 KDA layers hold no per-token cache at all, only a per-request conv window
   and recurrent state, addressed by a request row that never grows with context.
 
-The same lowering serves prefill and decode; decode is just the case where every
-request contributes ``1 + MTP_SPEC_TOKENS`` rows.
+The same lowering serves prefill and decode. Ordinary decode contributes one
+new token per request; speculative callers may contribute additional draft rows.
 """
 
 from dataclasses import dataclass
@@ -57,7 +57,7 @@ class ForwardMetadata:
             token belongs to, one row per ``index_kpool`` tokens. Tokens inside the
             same pool share a row, and the row is only complete once the pool closes.
         kda_state_rows: ``[requests]`` row in the KDA conv and recurrent state pools.
-        pool_count: ``[requests]`` number of complete-or-partial indexer pools.
+        pool_count: ``[requests]`` number of complete indexer pools.
         tail_start: ``[requests]`` first raw index of the incomplete tail pool.
         tail_count: ``[requests]`` tokens in that tail (``0 .. index_kpool - 1``).
     """
@@ -190,9 +190,97 @@ def build_forward_metadata(
     )
 
 
+def build_indexer_chunk_metadata(
+    metadata: ForwardMetadata,
+    index_block_table: torch.Tensor,
+    pool_offsets: torch.Tensor,
+    *,
+    pools_cap: int,
+    pool_rows: int,
+) -> dict[str, torch.Tensor]:
+    """Lower one chunk against persistent raw and pooled indexer caches.
+
+    ``pool_offsets`` gives each batch request's persistent pooled-row segment.
+    Only pools completed by this chunk produce write events; their four raw
+    members may include rows cached by an earlier chunk. Query positions and
+    expanded attention indices remain absolute positions within each request.
+    Empty requests produce no events, and padded events target the scratch row.
+    """
+    if pools_cap <= 0 or pool_rows < pools_cap * INDEX_STATE_BLOCK_SIZE:
+        raise ValueError("indexer pool storage must cover the identity pool-block gather")
+    device = metadata.query_start_loc.device
+    old_lengths = metadata.kv_seq_lens.to(device=device, dtype=torch.int64)
+    new_lengths = metadata.new_kv_seq_lens.to(device=device, dtype=torch.int64)
+    offsets = pool_offsets.to(device=device, dtype=torch.int64)
+    requests = old_lengths.numel()
+    if offsets.ndim != 1 or offsets.numel() != requests or new_lengths.shape != old_lengths.shape:
+        raise ValueError("indexer chunk metadata needs one length and pool offset per request")
+    if index_block_table.ndim != 2 or index_block_table.shape[0] != requests:
+        raise ValueError("indexer chunk metadata needs one raw block-table row per request")
+    if bool(((old_lengths < 0) | (new_lengths < old_lengths)).any()):
+        raise ValueError("indexer chunk lengths must extend a nonnegative cached prefix")
+
+    prior_pools = torch.div(old_lengths, INDEX_KPOOL, rounding_mode="floor")
+    new_pools = torch.div(new_lengths, INDEX_KPOOL, rounding_mode="floor")
+    event_counts = new_pools - prior_pools
+    if int(event_counts.sum().item()) > pools_cap:
+        raise ValueError("indexer pool-close events exceed the compiled event capacity")
+    active_requests = new_lengths > old_lengths
+    invalid_windows = (offsets < 0) | (offsets + new_pools > pools_cap)
+    if bool((active_requests & invalid_windows).any()):
+        raise ValueError("indexer request pool segment exceeds the compiled score width")
+
+    members = torch.full((pools_cap, INDEX_KPOOL), -1, dtype=torch.int32, device=device)
+    destinations = torch.full((pools_cap,), pool_rows - 1, dtype=torch.int32, device=device)
+    raw_table = index_block_table.to(device=device, dtype=torch.int64)
+    lanes = torch.arange(INDEX_KPOOL, dtype=torch.int64, device=device)
+    event = 0
+    for request in range(requests):
+        count = int(event_counts[request].item())
+        if not count:
+            continue
+        pools = torch.arange(prior_pools[request], new_pools[request], device=device)
+        positions = pools.unsqueeze(1) * INDEX_KPOOL + lanes.unsqueeze(0)
+        logical_blocks = torch.div(positions, BLOCK_SIZE, rounding_mode="floor")
+        if int(logical_blocks.max().item()) >= raw_table.shape[1]:
+            raise ValueError("indexer pool members exceed the request's raw block table")
+        pages = raw_table[request, logical_blocks]
+        if bool((pages < 0).any()):
+            raise ValueError("indexer pool-close event references an unallocated raw page")
+        rows = pages * BLOCK_SIZE + positions.remainder(BLOCK_SIZE)
+        members[event : event + count] = rows.to(torch.int32)
+        destinations[event : event + count] = (offsets[request] + pools).to(torch.int32)
+        event += count
+
+    request_ids = metadata.request_ids.to(device=device, dtype=torch.int64)
+    positions = metadata.position_ids.to(device=device, dtype=torch.int64)
+    if request_ids.shape != positions.shape:
+        raise ValueError("indexer chunk token positions must match token request ids")
+    valid = request_ids >= 0
+    if bool((request_ids[valid] >= requests).any()):
+        raise ValueError("indexer chunk token references an unknown batch request")
+    safe_requests = request_ids.clamp(min=0)
+    length_through = torch.where(valid, positions + 1, torch.zeros_like(positions))
+    tails = length_through.remainder(INDEX_KPOOL)
+    visible = torch.div(length_through, INDEX_KPOOL, rounding_mode="floor")
+    visible = torch.where(valid, torch.minimum(visible, new_pools[safe_requests]), torch.zeros_like(visible))
+    segments = torch.where(valid, offsets[safe_requests], torch.zeros_like(positions))
+    return {
+        "seg_start": segments.to(torch.int32),
+        "pool_count_tok": visible.to(torch.int32),
+        "tail_start": (length_through - tails).to(torch.int32),
+        "tail_count": tails.to(torch.int32),
+        "kv_len_tok": length_through.to(torch.int32),
+        "pool_token_slots": members,
+        "pool_slots": destinations,
+        "pool_blocks": torch.arange(pools_cap, dtype=torch.int32, device=device) * INDEX_STATE_BLOCK_SIZE,
+    }
+
+
 __all__ = [
     "ForwardMetadata",
     "build_forward_metadata",
+    "build_indexer_chunk_metadata",
     "kpool_metadata",
     "paged_slots",
     "request_ids_from_starts",

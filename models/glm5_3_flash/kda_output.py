@@ -13,7 +13,7 @@ gamma is not downcast) and then multiplies by ``sigmoid(out_gate)`` before the h
 are flattened back to ``[T, KDA_H * KDA_DIM]`` and projected to ``[T, D]``.
 
 ``o_proj`` is head-sharded, so the projection is row-parallel and its result needs
-the layer's TP16 all-reduce before mHC folds it back into the residual stream. Like
+the layer's TP all-reduce before mHC folds it back into the residual stream. Like
 the rest of the KDA block, the weight stays BF16.
 
 Two numerics notes:
@@ -50,9 +50,9 @@ EPS = FLASH.rms_norm_eps
 KDA_DIM_INV = 1.0 / KDA_DIM
 
 # tiling
-T_TILE = 16  # tokens per task; the norm pass handles T_TILE * LOCAL_KDA_H rows
-D_TILE = 128  # output columns per projection task: a [128, 512] BF16 weight tile is
-# 128 KiB, and the pipeline double-buffers it inside L1's usable 448 KiB
+T_TILE = min(16, 64 // LOCAL_KDA_H)  # at most 64 head rows per normalization task
+D_TILE = 128  # output columns per task; one complete local-head contraction
+# The BF16 weight tile is 128 KiB at TP16 and 256 KiB at TP8.
 
 
 def golden_kda_output(
