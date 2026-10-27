@@ -957,7 +957,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark drafter validation")
     parser.add_argument("--mode", choices=("projection", "metadata", "all"), default="all")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
@@ -991,7 +992,10 @@ if __name__ == "__main__":
             fn=dspark_proj_test,
             specs=specs,
             golden_fn=golden,
-            config={"platform": args.platform, "device_id": args.device},
+            config={
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
+                "device_id": args.device,
+            },
             rtol=0.05,
             atol=0.05,
             compile_only=args.compile_only,
@@ -1043,7 +1047,10 @@ if __name__ == "__main__":
             fn=dspark_metadata_test,
             specs=specs,
             golden_fn=golden,
-            config={"platform": args.platform, "device_id": args.device},
+            config={
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
+                "device_id": args.device,
+            },
             compile_only=args.compile_only,
         )
         print(result)
