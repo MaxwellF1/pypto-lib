@@ -8,7 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
-from gemm import gemm_bf16_to_bf16_staged, gemm_bf16_via_mxfp8_to_bf16_staged
+from gemm import (
+    gemm_bf16_to_bf16_staged,
+    gemm_bf16_via_mxfp8_to_bf16_staged,
+)
 import pypto.language as pl
 from rmsnorm import make_norm_with_deps
 from config import (
@@ -107,6 +110,8 @@ def _index_key_packed_decode_lut():
 @pl.jit.inline(auto_scope=False)
 def quantize_index_query(
     source: pl.Tensor[[T_DYN, INDEX_QUERY_WIDTH], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output: pl.Tensor,
     output_scale: pl.Tensor[[T_DYN, INDEX_QUERY_SCALE_WIDTH], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
@@ -114,7 +119,7 @@ def quantize_index_query(
     private_query: pl.Tensor,
     pretransposed: pl.constexpr,
 ):
-    """Quantize group-32 queries to exact E2M1 carriers in E4M3 and E8M0 scales."""
+    """Rotate query heads and quantize group-32 E2M1 carriers with E8M0 scales."""
     # A metadata-only view stays in scope for the optional store below.
     private_tokens = pl.tensor.dim(private_query, 0)
     private_flat = pl.reshape(private_query, [private_tokens * INDEX_DIM, INDEX_H])
@@ -125,7 +130,29 @@ def quantize_index_query(
         worker = pl.tile.get_block_idx()
         for t in pl.range(worker, num_tokens, 32):
             raw = pl.load(source, [t, 0], [1, INDEX_QUERY_WIDTH])
-            values = pl.reshape(pl.cast(raw, pl.FP32), [INDEX_QUERY_SCALE_WIDTH, 32])
+            heads = pl.reshape(raw, [INDEX_H, INDEX_DIM])
+            tail = pl.cast(heads[:, INDEX_DIM - ROPE_DIM:INDEX_DIM], pl.FP32)
+            even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            cosine = pl.load(cos, [t, 0], [1, ROPE_DIM // 2])
+            sine = pl.mul(pl.load(sin, [t, 0], [1, ROPE_DIM // 2]), 1.0)
+            even_cos = pl.col_expand_mul(even, cosine)
+            odd_sin = pl.col_expand_mul(odd, sine)
+            real = pl.sub(even_cos, odd_sin)
+            even_sin = pl.col_expand_mul(even, sine)
+            odd_cos = pl.col_expand_mul(odd, cosine)
+            imag = pl.add(even_sin, odd_cos)
+            real_lanes = pl.tile.full([INDEX_H, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            real_lanes = pl.tile.scatter_mask(real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101)
+            imag_lanes = pl.tile.full([INDEX_H, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            imag_lanes = pl.tile.scatter_mask(imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010)
+            real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+            imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+            rotated_bits = pl.or_(real_bits, imag_bits)
+            rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
+            rounded_tail = pl.cast(rotated, pl.BF16, mode="rint")
+            rotated_heads = pl.tile.assemble(heads, rounded_tail, [0, INDEX_DIM - ROPE_DIM])
+            values = pl.reshape(pl.cast(rotated_heads, pl.FP32), [INDEX_QUERY_SCALE_WIDTH, 32])
             reduce_tmp = pl.tile.create([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32)
             raw_maximum = pl.row_max(pl.abs(values), tmp_tile=reduce_tmp)
             maximum = pl.maximum(raw_maximum, 7.052966104933725e-38)
@@ -474,34 +501,6 @@ def select_candidate_block_pool(
                 published_count = pl.cast(pl.min(pl.min(publish_blocks, CANDIDATE_TOPK_BLOCKS), capacity), pl.INT32)
             pl.write(pool_block_counts, [publish_token], published_count)
     return counts_tid
-
-
-@pl.jit.inline
-def _index_query_rope_block(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    block: pl.Scalar[pl.INT32],
-):
-    t = block // INDEX_H
-    h = block % INDEX_H
-    base = h * INDEX_DIM
-    output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
-    tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
-    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-    c = cos[t : t + 1, :]
-    s = pl.mul(sin[t : t + 1, :], 1.0)
-    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-    output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = pl.cast(
-        rotated, pl.BF16, mode="rint"
-    )
-    return output
 
 
 @pl.jit.inline
@@ -2178,24 +2177,6 @@ def project_index_weights(
 
 
 @pl.jit.inline(auto_scope=False)
-def rotate_index_query(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
-):
-    blocks = num_tokens * INDEX_H
-    workers = pl.min(blocks, 32)
-    with pl.spmd(workers, name_hint='rope_idx_q', deps=[ready]) as rope_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, workers):
-            _index_query_rope_block(x, cos, sin, output, block)
-    return rope_tid
-
-
-@pl.jit.inline(auto_scope=False)
 def c1a_index(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
@@ -2211,18 +2192,79 @@ def c1a_index(
     entry_ready: pl.Scalar[pl.TASK_ID],
     private_query: pl.Tensor,
     private_route: pl.Scalar[pl.INT32],
+    projection_payload: pl.Tensor,
+    projection_scale_backing: pl.Tensor,
+    reuse_projection_input: pl.constexpr,
     pretransposed: pl.constexpr,
     query_max_workers: pl.constexpr = 2147483647,
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
-        Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", "quant_idx_q",
-        INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, query_max_workers,
-    )
-    rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
+    if reuse_projection_input:
+        scales_per_token = Q_LORA // 32
+        for group_start in pl.parallel(0, num_tokens, 80):
+            projection_payload_m80 = pl.tensor.slice(projection_payload, [80, Q_LORA], [group_start, 0])
+            scale_start = group_start * scales_per_token
+            backing_size = pl.tensor.dim(projection_scale_backing, 0) * pl.tensor.dim(projection_scale_backing, 1)
+            activation_scales_nd = pl.tensor.view(projection_scale_backing, [1, backing_size], layout=pl.ND)
+            scale_end = scale_start + 80 * scales_per_token
+            activation_scales = activation_scales_nd[0:1, scale_start:scale_end]
+            activation_scale = pl.tensor.view(activation_scales, [80, scales_per_token], layout=pl.MX_A_ZZ)
+            scale_group_size = (Q_LORA // 32) * INDEX_QUERY_WIDTH
+            index_scale_flat = pl.tensor.view(
+                index_wq_b_scale, [1, scale_group_size], layout=pl.ND,
+            )
+            index_scale_group = pl.tensor.view(
+                index_scale_flat[0:1, 0:scale_group_size], [Q_LORA // 32, INDEX_QUERY_WIDTH], layout=pl.MX_B_NN,
+            )
+            available_clusters = pl.system.available_cluster_count()
+            workers = pl.min(
+                pl.min(INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE, query_max_workers), available_clusters,
+            )
+            for worker in pl.spmd(workers, name_hint="proj_idx_q", sync_start=True):
+                full_a = pl.load(
+                    projection_payload_m80, [0, 0], [80, Q_LORA], target_memory=pl.MemorySpace.Mat,
+                )
+                block_num = pl.tile.get_block_num()
+                for wave in pl.range(
+                    (INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE + block_num - 1) // block_num,
+                ):
+                    block = wave * block_num + worker
+                    if block < INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE:
+                        n0 = block * INDEX_PROJ_N_TILE
+                        rows = pl.min(80, num_tokens - group_start)
+                        a0 = full_a[:, :INDEX_PROJ_K_TILE]
+                        sa0 = pl.load(
+                            activation_scale, [0, 0], [80, INDEX_PROJ_K_TILE // 32],
+                        )
+                        b0 = pl.load(
+                            index_wq_b, [0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
+                        )
+                        sb0 = pl.load(
+                            index_scale_group, [0, n0], [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
+                        )
+                        acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                        for k0 in pl.pipeline(INDEX_PROJ_K_TILE, Q_LORA, INDEX_PROJ_K_TILE, stage=2):
+                            a = pl.tile.slice(full_a, [80, INDEX_PROJ_K_TILE], [0, k0])
+                            sa = pl.load(
+                                activation_scale, [0, k0 // 32], [80, INDEX_PROJ_K_TILE // 32],
+                            )
+                            b = pl.load(
+                                index_wq_b, [k0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
+                            )
+                            sb = pl.load(
+                                index_scale_group, [k0 // 32, n0],
+                                [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
+                            )
+                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                        valid_acc = pl.set_validshape(acc, rows, INDEX_PROJ_N_TILE)
+                        projected = pl.store(valid_acc, [group_start, n0], projected)
+    else:
+        gemm_bf16_via_mxfp8_to_bf16_staged(
+            qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
+            Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", "quant_idx_q",
+            INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, query_max_workers,
+        )
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     query_scale = pl.create_tensor(
         [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
@@ -2230,15 +2272,15 @@ def c1a_index(
     if pretransposed:
         if private_route != 0:
             query_tid = quantize_index_query(
-                rotated, query, query_scale, num_tokens, rotated_tid, private_query, pretransposed=True,
+                projected, cos, sin, query, query_scale, num_tokens, entry_ready, private_query, pretransposed=True,
             )
         else:
             query_tid = quantize_index_query(
-                rotated, query, query_scale, num_tokens, rotated_tid, query, pretransposed=False,
+                projected, cos, sin, query, query_scale, num_tokens, entry_ready, query, pretransposed=False,
             )
     else:
         query_tid = quantize_index_query(
-            rotated, query, query_scale, num_tokens, rotated_tid, query, pretransposed=False,
+            projected, cos, sin, query, query_scale, num_tokens, entry_ready, query, pretransposed=False,
         )
     weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
     weights_tid = project_index_weights(
@@ -2574,7 +2616,9 @@ def decode_c2a_indexer(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
         num_tokens, score_width,
-        cache_ready, index_wq_b, 0, pretransposed=False, query_max_workers=8,
+        cache_ready, index_wq_b, 0,
+        index_wq_b, index_wq_b_scale, reuse_projection_input=False,
+        pretransposed=False, query_max_workers=8,
     )
     return _score_select_c2a_groups(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
