@@ -74,6 +74,7 @@ WORKERS = 32
 GATHER_WORKERS = 64
 SELECTED_GATHER_TILE = 64
 CACHE_WORKERS = 32
+WINDOW_PUBLISH_WORKER_TILE = 12
 SHARED_GATHER_WORKERS = 64
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
@@ -171,17 +172,12 @@ def publish_window_row(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
-    max_workers: pl.constexpr = 2147483647,
 ):
-    if max_workers == 2147483647:
-        for t in pl.spmd(num_tokens, name_hint="pub_win"):
+    workers = pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE)
+    step = pl.max(1, workers)
+    for worker in pl.spmd(workers, name_hint="pub_win"):
+        for t in pl.range(worker, num_tokens, step):
             _publish_window_row(kv, slots, cache, scales, t)
-    else:
-        workers = pl.min(num_tokens, max_workers)
-        step = pl.max(1, workers)
-        for worker in pl.spmd(workers, name_hint="pub_win"):
-            for t in pl.range(worker, num_tokens, step):
-                _publish_window_row(kv, slots, cache, scales, t)
     return cache, scales
 
 
@@ -1148,7 +1144,10 @@ GOLDEN_SELECTED_KEY_TILE = 64
 GOLDEN_PREFILL_KEY_TILE = 128
 
 
-def golden_selected_attention(q, window_value, window_indices, compressed_value, compressed_indices, sink):
+def golden_selected_attention(
+    q, window_value, window_indices, compressed_value, compressed_indices, sink,
+    *, key_tile=GOLDEN_SELECTED_KEY_TILE,
+):
     """Attend selected paged KV rows with BF16 probability tiles and one sink."""
     tokens, heads, head_dim = q.shape
     gathered = torch.cat(
@@ -1163,9 +1162,9 @@ def golden_selected_attention(q, window_value, window_indices, compressed_value,
     maximum = torch.full((tokens, heads), -1e30)
     denominator = torch.zeros_like(maximum)
     numerator = torch.zeros(tokens, heads, head_dim, dtype=torch.float32)
-    for start in range(0, gathered.shape[-2], GOLDEN_SELECTED_KEY_TILE):
-        tile = gathered[:, start : start + GOLDEN_SELECTED_KEY_TILE]
-        tile_visible = visible[:, None, start : start + GOLDEN_SELECTED_KEY_TILE]
+    for start in range(0, gathered.shape[-2], key_tile):
+        tile = gathered[:, start : start + key_tile]
+        tile_visible = visible[:, None, start : start + key_tile]
         logits = torch.einsum("thd,tkd->thk", q.float(), tile) * head_dim**-0.5
         logits = logits.masked_fill(~tile_visible, -1e30)
         next_maximum = torch.maximum(maximum, logits.amax(-1))
