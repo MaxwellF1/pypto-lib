@@ -744,8 +744,9 @@ if __name__ == "__main__":
             backend_type=args.backend_type,
             execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
-            # Heap capacity for all local experts and activation tiles.
-            ring_heap=1_073_741_824,
+            # Match the composed MoE capacity for overlapping decoded weights
+            # and activation tiles across the parallel experts.
+            ring_heap=2 * 1024**3,
         ),
         rtol=1e-3,
         atol=1e-3,
