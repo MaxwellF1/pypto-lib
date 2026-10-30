@@ -265,6 +265,7 @@ def q_proj_rope(
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
         projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
+        # Projection blocks own disjoint columns; no simultaneous start is required.
         with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
             projected = _proj_q_a(group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows)
         qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])

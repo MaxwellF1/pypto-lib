@@ -1996,7 +1996,8 @@ def c1a_index(
         rows = pl.min(80, num_tokens - group_start)
         query_workers = pl.min(INDEX_QUERY_WIDTH // INDEX_QUERY_N_TILE, pl.system.available_cluster_count())
         query_workers = pl.max(1, query_workers)
-        with pl.spmd(query_workers, name_hint="proj_idx_q", sync_start=True):
+        # Projection blocks own disjoint columns and may execute in waves.
+        with pl.spmd(query_workers, name_hint="proj_idx_q"):
             projected = _proj_idx_q(
                 projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
                 projected, rows, INDEX_QUERY_WIDTH, group_start, group_start,

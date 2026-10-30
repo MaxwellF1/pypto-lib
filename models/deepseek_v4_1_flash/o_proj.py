@@ -193,6 +193,7 @@ def o_proj(
         projected = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.BF16)
         oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
         oa_workers = pl.max(1, oa_workers)
+        # Both projection grids write disjoint columns and may execute in waves.
         with pl.spmd(oa_workers, name_hint="proj_o_a"):
             projected = _o_proj_a(payload_all, wo_a, scales_all, wo_a_scale, projected, LOCAL_O_WIDTH)
         # Quantize the O-A result for O-B.
