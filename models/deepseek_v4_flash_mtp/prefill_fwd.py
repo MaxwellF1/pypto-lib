@@ -284,22 +284,6 @@ def _fwd_attention_stage_barrier_from_completion(
 
 
 @pl.jit.inline
-def _fwd_attention_stage_barrier_from_x_attn(
-    x_attn: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, ATTN_TILE_ROWS, HC_MULT, D], pl.FP32],
-) -> pl.Scalar[pl.TASK_ID]:
-    """HCA counterpart: one task samples every attention output tile."""
-    x_attn_flat = pl.reshape(x_attn, [CP_LOCAL_ROWS, HC_MULT, D])
-    stage_tokens = pl.create_tensor([NUM_ATTN_TILES, 1, 8], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="fwd_attn_stage_token", allow_early_resolve=False) as stage_tid:
-        for tile in pl.range(NUM_ATTN_TILES):
-            row0 = tile * ATTN_TILE_ROWS
-            stage_tokens[tile : tile + 1, 0:1, 0:8] = pl.slice(x_attn_flat, [1, 1, 8], [row0, 0, 0])
-    # Complete attention before constructing the dependent MoE graph.
-    _completed = pl.read(stage_tokens, [0, 0, 0])
-    return stage_tid
-
-
-@pl.jit.inline
 def _fwd_prepare_moe_inputs(
     x_attn: pl.Tensor[[CP_LOCAL_ROWS, HC_MULT, D], pl.FP32],
     input_ids: pl.Tensor[[CP_LOCAL_ROWS], pl.INT64],
@@ -1361,21 +1345,14 @@ def prefill_fwd(
                     hca_compact_consumed,
                     attn_sink_layer,
                     wo_a_layer, wo_b_layer, wo_b_scale_layer,
-                    x_attn,
+                    x_attn, attention_completion,
                     pl.read(cache_owner_rank_t, [0]),
                     my_rank,
                     tail_comm_epoch,
                     type_index,
                 )
-            if layer_index < 2:
-                attention_tid = _fwd_attention_stage_barrier_from_completion(attention_completion)
-                attention_stage_deps[0] = attention_tid
-            elif layer_index % 2 == 0:
-                attention_tid = _fwd_attention_stage_barrier_from_completion(attention_completion)
-                attention_stage_deps[0] = attention_tid
-            else:
-                attention_tid = _fwd_attention_stage_barrier_from_x_attn(x_attn)
-                attention_stage_deps[0] = attention_tid
+            attention_tid = _fwd_attention_stage_barrier_from_completion(attention_completion)
+            attention_stage_deps[0] = attention_tid
         attention_done = attention_stage_deps[0]
         if layer_index > 0:
             moe_ready = _fwd_wait_previous_moe(attention_done, moe_completion)

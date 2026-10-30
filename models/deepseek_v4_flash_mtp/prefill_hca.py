@@ -136,8 +136,6 @@ OVERLAY_SOURCES = 2
 MAX_COMPRESSED_ROWS_PER_SEGMENT = (MAX_SEGMENT_TILES * TAIL_ROWS // COMPRESS_RATIO)
 assert CMP_ROWS_PER_SEGMENT == MAX_COMPRESSED_ROWS_PER_SEGMENT
 MAX_COMPRESS_LEAVES = 1 + MAX_SEGMENT_TILES
-# Concurrent scalar stores must not share a 64-byte DDR cache line.
-LEAF_NUM_TOKENS_STRIDE = 16
 LEAF_LOWER_ROW_TILE = 16  # rows per cp_hca_leaf_lowering block
 CACHE_INIT_CMP_ROWS = 1024
 CACHE_INIT_HISTORY_ROWS = TAIL_ROWS // (HCA_MAX_COMPRESSED_ROWS // CACHE_INIT_CMP_ROWS)
@@ -507,6 +505,7 @@ def prefill_attention_hca(
     wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32]],
+    completion_token: pl.Tensor[[NUM_LOCAL_TILES, 1, 8], pl.FP32],
     cache_owner_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tail_comm_epoch: pl.Scalar[pl.INT32],
@@ -620,34 +619,8 @@ def prefill_attention_hca(
 
     effective_x = pl.create_tensor([LOCAL_AUGMENTED_ROWS, D], dtype=pl.BF16)
     leaf_positions = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT32)
-    leaf_num_tokens = pl.create_tensor([LOCAL_PARTS, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32)
     leaf_cmp_slots = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT64)
     leaf_state_slots = pl.create_tensor([LOCAL_AUGMENTED_ROWS], dtype=pl.INT64)
-    # Leaf token counts: a handful of per-part scalars, split out so the row lowering
-    # below can fan out freely. Two blocks, microseconds each.
-    with pl.spmd(LOCAL_PARTS, name_hint="cp_hca_leaf_token_counts", deps=[tail_exchange_tid]):
-        count_part = pl.tile.get_block_idx()
-        count_predecessor = pl.read(predecessor_segments, [count_part])
-        count_valid = pl.read(overlay_active_lengths, [count_part, 0, 0])
-        if count_predecessor < 0:
-            count_valid = pl.cast(0, pl.INT32)
-            if pl.read(history_slot_mapping, [count_part, TAIL_ROWS - 1]) >= 0:
-                count_valid = pl.cast(pl.min(TAIL_ROWS, pl.max(0, pl.read(segment_starts_t, [0]))), pl.INT32)
-        # The predecessor leaf feeds two consumers with different needs. Attention
-        # counts every visible key, including a continued chunk's history window.
-        # The compressor consumes hidden states, and a history window has none --
-        # its rows are already compressed in the persistent cache -- so it must
-        # see zero tokens there or it would compress 128 zero rows.
-        count_tokens = count_valid
-        if count_predecessor < 0:
-            count_tokens = pl.cast(0, pl.INT32)
-        leaf_token_row = pl.full([1, LEAF_NUM_TOKENS_STRIDE], dtype=pl.INT32, value=0)
-        pl.write(leaf_token_row, [0, 0], count_tokens)
-        for count_tile in pl.range(MAX_SEGMENT_TILES):
-            pl.write(leaf_token_row, [0, 1 + count_tile],
-                     pl.read(overlay_active_lengths, [count_part, count_tile, 1]))
-        leaf_num_tokens[count_part:count_part + 1, 0:LEAF_NUM_TOKENS_STRIDE] = leaf_token_row
-
     # Row lowering fanned over (part, leaf, row tile). The rows are independent, but
     # this ran as LOCAL_PARTS blocks of ~336 us each, leaving 46 of 48 AIV cores idle;
     # SWA's equivalent (cp_swa_augmented_hidden_lowering) has long been at 80 blocks.
@@ -903,7 +876,14 @@ def prefill_attention_hca(
             cmp_slots_leaf = pl.slice(leaf_cmp_slots, [TAIL_ROWS], [token0])
             state_slots_leaf = pl.slice(leaf_state_slots, [TAIL_ROWS], [token0])
             cmp_leaf = pl.slice(leaf_cmp, [LEAF_CMP_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], [cmp_block0, 0, 0, 0])
-            active = pl.read(leaf_num_tokens, [part, leaf])
+            # Compressor counts come from immutable request metadata.
+            # A cached predecessor window contains no uncompressed hidden rows.
+            active = pl.cast(0, pl.INT32)
+            if leaf == 0:
+                if pl.read(predecessor_segments, [part]) >= 0:
+                    active = pl.read(overlay_active_lengths, [part, 0, 0])
+            else:
+                active = pl.read(overlay_active_lengths, [part, leaf - 1, 1])
             cmp_leaf, state_part, state_read_done = prefill_compressor_ratio128(
                 x_leaf, state_part, compress_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -1115,7 +1095,6 @@ def prefill_attention_hca(
         hc_post_prefill(attn_out_tile, residual_tile, post_tile, comb_tile, y_tile, active)
         x_out_flat[row0 : row0 + TAIL_ROWS, 0:HC_MULT, 0:D] = y_tile
 
-    completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="cp_hca_rank_complete",
@@ -1125,7 +1104,6 @@ def prefill_attention_hca(
     ):
         for tile in pl.range(NUM_LOCAL_TILES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
-    _completed = pl.read(completion_token, [0, 0, 0])
 
     x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
     return x_out
@@ -1193,6 +1171,7 @@ def prefill_cp_hca_rank(
 ):
     """Standalone CP-HCA rank child. Delegates to the inline core so the
     standalone test preserves the original @pl.jit entry point."""
+    completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
     return prefill_attention_hca(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
@@ -1215,7 +1194,7 @@ def prefill_cp_hca_rank(
         state_window, state_meta_window,
         compact_ready, compact_consumed,
         attn_sink, wo_a, wo_b, wo_b_scale,
-        x_out, pl.read(cache_owner_rank_t, [0]), my_rank,
+        x_out, completion_token, pl.read(cache_owner_rank_t, [0]), my_rank,
         pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
     )
 
