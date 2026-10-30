@@ -382,8 +382,10 @@ jobs:
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
+          # Serving uses PyPTO/simpler for NPU execution; it does not need
+          # torch_npu. Use CPU Torch 2.10 for the model loader dependencies.
+          install-torch-npu: 'false'
+          torch-version: 'torch==2.10.0'
           # Own ccache: serving's churn must not LRU-evict the a2a3/sim entries.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
@@ -442,8 +444,10 @@ jobs:
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
+          # DeepSeek V4 uses CPU Torch; its V4.1 loader needs Torch 2.10's
+          # float8_e8m0fnu dtype and does not need torch_npu in this job.
+          install-torch-npu: 'false'
+          torch-version: 'torch==2.10.0'
           # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
@@ -508,8 +512,10 @@ jobs:
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
+          # Serving uses PyPTO/simpler for NPU execution; it does not need
+          # torch_npu. Use CPU Torch 2.10 for the model loader dependencies.
+          install-torch-npu: 'false'
+          torch-version: 'torch==2.10.0'
           # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
