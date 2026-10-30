@@ -50,6 +50,7 @@ _PAIR_M_TILE = INDEX_H * 2
 
 
 INDEX_PROJ_N_TILE = 128
+INDEX_QUERY_N_TILE = 256
 INDEX_WEIGHT_K_SPLIT_TILE = 4
 INDEX_WEIGHT_K_TILE = 256
 INDEX_PROJ_K_TILE = 256
@@ -2195,7 +2196,9 @@ def c1a_index(
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     for group_start in pl.parallel(0, num_tokens, 80):
         rows = pl.min(80, num_tokens - group_start)
-        with pl.spmd(16, name_hint="proj_idx_q", sync_start=True):
+        query_workers = pl.min(INDEX_QUERY_WIDTH // INDEX_QUERY_N_TILE, pl.system.available_cluster_count())
+        query_workers = pl.max(1, query_workers)
+        with pl.spmd(query_workers, name_hint="proj_idx_q", sync_start=True):
             projected = _proj_idx_q(
                 projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
                 projected, rows, INDEX_QUERY_WIDTH, group_start, group_start,
