@@ -49,6 +49,7 @@ using HeadDotTile = Vec<bfloat16_t, 32, 128>;
 using WeightColumn = Tile<TileType::Vec, float, 32, 1, BLayout::ColMajor>;
 using ReducedTile = Vec<bfloat16_t, 1, 128>;
 
+#if !defined(__CPU_SIM)
 __aicore__ inline void weighted_head(RegTensor<float>& result, __ubuf__ bfloat16_t* src,
                                     __ubuf__ float* weights, uint16_t head, uint16_t column, MaskReg& mask) {
     RegTensor<bfloat16_t> dot16, rounded;
@@ -60,6 +61,7 @@ __aicore__ inline void weighted_head(RegTensor<float>& result, __ubuf__ bfloat16
     vcvt(rounded, dot, mask, ROUND_R, RS_DISABLE, PART_EVEN);
     vcvt(result, rounded, mask, PART_EVEN);
 }
+#endif
 
 __tf__ __aicore__ inline void reduce_weighted(
     ReducedTile::TileDType __out__ result, HeadDotTile::TileDType __in__ dots,
@@ -67,6 +69,22 @@ __tf__ __aicore__ inline void reduce_weighted(
     __ubuf__ bfloat16_t* src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(dots);
     __ubuf__ float* weights = (__ubuf__ float*)__cce_get_tile_ptr(head_weights);
     __ubuf__ bfloat16_t* dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(result);
+#if defined(__CPU_SIM)
+    for (int column = 0; column < 128; ++column) {
+        auto weighted = [&](int head) {
+            float product = static_cast<float>(src[head * 128 + column]) * weights[head];
+            return static_cast<float>(static_cast<bfloat16_t>(product));
+        };
+        // Match the device's BF16 product rounding and FP32 pairwise accumulation.
+        float sum = weighted(0);
+        for (int head = 1; head < 31; head += 2) {
+            float pair_sum = weighted(head) + weighted(head + 1);
+            sum += pair_sum;
+        }
+        sum += weighted(31);
+        dst[column] = static_cast<bfloat16_t>(sum);
+    }
+#else
     constexpr auto store_mode = std::integral_constant<::DistVST,
         static_cast<::DistVST>(GetDistVst<bfloat16_t, pto::DistVST::DIST_NORM>())>();
     __VEC_SCOPE__ {
@@ -91,6 +109,7 @@ __tf__ __aicore__ inline void reduce_weighted(
             vsts(reduced, dst, column, store_mode, packed);
         }
     }
+#endif
 }
 
 __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
