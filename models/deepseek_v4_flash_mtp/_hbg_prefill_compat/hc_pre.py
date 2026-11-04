@@ -78,6 +78,7 @@ def hc_pre_gates(
     mixes_raw: pl.Tensor[[T_DYN, MIX_PAD], pl.FP32],
     inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
     emit_split: pl.Scalar[pl.BOOL],
+    fixed_tokens: pl.constexpr = 0,
 ):
     """rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn gates.
 
@@ -88,7 +89,10 @@ def hc_pre_gates(
     Cross-scope buffers are sized to t_linear, the token count padded up to
     whole 16-row cube tiles; ``pre_val_store`` holds t_linear rows.
     """
-    t_dim = pl.tensor.dim(x, 0)
+    if fixed_tokens > 0:
+        t_dim = fixed_tokens
+    else:
+        t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
@@ -263,55 +267,65 @@ def hc_pre_gates(
     return pre_val_store
 
 
-def _hc_pre(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_scale: pl.Tensor[[3], pl.FP32],
-    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
-):
-    x.bind_dynamic(0, T_DYN)
-    x_mixed.bind_dynamic(0, T_DYN)
-    post.bind_dynamic(0, T_DYN)
-    comb.bind_dynamic(0, T_DYN)
-    """One pl.spmd task per work-type, ordered by their GM read/write dependencies.
+def make_hc_pre(fixed_tokens=0):
+    def _hc_pre(
+        x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+        hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+        hc_scale: pl.Tensor[[3], pl.FP32],
+        hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+        x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+        post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+        comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
+    ):
+        if fixed_tokens == 0:
+            x.bind_dynamic(0, T_DYN)
+            x_mixed.bind_dynamic(0, T_DYN)
+            post.bind_dynamic(0, T_DYN)
+            comb.bind_dynamic(0, T_DYN)
+        """One pl.spmd task per work-type, ordered by their GM read/write dependencies.
 
-    rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn / mix_x. Cross-scope
-    buffers are sized to t_linear, the token count padded up to whole 16-row cube tiles.
-    """
-    t_dim = pl.tensor.dim(x, 0)
-    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    x_flat = pl.reshape(x, [t_dim, HC_DIM])
-    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    hc_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    hc_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    pre_val_store = hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, hc_mixes_raw, hc_inv_rms, True)
+        rms -> linear -> linear_reduce -> split_pre_post / comb_sinkhorn / mix_x. Cross-scope
+        buffers are sized to t_linear, the token count padded up to whole 16-row cube tiles.
+        """
+        if fixed_tokens > 0:
+            t_dim = fixed_tokens
+        else:
+            t_dim = pl.tensor.dim(x, 0)
+        t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+        x_flat = pl.reshape(x, [t_dim, HC_DIM])
+        pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+        hc_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+        hc_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+        pre_val_store = hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, hc_mixes_raw, hc_inv_rms, True, fixed_tokens)
 
-    # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
-        t0 = (blk // (D // D_SPMD)) * T_TILE
-        d_base = (blk % (D // D_SPMD)) * D_SPMD
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
-        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
-        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
-        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
-        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-        for db in pl.pipeline(D_SPMD // D_TILE, stage=2):
-            d0 = d_base + db * D_TILE
-            x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
-            x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
-            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
-            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
-    return x_mixed
+        # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
+        for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
+            t0 = (blk // (D // D_SPMD)) * T_TILE
+            d_base = (blk % (D // D_SPMD)) * D_SPMD
+            pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+            pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+            pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+            pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+            pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+            for db in pl.pipeline(D_SPMD // D_TILE, stage=2):
+                d0 = d_base + db * D_TILE
+                x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
+                x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
+                x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
+                x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+                y0 = pl.row_expand_mul(x0, pre0)
+                y1 = pl.row_expand_mul(x1, pre1)
+                y2 = pl.row_expand_mul(x2, pre2)
+                y3 = pl.row_expand_mul(x3, pre3)
+                y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
+        return x_mixed
+
+    return _hc_pre
+
+
+_hc_pre = make_hc_pre()
 
 hc_pre = pl.jit.inline(_hc_pre)
 hc_pre_test = pl.jit(_hc_pre)
@@ -328,6 +342,7 @@ def hc_pre_norm(
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
+    fixed_tokens: pl.constexpr = 0,
 ):
     """Prefill HC-pre with mix_x fused into the attention RMSNorm.
 
@@ -337,13 +352,16 @@ def hc_pre_norm(
     same order as ``rmsnorm.rms_norm``, so the result is bit-identical to
     ``hc_pre`` followed by ``rms_norm``.
     """
-    t_dim = pl.tensor.dim(x, 0)
+    if fixed_tokens > 0:
+        t_dim = fixed_tokens
+    else:
+        t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     gate_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     gate_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, gate_mixes_raw, gate_inv_rms, False)
+    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, gate_mixes_raw, gate_inv_rms, False, fixed_tokens)
     with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
         scale0 = pl.read(hc_scale, [0])
         scale1 = pl.read(hc_scale, [1])

@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 from graph_attention import attention_swa_mtp_graph
+from decode_moe import moe_graph
 'DeepSeek-V4 MTP decode layer: projection, SWA attention, MoE, HC head, RMSNorm, and LM head.'
 import argparse
 import pypto.language as pl
@@ -42,7 +43,10 @@ def _decode_mtp_control_core(hidden_states: pl.Tensor[[T, D], pl.BF16], prev_pre
         else:
             attention_swa(projected_hidden, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, swa_freqs_cos, swa_freqs_sin, kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids, attn_sink, wo_a, wo_b, wo_b_scale, x_attn)
     with pl.scope():
-        moe(x_attn, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, next_pre_hc_hidden, recv_meta, recv_x, recv_aux, arrived, data_arrived, routed_y_buf, combine_arrived, pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32))
+        if record_attention_graph:
+            moe_graph(x_attn, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, next_pre_hc_hidden, recv_meta, recv_x, recv_aux, arrived, data_arrived, routed_y_buf, combine_arrived, pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32))
+        else:
+            moe(x_attn, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, input_ids, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, next_pre_hc_hidden, recv_meta, recv_x, recv_aux, arrived, data_arrived, routed_y_buf, combine_arrived, pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32))
     clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():

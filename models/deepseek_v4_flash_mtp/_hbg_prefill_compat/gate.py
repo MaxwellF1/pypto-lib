@@ -48,7 +48,7 @@ TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
 
-def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, device_num_tokens=False):
+def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, device_num_tokens=False, fixed_tokens=0, upperbound_planning=False, fixed_routing_layer=-1):
     """Build the router with scalar or device-tensor token-count inputs.
 
     ``device_num_tokens=True`` selects a ``Tensor[[1], INT32]`` count. Its
@@ -58,9 +58,10 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
         raise ValueError("gate token tile rows must be a positive multiple of 16")
     if hidden_tile_cols <= 0 or D % hidden_tile_cols:
         raise ValueError("gate hidden tile columns must divide the hidden dimension")
+    GATE_SHAPE = fixed_tokens if fixed_tokens > 0 else GATE_T_DYN
     TOKEN_TILE_ROWS = token_tile_rows
     HIDDEN_TILE_COLS = hidden_tile_cols
-    NumTokensType = pl.Tensor[[1], pl.INT32] if device_num_tokens else pl.Scalar[pl.INT32]
+    _NumTokensType = pl.Tensor[[1], pl.INT32] if device_num_tokens else pl.Scalar[pl.INT32]
 
     if device_num_tokens:
         @pl.jit.inline
@@ -73,7 +74,10 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
     else:
         @pl.jit.inline
         def _planning_count(value: pl.Scalar[pl.INT32], capacity: pl.Scalar[pl.INDEX]):
-            return pl.cast(value, pl.INDEX)
+            planned = pl.cast(value, pl.INDEX)
+            if upperbound_planning:
+                planned = capacity
+            return planned
 
         @pl.jit.inline
         def _actual_count(value: pl.Scalar[pl.INT32]):
@@ -81,26 +85,27 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
 
     if device_num_tokens:
         def _gate(
-            x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
+            x_mixed: pl.Tensor[[GATE_SHAPE, D], pl.BF16],
             norm_w: pl.Tensor[[D], pl.BF16],
             gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
             gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             layer_id: pl.Scalar[pl.INT32],
             num_tokens: pl.Tensor[[1], pl.INT32],
             tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-            input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
-            x_norm_i8: pl.Out[pl.Tensor[[GATE_T_DYN, D], pl.INT8]],
-            x_norm_scale: pl.Out[pl.Tensor[[GATE_T_DYN, 1], pl.FP32]],
-            indices: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32]],
-            weights: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32]],
+            input_ids: pl.Tensor[[GATE_SHAPE], pl.INT64],
+            x_norm_i8: pl.Out[pl.Tensor[[GATE_SHAPE, D], pl.INT8]],
+            x_norm_scale: pl.Out[pl.Tensor[[GATE_SHAPE, 1], pl.FP32]],
+            indices: pl.Out[pl.Tensor[[GATE_SHAPE, TOPK], pl.INT32]],
+            weights: pl.Out[pl.Tensor[[GATE_SHAPE, TOPK], pl.FP32]],
         ):
-            x_mixed.bind_dynamic(0, GATE_T_DYN)
-            input_ids.bind_dynamic(0, GATE_T_DYN)
-            x_norm_i8.bind_dynamic(0, GATE_T_DYN)
-            x_norm_scale.bind_dynamic(0, GATE_T_DYN)
-            indices.bind_dynamic(0, GATE_T_DYN)
-            weights.bind_dynamic(0, GATE_T_DYN)
-            token_rows = pl.tensor.dim(x_mixed, 0)
+            if fixed_routing_layer < 0:
+                routing_layer = layer_id
+            else:
+                routing_layer = pl.cast(fixed_routing_layer, pl.INT32)
+            if fixed_tokens > 0:
+                token_rows = fixed_tokens
+            else:
+                token_rows = pl.tensor.dim(x_mixed, 0)
             padded_rows = ((token_rows + TOKEN_TILE_ROWS - 1) // TOKEN_TILE_ROWS) * TOKEN_TILE_ROWS
             # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
             # the per-token positive scalar inv_rms factors out of everything downstream:
@@ -161,6 +166,16 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 xg_sq = pl.div(scale_max, xg_amax)
                 xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
                 x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
+                # Fixed-capacity Graph tasks also visit inactive rows. Publish
+                # their zero dequant scale in this producer before quantization
+                # releases the early shared-expert chain; a later routing task
+                # cannot safely repair a manual-dependency input after release.
+                if upperbound_planning:
+                    live_norm_tokens = _actual_count(num_tokens)
+                    live_norm_tokens = pl.min(pl.max(live_norm_tokens, 0), token_rows)
+                    if tok >= live_norm_tokens:
+                        zero_dequant_scale = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=0.0)
+                        x_norm_dequant_scale = pl.set_validshape(zero_dequant_scale, 1, 1)
                 pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
                 pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
@@ -194,7 +209,8 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 route_tokens = pl.min(pl.max(route_tokens, 0), token_rows)
                 for zt in pl.range(token_rows):
                     if zt >= route_tokens:
-                        pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                        if not upperbound_planning:
+                            pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                         for zk in pl.range(TOPK):
                             pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                             pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
@@ -240,14 +256,14 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
                 gp_score = pl.sqrt(gp_softplus)
                 route_scores_buf[t1 : t1 + TOKEN_TILE_ROWS, n0 : n0 + GATE_N_TILE] = gp_score
-                if layer_id >= N_HASH_LAYERS:
+                if routing_layer >= N_HASH_LAYERS:
                     gp_bias = pl.col_expand_mul(pl.full([TOKEN_TILE_ROWS, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
                     gp_biased = pl.add(gp_score, gp_bias)
                     biased_scores_buf[t1 : t1 + TOKEN_TILE_ROWS, n0 : n0 + GATE_N_TILE] = gp_biased
 
             active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
             # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
-            if layer_id < N_HASH_LAYERS:
+            if routing_layer < N_HASH_LAYERS:
                 for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
                     route_tokens = _actual_count(num_tokens)
                     route_tokens = pl.min(pl.max(route_tokens, 0), token_rows)
@@ -329,26 +345,27 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
             return weights
     else:
         def _gate(
-            x_mixed: pl.Tensor[[GATE_T_DYN, D], pl.BF16],
+            x_mixed: pl.Tensor[[GATE_SHAPE, D], pl.BF16],
             norm_w: pl.Tensor[[D], pl.BF16],
             gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
             gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             layer_id: pl.Scalar[pl.INT32],
             num_tokens: pl.Scalar[pl.INT32],
             tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-            input_ids: pl.Tensor[[GATE_T_DYN], pl.INT64],
-            x_norm_i8: pl.Out[pl.Tensor[[GATE_T_DYN, D], pl.INT8]],
-            x_norm_scale: pl.Out[pl.Tensor[[GATE_T_DYN, 1], pl.FP32]],
-            indices: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.INT32]],
-            weights: pl.Out[pl.Tensor[[GATE_T_DYN, TOPK], pl.FP32]],
+            input_ids: pl.Tensor[[GATE_SHAPE], pl.INT64],
+            x_norm_i8: pl.Out[pl.Tensor[[GATE_SHAPE, D], pl.INT8]],
+            x_norm_scale: pl.Out[pl.Tensor[[GATE_SHAPE, 1], pl.FP32]],
+            indices: pl.Out[pl.Tensor[[GATE_SHAPE, TOPK], pl.INT32]],
+            weights: pl.Out[pl.Tensor[[GATE_SHAPE, TOPK], pl.FP32]],
         ):
-            x_mixed.bind_dynamic(0, GATE_T_DYN)
-            input_ids.bind_dynamic(0, GATE_T_DYN)
-            x_norm_i8.bind_dynamic(0, GATE_T_DYN)
-            x_norm_scale.bind_dynamic(0, GATE_T_DYN)
-            indices.bind_dynamic(0, GATE_T_DYN)
-            weights.bind_dynamic(0, GATE_T_DYN)
-            token_rows = pl.tensor.dim(x_mixed, 0)
+            if fixed_routing_layer < 0:
+                routing_layer = layer_id
+            else:
+                routing_layer = pl.cast(fixed_routing_layer, pl.INT32)
+            if fixed_tokens > 0:
+                token_rows = fixed_tokens
+            else:
+                token_rows = pl.tensor.dim(x_mixed, 0)
             padded_rows = ((token_rows + TOKEN_TILE_ROWS - 1) // TOKEN_TILE_ROWS) * TOKEN_TILE_ROWS
             # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
             # the per-token positive scalar inv_rms factors out of everything downstream:
@@ -409,6 +426,16 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 xg_sq = pl.div(scale_max, xg_amax)
                 xg_dequant_scale = pl.mul(xg_amax, 1.0 / INT8_SCALE_MAX)
                 x_norm_dequant_scale = pl.mul(xg_dequant_scale, inv_rms)
+                # Fixed-capacity Graph tasks also visit inactive rows. Publish
+                # their zero dequant scale in this producer before quantization
+                # releases the early shared-expert chain; a later routing task
+                # cannot safely repair a manual-dependency input after release.
+                if upperbound_planning:
+                    live_norm_tokens = _actual_count(num_tokens)
+                    live_norm_tokens = pl.min(pl.max(live_norm_tokens, 0), token_rows)
+                    if tok >= live_norm_tokens:
+                        zero_dequant_scale = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=0.0)
+                        x_norm_dequant_scale = pl.set_validshape(zero_dequant_scale, 1, 1)
                 pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
                 pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
@@ -442,7 +469,8 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 route_tokens = pl.min(pl.max(route_tokens, 0), token_rows)
                 for zt in pl.range(token_rows):
                     if zt >= route_tokens:
-                        pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                        if not upperbound_planning:
+                            pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                         for zk in pl.range(TOPK):
                             pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
                             pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
@@ -488,14 +516,14 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
                 gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
                 gp_score = pl.sqrt(gp_softplus)
                 route_scores_buf[t1 : t1 + TOKEN_TILE_ROWS, n0 : n0 + GATE_N_TILE] = gp_score
-                if layer_id >= N_HASH_LAYERS:
+                if routing_layer >= N_HASH_LAYERS:
                     gp_bias = pl.col_expand_mul(pl.full([TOKEN_TILE_ROWS, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
                     gp_biased = pl.add(gp_score, gp_bias)
                     biased_scores_buf[t1 : t1 + TOKEN_TILE_ROWS, n0 : n0 + GATE_N_TILE] = gp_biased
 
             active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
             # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
-            if layer_id < N_HASH_LAYERS:
+            if routing_layer < N_HASH_LAYERS:
                 for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
                     route_tokens = _actual_count(num_tokens)
                     route_tokens = pl.min(pl.max(route_tokens, 0), token_rows)
@@ -578,6 +606,7 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, *, devi
 
 
     return _gate
+
 
 
 _gate = make_gate()

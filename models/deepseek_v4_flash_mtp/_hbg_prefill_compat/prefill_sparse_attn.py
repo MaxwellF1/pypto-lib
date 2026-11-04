@@ -27,7 +27,7 @@ from config import (
     PREFILL_SEQ,
 )
 from prefill_indexer import INDEXER_TOPK_CAP
-from hc_post import hc_post_prefill, hc_post_prefill_split
+from hc_post import make_hc_post_prefill, make_hc_post_prefill_split
 
 # Dynamic shape variables.
 ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
@@ -155,265 +155,285 @@ HCA_CMP_PAD_ROWS = HCA_CMP_WORK_COUNT * HCA_ATTN_TILE
 
 assert WIN == PREFILL_ATTN_TILE, f"Sparse prefill expects WIN ({WIN}) == PREFILL_ATTN_TILE ({PREFILL_ATTN_TILE})"
 
-@pl.jit.inline(auto_scope=False)
-def _staged_attn_prepare_rope(
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    active_rows: pl.Scalar[pl.INDEX],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Build inverse-RoPE tables for one staged segment."""
-    rope_cs_blocks = pl.max(1, (active_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE)
-    # The row-tile guard writes from a conditional region; bind the outputs to a
-    # scalar extent so the region result stays off the dynamic row symbol.
-    rope_rows_dim = pl.tensor.dim(rope_cos_il, 0)
-    rope_cos_il_view = pl.reshape(rope_cos_il, [rope_rows_dim, ROPE_DIM])
-    rope_sin_signed_view = pl.reshape(rope_sin_signed, [rope_rows_dim, ROPE_DIM])
-    # One block per (column-pair tile, row tile) instead of a serial row loop.
-    with pl.spmd(
-        (ROPE_HALF // ROPE_TILE) * rope_cs_blocks, name_hint="staged_swa_rope_cs", deps=[prior_dep],
-    ) as rope_cs_tid:
-        cs_block = pl.tile.get_block_idx()
-        cp = cs_block % (ROPE_HALF // ROPE_TILE)
-        cs_rb = cs_block // (ROPE_HALF // ROPE_TILE)
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
+def make_staged_attn_prepare_rope(fixed_rows=0):
+    @pl.jit.inline(auto_scope=False)
+    def _staged_attn_prepare_rope(
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+        active_rows: pl.Scalar[pl.INDEX],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Build inverse-RoPE tables for one staged segment."""
+        rope_cs_blocks = pl.max(1, (active_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE)
+        if fixed_rows > 0:
+            rope_cs_blocks = (fixed_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE
+        # The row-tile guard writes from a conditional region; bind the outputs to a
+        # scalar extent so the region result stays off the dynamic row symbol.
+        rope_rows_dim = pl.tensor.dim(rope_cos_il, 0)
+        if fixed_rows > 0:
+            rope_rows_dim = ((fixed_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
+        rope_cos_il_view = pl.reshape(rope_cos_il, [rope_rows_dim, ROPE_DIM])
+        rope_sin_signed_view = pl.reshape(rope_sin_signed, [rope_rows_dim, ROPE_DIM])
+        # One block per (column-pair tile, row tile) instead of a serial row loop.
+        with pl.spmd(
+            (ROPE_HALF // ROPE_TILE) * rope_cs_blocks, name_hint="staged_swa_rope_cs", deps=[prior_dep],
+        ) as rope_cs_tid:
+            cs_block = pl.tile.get_block_idx()
+            cp = cs_block % (ROPE_HALF // ROPE_TILE)
+            cs_rb = cs_block // (ROPE_HALF // ROPE_TILE)
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
 
-        swap_ones = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        swap_ramp = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        swap_col = pl.col_expand_mul(swap_ones, swap_ramp)
-        swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
-        swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
-        swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
-        swap_pair_f = pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0))
-        swap_idx = pl.cast(swap_pair_f, target_type=pl.INT32)
-        if cs_rb == 0:
-            rope_swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE]
+            swap_ones = pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+            swap_ramp = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            swap_col = pl.col_expand_mul(swap_ones, swap_ramp)
+            swap_dup_i32 = pl.cast(pl.mul(swap_col, 0.5), target_type=pl.INT32, mode="trunc")
+            swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
+            swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
+            swap_pair_f = pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0))
+            swap_idx = pl.cast(swap_pair_f, target_type=pl.INT32)
+            if cs_rb == 0:
+                rope_swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = swap_idx[:, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE]
 
-        cs_ones = pl.full([STAGED_SWA_ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
-        cs_ramp_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
-        cs_ramp = pl.cast(cs_ramp_i32, target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_ramp)
-        cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
-        cs_t0 = cs_rb * STAGED_SWA_ROPE_CS_T_TILE
-        if cs_t0 < active_rows:
-            cs_rows = pl.min(STAGED_SWA_ROPE_CS_T_TILE, active_rows - cs_t0)
-            cs_cos_rows = pl.slice(
-                freqs_cos,
-                [STAGED_SWA_ROPE_CS_T_TILE, ROPE_TILE],
-                [cs_t0, cp_r0],
-                valid_shape=[cs_rows, ROPE_TILE],
+            cs_ones = pl.full([STAGED_SWA_ROPE_CS_T_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
+            cs_ramp_i32 = pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32)
+            cs_ramp = pl.cast(cs_ramp_i32, target_type=pl.FP32)
+            cs_col = pl.col_expand_mul(cs_ones, cs_ramp)
+            cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
+            cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
+            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
+            cs_t0 = cs_rb * STAGED_SWA_ROPE_CS_T_TILE
+            if cs_t0 < active_rows:
+                cs_rows = pl.min(STAGED_SWA_ROPE_CS_T_TILE, active_rows - cs_t0)
+                cs_cos_rows = pl.slice(
+                    freqs_cos,
+                    [STAGED_SWA_ROPE_CS_T_TILE, ROPE_TILE],
+                    [cs_t0, cp_r0],
+                    valid_shape=[cs_rows, ROPE_TILE],
+                )
+                cs_sin_rows = pl.slice(
+                    freqs_sin,
+                    [STAGED_SWA_ROPE_CS_T_TILE, ROPE_TILE],
+                    [cs_t0, cp_r0],
+                    valid_shape=[cs_rows, ROPE_TILE],
+                )
+                cs_cos = pl.cast(cs_cos_rows, target_type=pl.FP32)
+                cs_sin = pl.cast(cs_sin_rows, target_type=pl.FP32)
+                cs_cos_il = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+                cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
+                cs_sin_signed = pl.mul(cs_sin_il, cs_sign)
+                rope_cos_il_view[cs_t0 : cs_t0 + STAGED_SWA_ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_il
+                rope_sin_signed_view[
+                    cs_t0 : cs_t0 + STAGED_SWA_ROPE_CS_T_TILE,
+                    cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
+                ] = cs_sin_signed
+
+        return rope_cs_tid
+
+    return _staged_attn_prepare_rope
+
+_staged_attn_prepare_rope = make_staged_attn_prepare_rope()
+
+
+def make_staged_sparse_wave(fixed_rows=0):
+    @pl.jit.inline(auto_scope=False)
+    def _staged_sparse_wave(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        # FP16, not FP32: this is the dominant GM traffic of the whole attention
+        # segment (one HEAD_DIM row per query, head and sparse block, written by
+        # staged_swa_qk_pv and read straight back by the merge). The final output is
+        # cast to BF16 anyway, and FP16 keeps 10 mantissa bits against BF16's 7.
+        sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP16],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+        source_ready_tid: pl.Scalar[pl.TASK_ID],
+        merge_ready_tid: pl.Scalar[pl.TASK_ID],
+        query_base: pl.Scalar[pl.INDEX],
+        kv_query_stride: pl.Scalar[pl.INDEX],
+        kv_row_origin: pl.Scalar[pl.INDEX],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Run a QK/PV/merge wave bounded by caller-owned statistics scratch.
+
+        ``kv_query_stride`` / ``kv_row_origin`` say where query ``t``'s sparse-K rows
+        start in ``sparse_kv``: ``t * kv_query_stride + kv_row_origin``.
+
+        * ``(PREFILL_SPARSE_PAD, 0)`` -- one private PAD-strided region per query.
+        * ``(1, 1)`` -- CP-SWA's shared window, one row per absolute key position for
+          the whole segment, so consecutive queries overlap by ``WIN - 1`` rows. The
+          slice stays a contiguous ``PREFILL_ATTN_TILE``-row block either way, so the
+          QK and PV matmuls are untouched.
+        """
+        wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // (H * PREFILL_ATTN_BLOCKS)
+        if fixed_rows > 0:
+            wave_rows = fixed_rows
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
+        if fixed_rows > 0:
+            packed_rows = ((fixed_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        query_head_rows = token_rows * H
+        output_group_rows = O_GROUPS * packed_rows
+        q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
+        attn_sink_col = pl.reshape(attn_sink, [H, 1])
+        o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
+
+        # Statistics use wave-local row indices, so all waves reuse one scratch.
+        qk_query_blocks = (wave_rows + STAGED_SWA_QUERIES_PER_BLOCK - 1) // STAGED_SWA_QUERIES_PER_BLOCK
+        with pl.spmd(qk_query_blocks, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
+            qk_query_start = pl.tile.get_block_idx() * STAGED_SWA_QUERIES_PER_BLOCK
+            for qk_query_offset in pl.range(STAGED_SWA_QUERIES_PER_BLOCK):
+                qk_local_t = qk_query_start + qk_query_offset
+                qk_t = query_base + qk_local_t
+                if qk_local_t < wave_rows and qk_t < active_rows:
+                    qk_kv_base = qk_t * kv_query_stride + kv_row_origin
+                    qk_token_base = (qk_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                    for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
+                        qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
+                        qk_b0 = qk_sb * PREFILL_ATTN_TILE
+                        qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
+                        if qk_sb == 0:
+                            qk_block_valid = pl.cast(1, pl.INT32)
+                        if qk_block_valid > 0:
+                            qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_b0 : qk_b0 + PREFILL_ATTN_TILE]
+                            qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                            qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                                qk_head_row = qk_t * H + qk_hb * QK_M_TILE
+                                qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
+                                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                                qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                                qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                                qk_mi = pl.row_max(qk_scores)
+                                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                                qk_li = pl.row_sum(qk_exp)
+                                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                                # FP16 straight out of the cube writeback, not a vector
+                                # cast afterwards: this task holds one AIC and two AIV
+                                # cores for its whole duration, so a microsecond of added
+                                # vector work here costs three core-microseconds. The
+                                # earlier cast-based version measured +124.9 for exactly
+                                # that reason while its golden passed.
+                                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP16)
+                                for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                                    qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
+                                    qk_r0 = qk_sub * HEAD_TILE
+                                    qk_blk_base = (qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                                    qk_row = qk_blk_base + qk_sb * HEAD_TILE
+                                    sparse_blk_mi[qk_row : qk_row + HEAD_TILE, :] = qk_mi[qk_r0 : qk_r0 + HEAD_TILE, :]
+                                    sparse_blk_li[qk_row : qk_row + HEAD_TILE, :] = qk_li[qk_r0 : qk_r0 + HEAD_TILE, :]
+                                    sparse_blk_oi[qk_row : qk_row + HEAD_TILE, :] = qk_oi[qk_r0 : qk_r0 + HEAD_TILE, :]
+
+        # MERGE_ROWS query rows per block: the per-row work is unchanged, the block
+        # count (and its scheduler cost) drops MERGE_ROWS-fold.
+        with pl.spmd(
+            (wave_rows + MERGE_ROWS - 1) // MERGE_ROWS, name_hint="staged_swa_merge_rope_pack",
+            deps=[qk_tid, merge_ready_tid],
+        ) as merge_tid:
+            # Flat pair-swap index into a [1, HEAD_TILE * HEAD_DIM] view of one head
+            # tile: one gather row instead of a HEAD_TILE-iteration row loop.
+            flat_k = pl.cast(pl.arange(0, [1, HEAD_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            flat_row = pl.cast(pl.cast(pl.mul(flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            flat_col = pl.sub(flat_k, pl.mul(flat_row, ROPE_DIM_F))
+            flat_pair = pl.cast(pl.cast(pl.mul(flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            flat_lane = pl.sub(flat_col, pl.mul(flat_pair, 2.0))
+            flat_swap_col = pl.sub(pl.add(flat_col, 1.0), pl.mul(flat_lane, 2.0))
+            m_swap_flat_idx = pl.cast(
+                pl.add(pl.add(pl.mul(flat_row, HEAD_DIM_F), NOPE_DIM_F), flat_swap_col),
+                target_type=pl.INT32,
             )
-            cs_sin_rows = pl.slice(
-                freqs_sin,
-                [STAGED_SWA_ROPE_CS_T_TILE, ROPE_TILE],
-                [cs_t0, cp_r0],
-                valid_shape=[cs_rows, ROPE_TILE],
-            )
-            cs_cos = pl.cast(cs_cos_rows, target_type=pl.FP32)
-            cs_sin = pl.cast(cs_sin_rows, target_type=pl.FP32)
-            cs_cos_il = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-            cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-            cs_sin_signed = pl.mul(cs_sin_il, cs_sign)
-            rope_cos_il_view[cs_t0 : cs_t0 + STAGED_SWA_ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_il
-            rope_sin_signed_view[
-                cs_t0 : cs_t0 + STAGED_SWA_ROPE_CS_T_TILE,
-                cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE,
-            ] = cs_sin_signed
+            for m_row_off in pl.range(MERGE_ROWS):
+                m_local_t = pl.tile.get_block_idx() * MERGE_ROWS + m_row_off
+                m_t = query_base + m_local_t
+                if m_local_t < wave_rows and m_t < active_rows:
+                    m_token_base = (m_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                    m_mask_row = valid_block_mask[m_t : m_t + 1, :]
+                    m_cos_il = rope_cos_il[m_t : m_t + 1, :]
+                    m_sin_signed = rope_sin_signed[m_t : m_t + 1, :]
+                    for m_h_idx in pl.range(H // HEAD_TILE):
+                        m_h0 = m_h_idx * HEAD_TILE
+                        m_blk_base = (m_token_base + m_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
+                        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + HEAD_TILE, :]
+                        m_li = sparse_blk_li[m_blk_base : m_blk_base + HEAD_TILE, :]
+                        m_oi = pl.cast(sparse_blk_oi[m_blk_base : m_blk_base + HEAD_TILE, :], target_type=pl.FP32)
+                        for m_sb in pl.unroll(1, PREFILL_ATTN_BLOCKS):
+                            m_block_valid = pl.read(m_mask_row, [0, m_sb])
+                            if m_block_valid > 0:
+                                m_row = m_blk_base + m_sb * HEAD_TILE
+                                cur_mi = sparse_blk_mi[m_row : m_row + HEAD_TILE, :]
+                                cur_li = sparse_blk_li[m_row : m_row + HEAD_TILE, :]
+                                cur_oi = pl.cast(sparse_blk_oi[m_row : m_row + HEAD_TILE, :], target_type=pl.FP32)
+                                mi_new = pl.maximum(m_mi, cur_mi)
+                                alpha = pl.exp(pl.sub(m_mi, mi_new))
+                                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                                m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
+                                m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
+                                m_mi = mi_new
 
-    return rope_cs_tid
+                        sink_bias = attn_sink_col[m_h0 : m_h0 + HEAD_TILE, :]
+                        sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
+                        denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
+                        n_full = pl.row_expand_div(m_oi, denom)[0:HEAD_TILE, :]
+                        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
+                        m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
+                        n_flat = pl.reshape(n_full, [1, HEAD_TILE * HEAD_DIM])
+                        m_swapped = pl.reshape(
+                            pl.gather(n_flat, dim=-1, index=m_swap_flat_idx), [HEAD_TILE, ROPE_DIM],
+                        )
+                        m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
+                        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
 
-@pl.jit.inline(auto_scope=False)
-def _staged_sparse_wave(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    # FP16, not FP32: this is the dominant GM traffic of the whole attention
-    # segment (one HEAD_DIM row per query, head and sparse block, written by
-    # staged_swa_qk_pv and read straight back by the merge). The final output is
-    # cast to BF16 anyway, and FP16 keeps 10 mantissa bits against BF16's 7.
-    sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP16],
-    rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    source_ready_tid: pl.Scalar[pl.TASK_ID],
-    merge_ready_tid: pl.Scalar[pl.TASK_ID],
-    query_base: pl.Scalar[pl.INDEX],
-    kv_query_stride: pl.Scalar[pl.INDEX],
-    kv_row_origin: pl.Scalar[pl.INDEX],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run a QK/PV/merge wave bounded by caller-owned statistics scratch.
+                        if HEAD_TILE % HEADS_PER_GROUP == 0:
+                            m_g0 = m_h0 // HEADS_PER_GROUP
+                            for m_sg in pl.unroll(HEAD_TILE // HEADS_PER_GROUP):
+                                m_src_h0 = m_sg * HEADS_PER_GROUP
+                                m_pack_row = (m_g0 + m_sg) * packed_rows + m_t
+                                m_dst_head = m_pack_row * HEADS_PER_GROUP
+                                pl.assemble(
+                                    o_packed_heads,
+                                    n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM],
+                                    [m_dst_head, 0],
+                                )
+                                pl.assemble(
+                                    o_packed_heads,
+                                    n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM],
+                                    [m_dst_head, NOPE_DIM],
+                                )
+                        else:
+                            for m_hi in pl.range(HEAD_TILE):
+                                m_gh = m_h0 + m_hi
+                                m_g = m_gh // HEADS_PER_GROUP
+                                m_pack_row = m_g * packed_rows + m_t
+                                m_col = (m_gh - m_g * HEADS_PER_GROUP) * HEAD_DIM
+                                o_packed[
+                                    m_pack_row : m_pack_row + 1,
+                                    m_col : m_col + NOPE_DIM,
+                                ] = n_bf16[m_hi : m_hi + 1, 0:NOPE_DIM]
+                                o_packed[
+                                    m_pack_row : m_pack_row + 1,
+                                    m_col + NOPE_DIM : m_col + HEAD_DIM,
+                                ] = n_rope_bf16[m_hi : m_hi + 1, 0:ROPE_DIM]
 
-    ``kv_query_stride`` / ``kv_row_origin`` say where query ``t``'s sparse-K rows
-    start in ``sparse_kv``: ``t * kv_query_stride + kv_row_origin``.
+        return merge_tid
 
-    * ``(PREFILL_SPARSE_PAD, 0)`` -- one private PAD-strided region per query.
-    * ``(1, 1)`` -- CP-SWA's shared window, one row per absolute key position for
-      the whole segment, so consecutive queries overlap by ``WIN - 1`` rows. The
-      slice stays a contiguous ``PREFILL_ATTN_TILE``-row block either way, so the
-      QK and PV matmuls are untouched.
-    """
-    wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // (H * PREFILL_ATTN_BLOCKS)
-    token_rows = pl.tensor.dim(q, 0)
-    packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
-    query_head_rows = token_rows * H
-    output_group_rows = O_GROUPS * packed_rows
-    q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
-    attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
+    return _staged_sparse_wave
 
-    # Statistics use wave-local row indices, so all waves reuse one scratch.
-    qk_query_blocks = (wave_rows + STAGED_SWA_QUERIES_PER_BLOCK - 1) // STAGED_SWA_QUERIES_PER_BLOCK
-    with pl.spmd(qk_query_blocks, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
-        qk_query_start = pl.tile.get_block_idx() * STAGED_SWA_QUERIES_PER_BLOCK
-        for qk_query_offset in pl.range(STAGED_SWA_QUERIES_PER_BLOCK):
-            qk_local_t = qk_query_start + qk_query_offset
-            qk_t = query_base + qk_local_t
-            if qk_local_t < wave_rows and qk_t < active_rows:
-                qk_kv_base = qk_t * kv_query_stride + kv_row_origin
-                qk_token_base = (qk_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                    qk_s0 = qk_kv_base + qk_sb * PREFILL_ATTN_TILE
-                    qk_b0 = qk_sb * PREFILL_ATTN_TILE
-                    qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
-                    if qk_sb == 0:
-                        qk_block_valid = pl.cast(1, pl.INT32)
-                    if qk_block_valid > 0:
-                        qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_b0 : qk_b0 + PREFILL_ATTN_TILE]
-                        qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                        qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                            qk_head_row = qk_t * H + qk_hb * QK_M_TILE
-                            qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
-                            qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                            qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                            qk_mi = pl.row_max(qk_scores)
-                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                            qk_li = pl.row_sum(qk_exp)
-                            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                            # FP16 straight out of the cube writeback, not a vector
-                            # cast afterwards: this task holds one AIC and two AIV
-                            # cores for its whole duration, so a microsecond of added
-                            # vector work here costs three core-microseconds. The
-                            # earlier cast-based version measured +124.9 for exactly
-                            # that reason while its golden passed.
-                            qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP16)
-                            for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                                qk_h_idx = (qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub)
-                                qk_r0 = qk_sub * HEAD_TILE
-                                qk_blk_base = (qk_token_base + qk_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                                qk_row = qk_blk_base + qk_sb * HEAD_TILE
-                                sparse_blk_mi[qk_row : qk_row + HEAD_TILE, :] = qk_mi[qk_r0 : qk_r0 + HEAD_TILE, :]
-                                sparse_blk_li[qk_row : qk_row + HEAD_TILE, :] = qk_li[qk_r0 : qk_r0 + HEAD_TILE, :]
-                                sparse_blk_oi[qk_row : qk_row + HEAD_TILE, :] = qk_oi[qk_r0 : qk_r0 + HEAD_TILE, :]
-
-    # MERGE_ROWS query rows per block: the per-row work is unchanged, the block
-    # count (and its scheduler cost) drops MERGE_ROWS-fold.
-    with pl.spmd(
-        (wave_rows + MERGE_ROWS - 1) // MERGE_ROWS, name_hint="staged_swa_merge_rope_pack",
-        deps=[qk_tid, merge_ready_tid],
-    ) as merge_tid:
-        # Flat pair-swap index into a [1, HEAD_TILE * HEAD_DIM] view of one head
-        # tile: one gather row instead of a HEAD_TILE-iteration row loop.
-        flat_k = pl.cast(pl.arange(0, [1, HEAD_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        flat_row = pl.cast(pl.cast(pl.mul(flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        flat_col = pl.sub(flat_k, pl.mul(flat_row, ROPE_DIM_F))
-        flat_pair = pl.cast(pl.cast(pl.mul(flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        flat_lane = pl.sub(flat_col, pl.mul(flat_pair, 2.0))
-        flat_swap_col = pl.sub(pl.add(flat_col, 1.0), pl.mul(flat_lane, 2.0))
-        m_swap_flat_idx = pl.cast(
-            pl.add(pl.add(pl.mul(flat_row, HEAD_DIM_F), NOPE_DIM_F), flat_swap_col),
-            target_type=pl.INT32,
-        )
-        for m_row_off in pl.range(MERGE_ROWS):
-            m_local_t = pl.tile.get_block_idx() * MERGE_ROWS + m_row_off
-            m_t = query_base + m_local_t
-            if m_local_t < wave_rows and m_t < active_rows:
-                m_token_base = (m_local_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                m_mask_row = valid_block_mask[m_t : m_t + 1, :]
-                m_cos_il = rope_cos_il[m_t : m_t + 1, :]
-                m_sin_signed = rope_sin_signed[m_t : m_t + 1, :]
-                for m_h_idx in pl.range(H // HEAD_TILE):
-                    m_h0 = m_h_idx * HEAD_TILE
-                    m_blk_base = (m_token_base + m_h_idx * PREFILL_ATTN_BLOCKS * HEAD_TILE)
-                    m_mi = sparse_blk_mi[m_blk_base : m_blk_base + HEAD_TILE, :]
-                    m_li = sparse_blk_li[m_blk_base : m_blk_base + HEAD_TILE, :]
-                    m_oi = pl.cast(sparse_blk_oi[m_blk_base : m_blk_base + HEAD_TILE, :], target_type=pl.FP32)
-                    for m_sb in pl.unroll(1, PREFILL_ATTN_BLOCKS):
-                        m_block_valid = pl.read(m_mask_row, [0, m_sb])
-                        if m_block_valid > 0:
-                            m_row = m_blk_base + m_sb * HEAD_TILE
-                            cur_mi = sparse_blk_mi[m_row : m_row + HEAD_TILE, :]
-                            cur_li = sparse_blk_li[m_row : m_row + HEAD_TILE, :]
-                            cur_oi = pl.cast(sparse_blk_oi[m_row : m_row + HEAD_TILE, :], target_type=pl.FP32)
-                            mi_new = pl.maximum(m_mi, cur_mi)
-                            alpha = pl.exp(pl.sub(m_mi, mi_new))
-                            beta = pl.exp(pl.sub(cur_mi, mi_new))
-                            m_li = pl.add(pl.mul(alpha, m_li), pl.mul(beta, cur_li))
-                            m_oi = pl.add(pl.row_expand_mul(m_oi, alpha), pl.row_expand_mul(cur_oi, beta))
-                            m_mi = mi_new
-
-                    sink_bias = attn_sink_col[m_h0 : m_h0 + HEAD_TILE, :]
-                    sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
-                    denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
-                    n_full = pl.row_expand_div(m_oi, denom)[0:HEAD_TILE, :]
-                    n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-
-                    m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-                    n_flat = pl.reshape(n_full, [1, HEAD_TILE * HEAD_DIM])
-                    m_swapped = pl.reshape(
-                        pl.gather(n_flat, dim=-1, index=m_swap_flat_idx), [HEAD_TILE, ROPE_DIM],
-                    )
-                    m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-                    n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-
-                    if HEAD_TILE % HEADS_PER_GROUP == 0:
-                        m_g0 = m_h0 // HEADS_PER_GROUP
-                        for m_sg in pl.unroll(HEAD_TILE // HEADS_PER_GROUP):
-                            m_src_h0 = m_sg * HEADS_PER_GROUP
-                            m_pack_row = (m_g0 + m_sg) * packed_rows + m_t
-                            m_dst_head = m_pack_row * HEADS_PER_GROUP
-                            pl.assemble(
-                                o_packed_heads,
-                                n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM],
-                                [m_dst_head, 0],
-                            )
-                            pl.assemble(
-                                o_packed_heads,
-                                n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM],
-                                [m_dst_head, NOPE_DIM],
-                            )
-                    else:
-                        for m_hi in pl.range(HEAD_TILE):
-                            m_gh = m_h0 + m_hi
-                            m_g = m_gh // HEADS_PER_GROUP
-                            m_pack_row = m_g * packed_rows + m_t
-                            m_col = (m_gh - m_g * HEADS_PER_GROUP) * HEAD_DIM
-                            o_packed[
-                                m_pack_row : m_pack_row + 1,
-                                m_col : m_col + NOPE_DIM,
-                            ] = n_bf16[m_hi : m_hi + 1, 0:NOPE_DIM]
-                            o_packed[
-                                m_pack_row : m_pack_row + 1,
-                                m_col + NOPE_DIM : m_col + HEAD_DIM,
-                            ] = n_rope_bf16[m_hi : m_hi + 1, 0:ROPE_DIM]
-
-    return merge_tid
+_staged_sparse_wave = make_staged_sparse_wave()
 
 
 # The compact statistics layout drops the per-block axis, so it is only correct
@@ -421,1509 +441,1707 @@ def _staged_sparse_wave(
 assert WIN <= PREFILL_ATTN_TILE, "compact SWA statistics assume one sparse block per query"
 
 
-@pl.jit.inline(auto_scope=False)
-def _staged_swa_compact_wave(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP32],
-    rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    source_ready_tid: pl.Scalar[pl.TASK_ID],
-    merge_ready_tid: pl.Scalar[pl.TASK_ID],
-    query_base: pl.Scalar[pl.INDEX],
-    kv_query_stride: pl.Scalar[pl.INDEX],
-    kv_row_origin: pl.Scalar[pl.INDEX],
-) -> pl.Scalar[pl.TASK_ID]:
-    """SWA QK/PV + merge over a block-free statistics layout.
+def make_staged_swa_compact_wave(fixed_rows=0):
+    @pl.jit.inline(auto_scope=False)
+    def _staged_swa_compact_wave(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP32],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+        source_ready_tid: pl.Scalar[pl.TASK_ID],
+        merge_ready_tid: pl.Scalar[pl.TASK_ID],
+        query_base: pl.Scalar[pl.INDEX],
+        kv_query_stride: pl.Scalar[pl.INDEX],
+        kv_row_origin: pl.Scalar[pl.INDEX],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """SWA QK/PV + merge over a block-free statistics layout.
 
-    A sliding window of WIN == PREFILL_ATTN_TILE rows makes block 0 the only
-    staged block, so the statistics need no per-block axis: row ``t * H + h``
-    holds head ``h`` of query ``t``. Consecutive heads are then contiguous, which
-    lets qk_pv store a whole QK_M_TILE result in one write and lets merge run its
-    vector epilogue on MERGE_TILE rows instead of HEAD_TILE.
+        A sliding window of WIN == PREFILL_ATTN_TILE rows makes block 0 the only
+        staged block, so the statistics need no per-block axis: row ``t * H + h``
+        holds head ``h`` of query ``t``. Consecutive heads are then contiguous, which
+        lets qk_pv store a whole QK_M_TILE result in one write and lets merge run its
+        vector epilogue on MERGE_TILE rows instead of HEAD_TILE.
 
-    ``kv_query_stride`` / ``kv_row_origin`` say where query ``t``'s sparse-K rows
-    start in ``sparse_kv``: ``t * kv_query_stride + kv_row_origin``.
+        ``kv_query_stride`` / ``kv_row_origin`` say where query ``t``'s sparse-K rows
+        start in ``sparse_kv``: ``t * kv_query_stride + kv_row_origin``.
 
-    * ``(PREFILL_SPARSE_PAD, 0)`` -- one private PAD-strided region per query.
-    * ``(1, 1)`` -- CP-SWA's shared window, one row per absolute key position for
-      the whole segment, so consecutive queries overlap by ``WIN - 1`` rows. The
-      slice stays a contiguous ``PREFILL_ATTN_TILE``-row block either way, so the
-      QK and PV matmuls are untouched.
-    """
-    wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // H
-    token_rows = pl.tensor.dim(q, 0)
-    packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
-    query_head_rows = token_rows * H
-    output_group_rows = O_GROUPS * packed_rows
-    q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
-    attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
+        * ``(PREFILL_SPARSE_PAD, 0)`` -- one private PAD-strided region per query.
+        * ``(1, 1)`` -- CP-SWA's shared window, one row per absolute key position for
+          the whole segment, so consecutive queries overlap by ``WIN - 1`` rows. The
+          slice stays a contiguous ``PREFILL_ATTN_TILE``-row block either way, so the
+          QK and PV matmuls are untouched.
+        """
+        wave_rows = pl.tensor.dim(sparse_blk_mi, 0) // H
+        if fixed_rows > 0:
+            wave_rows = STAGED_SWA_QUERY_TILE
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
+        if fixed_rows > 0:
+            packed_rows = ((fixed_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        query_head_rows = token_rows * H
+        output_group_rows = O_GROUPS * packed_rows
+        q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
+        attn_sink_col = pl.reshape(attn_sink, [H, 1])
+        o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
 
-    # Statistics use wave-local row indices, so all waves reuse one scratch.
-    qk_query_blocks = (wave_rows + STAGED_SWA_QUERIES_PER_BLOCK - 1) // STAGED_SWA_QUERIES_PER_BLOCK
-    with pl.spmd(qk_query_blocks, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
-        qk_query_start = pl.tile.get_block_idx() * STAGED_SWA_QUERIES_PER_BLOCK
-        for qk_query_offset in pl.range(STAGED_SWA_QUERIES_PER_BLOCK):
-            qk_local_t = qk_query_start + qk_query_offset
-            qk_t = query_base + qk_local_t
-            if qk_local_t < wave_rows and qk_t < active_rows:
-                qk_s0 = qk_t * kv_query_stride + kv_row_origin
-                qk_token_base = qk_local_t * H
-                qk_bias_row = sparse_bias[qk_t : qk_t + 1, 0:PREFILL_ATTN_TILE]
-                qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
-                for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                    qk_head_row = qk_t * H + qk_hb * QK_M_TILE
-                    qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
-                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                    qk_mi = pl.row_max(qk_scores)
-                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                    qk_li = pl.row_sum(qk_exp)
-                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                    qk_row = qk_token_base + qk_hb * QK_M_TILE
-                    sparse_blk_mi[qk_row : qk_row + QK_M_TILE, :] = qk_mi
-                    sparse_blk_li[qk_row : qk_row + QK_M_TILE, :] = qk_li
-                    sparse_blk_oi[qk_row : qk_row + QK_M_TILE, :] = qk_oi
+        # Statistics use wave-local row indices, so all waves reuse one scratch.
+        qk_query_blocks = (wave_rows + STAGED_SWA_QUERIES_PER_BLOCK - 1) // STAGED_SWA_QUERIES_PER_BLOCK
+        with pl.spmd(qk_query_blocks, name_hint="staged_swa_qk_pv", deps=[source_ready_tid]) as qk_tid:
+            qk_query_start = pl.tile.get_block_idx() * STAGED_SWA_QUERIES_PER_BLOCK
+            for qk_query_offset in pl.range(STAGED_SWA_QUERIES_PER_BLOCK):
+                qk_local_t = qk_query_start + qk_query_offset
+                qk_t = query_base + qk_local_t
+                if qk_local_t < wave_rows and qk_t < active_rows:
+                    qk_s0 = qk_t * kv_query_stride + kv_row_origin
+                    qk_token_base = qk_local_t * H
+                    qk_bias_row = sparse_bias[qk_t : qk_t + 1, 0:PREFILL_ATTN_TILE]
+                    qk_kv_k = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                    qk_kv_v = sparse_kv[qk_s0 : qk_s0 + PREFILL_ATTN_TILE, :]
+                    for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                        qk_head_row = qk_t * H + qk_hb * QK_M_TILE
+                        qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, :]
+                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                        qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                        qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                        qk_mi = pl.row_max(qk_scores)
+                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                        qk_li = pl.row_sum(qk_exp)
+                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                        qk_row = qk_token_base + qk_hb * QK_M_TILE
+                        sparse_blk_mi[qk_row : qk_row + QK_M_TILE, :] = qk_mi
+                        sparse_blk_li[qk_row : qk_row + QK_M_TILE, :] = qk_li
+                        sparse_blk_oi[qk_row : qk_row + QK_M_TILE, :] = qk_oi
 
-    # MERGE_ROWS query rows per block: the per-row work is unchanged, the block
-    # count (and its scheduler cost) drops MERGE_ROWS-fold.
-    with pl.spmd(
-        (wave_rows + MERGE_ROWS - 1) // MERGE_ROWS, name_hint="staged_swa_merge_rope_pack",
-        deps=[qk_tid, merge_ready_tid],
-    ) as merge_tid:
-        # Flat pair-swap index into a [1, HEAD_TILE * HEAD_DIM] view of one head
-        # tile: one gather row instead of a MERGE_TILE-iteration row loop.
-        flat_k = pl.cast(pl.arange(0, [1, MERGE_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        flat_row = pl.cast(pl.cast(pl.mul(flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        flat_col = pl.sub(flat_k, pl.mul(flat_row, ROPE_DIM_F))
-        flat_pair = pl.cast(pl.cast(pl.mul(flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        flat_lane = pl.sub(flat_col, pl.mul(flat_pair, 2.0))
-        flat_swap_col = pl.sub(pl.add(flat_col, 1.0), pl.mul(flat_lane, 2.0))
-        m_swap_flat_idx = pl.cast(
-            pl.add(pl.add(pl.mul(flat_row, HEAD_DIM_F), NOPE_DIM_F), flat_swap_col),
-            target_type=pl.INT32,
-        )
-        for m_row_off in pl.range(MERGE_ROWS):
-            m_local_t = pl.tile.get_block_idx() * MERGE_ROWS + m_row_off
-            m_t = query_base + m_local_t
-            if m_local_t < wave_rows and m_t < active_rows:
-                m_token_base = m_local_t * H
-                m_cos_il = rope_cos_il[m_t : m_t + 1, :]
-                m_sin_signed = rope_sin_signed[m_t : m_t + 1, :]
-                for m_h_idx in pl.range(H // MERGE_TILE):
-                    m_h0 = m_h_idx * MERGE_TILE
-                    m_blk_base = m_token_base + m_h0
-                    m_mi = sparse_blk_mi[m_blk_base : m_blk_base + MERGE_TILE, :]
-                    m_li = sparse_blk_li[m_blk_base : m_blk_base + MERGE_TILE, :]
-                    m_oi = sparse_blk_oi[m_blk_base : m_blk_base + MERGE_TILE, :]
-                    sink_bias = attn_sink_col[m_h0 : m_h0 + MERGE_TILE, :]
-                    sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
-                    denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
-                    n_full = pl.row_expand_div(m_oi, denom)[0:MERGE_TILE, :]
-                    n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-
-                    m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-                    n_flat = pl.reshape(n_full, [1, MERGE_TILE * HEAD_DIM])
-                    m_swapped = pl.reshape(
-                        pl.gather(n_flat, dim=-1, index=m_swap_flat_idx), [MERGE_TILE, ROPE_DIM],
-                    )
-                    m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-                    n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-
-                    if MERGE_TILE % HEADS_PER_GROUP == 0:
-                        m_g0 = m_h0 // HEADS_PER_GROUP
-                        for m_sg in pl.unroll(MERGE_TILE // HEADS_PER_GROUP):
-                            m_src_h0 = m_sg * HEADS_PER_GROUP
-                            m_pack_row = (m_g0 + m_sg) * packed_rows + m_t
-                            m_dst_head = m_pack_row * HEADS_PER_GROUP
-                            pl.assemble(
-                                o_packed_heads,
-                                n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM],
-                                [m_dst_head, 0],
-                            )
-                            pl.assemble(
-                                o_packed_heads,
-                                n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM],
-                                [m_dst_head, NOPE_DIM],
-                            )
-                    else:
-                        for m_hi in pl.range(MERGE_TILE):
-                            m_gh = m_h0 + m_hi
-                            m_g = m_gh // HEADS_PER_GROUP
-                            m_pack_row = m_g * packed_rows + m_t
-                            m_col = (m_gh - m_g * HEADS_PER_GROUP) * HEAD_DIM
-                            o_packed[
-                                m_pack_row : m_pack_row + 1,
-                                m_col : m_col + NOPE_DIM,
-                            ] = n_bf16[m_hi : m_hi + 1, 0:NOPE_DIM]
-                            o_packed[
-                                m_pack_row : m_pack_row + 1,
-                                m_col + NOPE_DIM : m_col + HEAD_DIM,
-                            ] = n_rope_bf16[m_hi : m_hi + 1, 0:ROPE_DIM]
-
-    return merge_tid
-
-
-@pl.jit.inline(auto_scope=False)
-def _staged_swa_heads(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    packed_init_tid: pl.Scalar[pl.TASK_ID],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    kv_query_stride: pl.Scalar[pl.INDEX],
-    kv_row_origin: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Write a segment through serial reusable query waves."""
-    token_rows = pl.tensor.dim(q, 0)
-    rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
-    merge_tids = pl.array.create(2, pl.TASK_ID)
-    merge_tids[0] = packed_init_tid
-    merge_tids[1] = packed_init_tid
-    with pl.scope():
-        sparse_blk_mi0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-        sparse_blk_li0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-        sparse_blk_oi0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
-        sparse_blk_mi1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-        sparse_blk_li1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
-        sparse_blk_oi1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
-        rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
-        # The tables read only the caller's RoPE rows (tracked by their tensors),
-        # so they need not wait for the staged KV sources behind prior_dep.
-        rope_cs_ready = pl.system.task_dummy(deps=[])
-        rope_cs_tid = _staged_attn_prepare_rope(
-            freqs_cos,
-            freqs_sin,
-            rope_cos_il,
-            rope_sin_signed,
-            rope_swap_idx,
-            active_rows,
-            rope_cs_ready,
-        )
-        wave_ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
-        merge_tids[0] = wave_ready_tid
-        merge_tids[1] = wave_ready_tid
-        # Waves alternate between two statistics buffers, so wave k's QK/PV only
-        # waits for wave k-2's merge and overlaps wave k-1's. The loop is unrolled
-        # to SEGMENT_ROWS // STAGED_SWA_QUERY_TILE so the slot is a compile-time
-        # constant; every wave past the active rows is skipped by its guard.
-        w0_query_base = 0 * STAGED_SWA_QUERY_TILE
-        w0_prior_merge_tid = merge_tids[0]
-        w0_merge_tid = w0_prior_merge_tid
-        if w0_query_base < active_rows:
-            w0_merge_tid = _staged_swa_compact_wave(
-                q,
-                sparse_kv,
-                sparse_bias,
-                valid_block_mask,
-                attn_sink,
-                active_rows,
-                o_packed_heads,
-                sparse_blk_mi0,
-                sparse_blk_li0,
-                sparse_blk_oi0,
-                rope_cos_il,
-                rope_sin_signed,
-                rope_swap_idx,
-                w0_prior_merge_tid,
-                w0_prior_merge_tid,
-                w0_query_base,
-                kv_query_stride,
-                kv_row_origin,
+        # MERGE_ROWS query rows per block: the per-row work is unchanged, the block
+        # count (and its scheduler cost) drops MERGE_ROWS-fold.
+        with pl.spmd(
+            (wave_rows + MERGE_ROWS - 1) // MERGE_ROWS, name_hint="staged_swa_merge_rope_pack",
+            deps=[qk_tid, merge_ready_tid],
+        ) as merge_tid:
+            # Flat pair-swap index into a [1, HEAD_TILE * HEAD_DIM] view of one head
+            # tile: one gather row instead of a MERGE_TILE-iteration row loop.
+            flat_k = pl.cast(pl.arange(0, [1, MERGE_TILE * ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+            flat_row = pl.cast(pl.cast(pl.mul(flat_k, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            flat_col = pl.sub(flat_k, pl.mul(flat_row, ROPE_DIM_F))
+            flat_pair = pl.cast(pl.cast(pl.mul(flat_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            flat_lane = pl.sub(flat_col, pl.mul(flat_pair, 2.0))
+            flat_swap_col = pl.sub(pl.add(flat_col, 1.0), pl.mul(flat_lane, 2.0))
+            m_swap_flat_idx = pl.cast(
+                pl.add(pl.add(pl.mul(flat_row, HEAD_DIM_F), NOPE_DIM_F), flat_swap_col),
+                target_type=pl.INT32,
             )
-        merge_tids[0] = w0_merge_tid
-        w1_query_base = 1 * STAGED_SWA_QUERY_TILE
-        w1_prior_merge_tid = merge_tids[1]
-        w1_merge_tid = w1_prior_merge_tid
-        if w1_query_base < active_rows:
-            w1_merge_tid = _staged_swa_compact_wave(
-                q,
-                sparse_kv,
-                sparse_bias,
-                valid_block_mask,
-                attn_sink,
-                active_rows,
-                o_packed_heads,
-                sparse_blk_mi1,
-                sparse_blk_li1,
-                sparse_blk_oi1,
-                rope_cos_il,
-                rope_sin_signed,
-                rope_swap_idx,
-                w1_prior_merge_tid,
-                w1_prior_merge_tid,
-                w1_query_base,
-                kv_query_stride,
-                kv_row_origin,
-            )
-        merge_tids[1] = w1_merge_tid
-        w2_query_base = 2 * STAGED_SWA_QUERY_TILE
-        w2_prior_merge_tid = merge_tids[0]
-        w2_merge_tid = w2_prior_merge_tid
-        if w2_query_base < active_rows:
-            w2_merge_tid = _staged_swa_compact_wave(
-                q,
-                sparse_kv,
-                sparse_bias,
-                valid_block_mask,
-                attn_sink,
-                active_rows,
-                o_packed_heads,
-                sparse_blk_mi0,
-                sparse_blk_li0,
-                sparse_blk_oi0,
-                rope_cos_il,
-                rope_sin_signed,
-                rope_swap_idx,
-                w2_prior_merge_tid,
-                w2_prior_merge_tid,
-                w2_query_base,
-                kv_query_stride,
-                kv_row_origin,
-            )
-        merge_tids[0] = w2_merge_tid
-        w3_query_base = 3 * STAGED_SWA_QUERY_TILE
-        w3_prior_merge_tid = merge_tids[1]
-        w3_merge_tid = w3_prior_merge_tid
-        if w3_query_base < active_rows:
-            w3_merge_tid = _staged_swa_compact_wave(
-                q,
-                sparse_kv,
-                sparse_bias,
-                valid_block_mask,
-                attn_sink,
-                active_rows,
-                o_packed_heads,
-                sparse_blk_mi1,
-                sparse_blk_li1,
-                sparse_blk_oi1,
-                rope_cos_il,
-                rope_sin_signed,
-                rope_swap_idx,
-                w3_prior_merge_tid,
-                w3_prior_merge_tid,
-                w3_query_base,
-                kv_query_stride,
-                kv_row_origin,
-            )
-        merge_tids[1] = w3_merge_tid
+            for m_row_off in pl.range(MERGE_ROWS):
+                m_local_t = pl.tile.get_block_idx() * MERGE_ROWS + m_row_off
+                m_t = query_base + m_local_t
+                if m_local_t < wave_rows and m_t < active_rows:
+                    m_token_base = m_local_t * H
+                    m_cos_il = rope_cos_il[m_t : m_t + 1, :]
+                    m_sin_signed = rope_sin_signed[m_t : m_t + 1, :]
+                    for m_h_idx in pl.range(H // MERGE_TILE):
+                        m_h0 = m_h_idx * MERGE_TILE
+                        m_blk_base = m_token_base + m_h0
+                        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + MERGE_TILE, :]
+                        m_li = sparse_blk_li[m_blk_base : m_blk_base + MERGE_TILE, :]
+                        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + MERGE_TILE, :]
+                        sink_bias = attn_sink_col[m_h0 : m_h0 + MERGE_TILE, :]
+                        sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
+                        denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
+                        n_full = pl.row_expand_div(m_oi, denom)[0:MERGE_TILE, :]
+                        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-    return o_packed_heads, pl.system.task_dummy(deps=[merge_tids[0], merge_tids[1]])
-
-
-@pl.jit.inline(auto_scope=False)
-def _physical_sparse_wave(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
-    sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP16],
-    rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
-    raw_ready_tid: pl.Scalar[pl.TASK_ID],
-    compressed_ready_tid: pl.Scalar[pl.TASK_ID],
-    merge_ready_tid: pl.Scalar[pl.TASK_ID],
-    CONTIGUOUS_CMP_PAGES: pl.constexpr,
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run one DSpark-style gather/QK-PV/merge wave from physical roots."""
-    token_rows = pl.tensor.dim(q, 0)
-    source_rows = pl.tensor.dim(sparse_kv, 0)
-    source_view = pl.reshape(sparse_kv, [source_rows, HEAD_DIM])
-    ori_block_num = pl.tensor.dim(ori_kv, 0)
-    ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_page_rows = pl.tensor.dim(cmp_kv, 1)
-    cmp_cache_rows = cmp_block_num * cmp_page_rows
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-    cmp_page_size = pl.cast(cmp_page_rows, pl.INT32)
-    cmp_page_count = pl.cast(cmp_block_num, pl.INT32)
-    gather_blocks = (token_rows + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
-    gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
-
-    # This is the post-0.60 DSpark donor contract: ``swa_indices`` already
-    # contains physical rows in a page-128 root, with -1 for invalid entries.
-    gather_ori_blocks = (token_rows + ORI_GATHER_TOKEN_TILE - 1) // ORI_GATHER_TOKEN_TILE
-    with pl.spmd(gather_ori_blocks, name_hint="physical_sparse_gather_ori", deps=[raw_ready_tid]) as gather_ori_tid:
-        gather_schedule_block = pl.tile.get_block_idx()
-        gather_token_block = gather_ori_blocks - 1 - gather_schedule_block
-        gather_local_t0 = gather_token_block * ORI_GATHER_TOKEN_TILE
-        for gather_dt in pl.range(ORI_GATHER_TOKEN_TILE):
-            gather_local_t = gather_local_t0 + gather_dt
-            gather_t = gather_local_t
-            if gather_t < active_rows:
-                block_base = gather_local_t * PREFILL_SPARSE_PAD
-                # One MGATHER row gather per query replaces PREFILL_ATTN_TILE scalar
-                # index reads plus that many single-row copies.
-                #
-                # Slots outside the window hold -1, and physical_sparse_build_bias
-                # already masks their columns with -inf, so their gathered rows are
-                # multiplied by an exactly-zero probability. They therefore only have
-                # to be a real initialised row, not a zero one. Right-aligned CP
-                # windows put the query's own row at WIN - 1; left-aligned short
-                # windows may leave that slot invalid, so fall back to row zero.
-                # Both avoid MGATHER's expensive out-of-bounds path.
-                gather_own = pl.max(pl.read(swa_indices, [gather_t, WIN - 1]), pl.cast(0, pl.INT32))
-                gather_idx = pl.load(swa_indices, [gather_t, 0], [1, PREFILL_ATTN_TILE])
-                gather_flag = pl.minimum(pl.maximum(pl.add(gather_idx, 1), 0), 1)
-                gather_fix = pl.add(pl.mul(gather_flag, pl.sub(gather_idx, gather_own)), gather_own)
-                ori_stage = pl.tile.mgather(ori_kv_flat, gather_fix, coalesce="row")
-                pl.store(ori_stage, [block_base, 0], source_view)
-
-    cmp_block_table_view = pl.reshape(cmp_block_table, [1, CMP_MAX_BLOCKS])
-    with pl.spmd(gather_cmp_blocks, name_hint="physical_sparse_gather_cmp", deps=[compressed_ready_tid]) as gather_cmp_tid:
-        gather_block = pl.tile.get_block_idx()
-        gather_schedule_block = (gather_block // (PREFILL_ATTN_BLOCKS - 1))
-        gather_token_block = gather_blocks - 1 - gather_schedule_block
-        gather_sb = (gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1)
-        gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
-        gather_k0 = gather_sb * PREFILL_ATTN_TILE
-        for gather_dt in pl.range(GATHER_TOKEN_TILE):
-            gather_local_t = gather_local_t0 + gather_dt
-            gather_t = gather_local_t
-            if gather_t < active_rows:
-                gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
-                if gather_block_valid > 0:
-                    block_base = (gather_local_t * PREFILL_SPARSE_PAD + gather_k0)
-                    if cmp_page_size == 128:
-                        gather_cmp_start = gather_k0 - WIN
-                        gather_cmp_valid = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_start)
-                        gather_slots = pl.load(
-                            cmp_indices, [gather_t, gather_cmp_start], [1, PREFILL_ATTN_TILE],
-                            valid_shape=[1, gather_cmp_valid],
+                        m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
+                        n_flat = pl.reshape(n_full, [1, MERGE_TILE * HEAD_DIM])
+                        m_swapped = pl.reshape(
+                            pl.gather(n_flat, dim=-1, index=m_swap_flat_idx), [MERGE_TILE, ROPE_DIM],
                         )
-                        gather_slots = pl.tile.fillpad(gather_slots, pad_value=pl.PadValue.min)
-                        gather_slots_plus_one = pl.add(gather_slots, 1)
-                        gather_slots_positive = pl.maximum(gather_slots_plus_one, 0)
-                        gather_slot_valid = pl.minimum(gather_slots_positive, 1)
-                        gather_slots_nonnegative = pl.maximum(gather_slots, 0)
-                        gather_logical_blocks = pl.tile.shrs(gather_slots_nonnegative, 7)
-                        gather_page_starts = pl.mul(gather_logical_blocks, 128)
-                        gather_rows = pl.sub(gather_slots_nonnegative, gather_page_starts)
-                        gather_negative_blocks = pl.mul(gather_logical_blocks, -1)
-                        gather_table_distance = pl.add(gather_negative_blocks, CMP_MAX_BLOCKS)
-                        gather_table_nonnegative = pl.maximum(gather_table_distance, 0)
-                        gather_table_valid = pl.minimum(gather_table_nonnegative, 1)
-                        gather_nonnegative_blocks = pl.maximum(gather_logical_blocks, 0)
-                        gather_table_indices = pl.minimum(gather_nonnegative_blocks, CMP_MAX_BLOCKS - 1)
-                        if CONTIGUOUS_CMP_PAGES:
-                            # CP roots reserve page zero and store logical page p at p + 1.
-                            gather_page_offset = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
-                            gather_pages = pl.add(gather_page_offset, gather_logical_blocks)
+                        m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
+                        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+
+                        if MERGE_TILE % HEADS_PER_GROUP == 0:
+                            m_g0 = m_h0 // HEADS_PER_GROUP
+                            for m_sg in pl.unroll(MERGE_TILE // HEADS_PER_GROUP):
+                                m_src_h0 = m_sg * HEADS_PER_GROUP
+                                m_pack_row = (m_g0 + m_sg) * packed_rows + m_t
+                                m_dst_head = m_pack_row * HEADS_PER_GROUP
+                                pl.assemble(
+                                    o_packed_heads,
+                                    n_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM],
+                                    [m_dst_head, 0],
+                                )
+                                pl.assemble(
+                                    o_packed_heads,
+                                    n_rope_bf16[m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM],
+                                    [m_dst_head, NOPE_DIM],
+                                )
                         else:
-                            gather_table = pl.load(cmp_block_table_view, [0, 0], [1, CMP_MAX_BLOCKS])
-                            gather_table_tmp = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
-                            gather_pages = pl.tile.gather(gather_table, gather_table_indices, gather_table_tmp)
-                        gather_pages_plus_one = pl.add(gather_pages, 1)
-                        gather_pages_positive = pl.maximum(gather_pages_plus_one, 0)
-                        gather_page_nonnegative = pl.minimum(gather_pages_positive, 1)
-                        gather_negative_pages = pl.mul(gather_pages, -1)
-                        gather_page_distance = pl.add(gather_negative_pages, cmp_page_count)
-                        gather_page_distance_positive = pl.maximum(gather_page_distance, 0)
-                        gather_page_in_range = pl.minimum(gather_page_distance_positive, 1)
-                        gather_logical_valid = pl.mul(gather_slot_valid, gather_table_valid)
-                        gather_physical_valid = pl.mul(gather_page_nonnegative, gather_page_in_range)
-                        gather_valid = pl.mul(gather_logical_valid, gather_physical_valid)
-                        gather_physical_page_starts = pl.mul(gather_pages, 128)
-                        gather_physical_rows = pl.add(gather_physical_page_starts, gather_rows)
-                        gather_rows_plus_one = pl.add(gather_physical_rows, 1)
-                        gather_masked_rows = pl.mul(gather_valid, gather_rows_plus_one)
-                        gather_vector_rows = pl.sub(gather_masked_rows, 1)
-                        gather_safe_rows = pl.maximum(gather_vector_rows, 0)
-                        # Eight INT32 rows satisfy the 32-byte reduction-column alignment.
-                        gather_reduce_ones = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
-                        gather_valid_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid)
-                        gather_reduce_tmp = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
-                        gather_count_tile = pl.tile.row_sum(gather_valid_matrix, gather_reduce_tmp)
-                        gather_count = pl.tile.read(gather_count_tile, [0, 0])
-                        gather_valid_count = pl.cast(gather_count, pl.INDEX)
-                        gather_lane_ends = pl.tile.arange(1, [1, PREFILL_ATTN_TILE], dtype=pl.INT32)
-                        gather_valid_ends = pl.mul(gather_lane_ends, gather_valid)
-                        gather_end_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid_ends)
-                        gather_end_tile = pl.tile.row_max(gather_end_matrix, gather_reduce_tmp)
-                        gather_end = pl.tile.read(gather_end_tile, [0, 0])
-                        gather_valid_end = pl.cast(gather_end, pl.INDEX)
-                        if gather_valid_count == 0:
-                            gather_empty_stage = pl.tile.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                            pl.store(gather_empty_stage, [block_base, 0], source_view)
-                        elif gather_valid_end == gather_valid_count:
-                            gather_prefix_indices = pl.tile.set_validshape(gather_safe_rows, 1, gather_valid_count)
-                            gather_prefix_stage = pl.tile.mgather(cmp_kv_flat, gather_prefix_indices, coalesce="row")
-                            gather_prefix_filled = pl.tile.fillpad_inplace(gather_prefix_stage)
-                            gather_prefix_full = pl.tile.set_validshape(gather_prefix_filled, PREFILL_ATTN_TILE, HEAD_DIM)
-                            pl.store(gather_prefix_full, [block_base, 0], source_view)
-                        else:
-                            gather_mask_ones = pl.tile.full([HEAD_DIM // 32, PREFILL_ATTN_TILE], dtype=pl.INT32, value=-1)
-                            gather_mask_columns = pl.tile.col_expand_mul(gather_mask_ones, gather_valid)
-                            gather_mask_words = pl.tile.transpose(gather_mask_columns, axis1=0, axis2=1)
-                            gather_mask = pl.tile.reinterpret_view(gather_mask_words, pl.UINT8)
-                            vector_stage = pl.tile.mgather(cmp_kv_flat, gather_safe_rows, coalesce="row")
-                            vector_stage_fp16 = pl.tile.reinterpret_view(vector_stage, pl.FP16)
-                            gather_select_tmp = pl.tile.full([1, HEAD_DIM], dtype=pl.FP16, value=0.0)
-                            gather_zero = pl.cast(0.0, pl.FP16)
-                            vector_selected_fp16 = pl.tile.sels(
-                                gather_mask, vector_stage_fp16, gather_select_tmp, gather_zero,
+                            for m_hi in pl.range(MERGE_TILE):
+                                m_gh = m_h0 + m_hi
+                                m_g = m_gh // HEADS_PER_GROUP
+                                m_pack_row = m_g * packed_rows + m_t
+                                m_col = (m_gh - m_g * HEADS_PER_GROUP) * HEAD_DIM
+                                o_packed[
+                                    m_pack_row : m_pack_row + 1,
+                                    m_col : m_col + NOPE_DIM,
+                                ] = n_bf16[m_hi : m_hi + 1, 0:NOPE_DIM]
+                                o_packed[
+                                    m_pack_row : m_pack_row + 1,
+                                    m_col + NOPE_DIM : m_col + HEAD_DIM,
+                                ] = n_rope_bf16[m_hi : m_hi + 1, 0:ROPE_DIM]
+
+        return merge_tid
+
+    return _staged_swa_compact_wave
+
+
+_staged_swa_compact_wave = make_staged_swa_compact_wave()
+
+
+def make_staged_swa_heads(fixed_rows=0):
+    planned_wave = make_staged_swa_compact_wave(fixed_rows)
+    planned_rope = make_staged_attn_prepare_rope(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def _staged_swa_heads(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        packed_init_tid: pl.Scalar[pl.TASK_ID],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+        kv_query_stride: pl.Scalar[pl.INDEX],
+        kv_row_origin: pl.Scalar[pl.INDEX],
+    ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+        """Write a segment through serial reusable query waves."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
+        merge_tids = pl.array.create(2, pl.TASK_ID)
+        merge_tids[0] = packed_init_tid
+        merge_tids[1] = packed_init_tid
+        with pl.scope():
+            sparse_blk_mi0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+            sparse_blk_li0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+            sparse_blk_oi0 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
+            sparse_blk_mi1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+            sparse_blk_li1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, 1], dtype=pl.FP32)
+            sparse_blk_oi1 = pl.create_tensor([STAGED_SWA_QUERY_STATS_ROWS, HEAD_DIM], dtype=pl.FP32)
+            rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
+            # The tables read only the caller's RoPE rows (tracked by their tensors),
+            # so they need not wait for the staged KV sources behind prior_dep.
+            rope_cs_ready = pl.system.task_dummy(deps=[])
+            rope_cs_tid = planned_rope(
+                freqs_cos,
+                freqs_sin,
+                rope_cos_il,
+                rope_sin_signed,
+                rope_swap_idx,
+                active_rows,
+                rope_cs_ready,
+            )
+            wave_ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_cs_tid])
+            merge_tids[0] = wave_ready_tid
+            merge_tids[1] = wave_ready_tid
+            # Waves alternate between two statistics buffers, so wave k's QK/PV only
+            # waits for wave k-2's merge and overlaps wave k-1's. The loop is unrolled
+            # to SEGMENT_ROWS // STAGED_SWA_QUERY_TILE so the slot is a compile-time
+            # constant; every wave past the active rows is skipped by its guard.
+            w0_query_base = 0 * STAGED_SWA_QUERY_TILE
+            w0_prior_merge_tid = merge_tids[0]
+            w0_merge_tid = w0_prior_merge_tid
+            if fixed_rows > 0 or w0_query_base < active_rows:
+                w0_merge_tid = planned_wave(
+                    q,
+                    sparse_kv,
+                    sparse_bias,
+                    valid_block_mask,
+                    attn_sink,
+                    active_rows,
+                    o_packed_heads,
+                    sparse_blk_mi0,
+                    sparse_blk_li0,
+                    sparse_blk_oi0,
+                    rope_cos_il,
+                    rope_sin_signed,
+                    rope_swap_idx,
+                    w0_prior_merge_tid,
+                    w0_prior_merge_tid,
+                    w0_query_base,
+                    kv_query_stride,
+                    kv_row_origin,
+                )
+            merge_tids[0] = w0_merge_tid
+            w1_query_base = 1 * STAGED_SWA_QUERY_TILE
+            w1_prior_merge_tid = merge_tids[1]
+            w1_merge_tid = w1_prior_merge_tid
+            if fixed_rows > 0 or w1_query_base < active_rows:
+                w1_merge_tid = planned_wave(
+                    q,
+                    sparse_kv,
+                    sparse_bias,
+                    valid_block_mask,
+                    attn_sink,
+                    active_rows,
+                    o_packed_heads,
+                    sparse_blk_mi1,
+                    sparse_blk_li1,
+                    sparse_blk_oi1,
+                    rope_cos_il,
+                    rope_sin_signed,
+                    rope_swap_idx,
+                    w1_prior_merge_tid,
+                    w1_prior_merge_tid,
+                    w1_query_base,
+                    kv_query_stride,
+                    kv_row_origin,
+                )
+            merge_tids[1] = w1_merge_tid
+            w2_query_base = 2 * STAGED_SWA_QUERY_TILE
+            w2_prior_merge_tid = merge_tids[0]
+            w2_merge_tid = w2_prior_merge_tid
+            if fixed_rows > 0 or w2_query_base < active_rows:
+                w2_merge_tid = planned_wave(
+                    q,
+                    sparse_kv,
+                    sparse_bias,
+                    valid_block_mask,
+                    attn_sink,
+                    active_rows,
+                    o_packed_heads,
+                    sparse_blk_mi0,
+                    sparse_blk_li0,
+                    sparse_blk_oi0,
+                    rope_cos_il,
+                    rope_sin_signed,
+                    rope_swap_idx,
+                    w2_prior_merge_tid,
+                    w2_prior_merge_tid,
+                    w2_query_base,
+                    kv_query_stride,
+                    kv_row_origin,
+                )
+            merge_tids[0] = w2_merge_tid
+            w3_query_base = 3 * STAGED_SWA_QUERY_TILE
+            w3_prior_merge_tid = merge_tids[1]
+            w3_merge_tid = w3_prior_merge_tid
+            if fixed_rows > 0 or w3_query_base < active_rows:
+                w3_merge_tid = planned_wave(
+                    q,
+                    sparse_kv,
+                    sparse_bias,
+                    valid_block_mask,
+                    attn_sink,
+                    active_rows,
+                    o_packed_heads,
+                    sparse_blk_mi1,
+                    sparse_blk_li1,
+                    sparse_blk_oi1,
+                    rope_cos_il,
+                    rope_sin_signed,
+                    rope_swap_idx,
+                    w3_prior_merge_tid,
+                    w3_prior_merge_tid,
+                    w3_query_base,
+                    kv_query_stride,
+                    kv_row_origin,
+                )
+            merge_tids[1] = w3_merge_tid
+
+        return o_packed_heads, pl.system.task_dummy(deps=[merge_tids[0], merge_tids[1]])
+
+    return _staged_swa_heads
+
+
+_staged_swa_heads = make_staged_swa_heads()
+
+
+def make_physical_sparse_wave(fixed_rows=0):
+    planned_staged_wave = make_staged_sparse_wave(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def _physical_sparse_wave(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        sparse_blk_mi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        sparse_blk_li: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, 1], pl.FP32],
+        sparse_blk_oi: pl.Tensor[[PREFILL_ATTN_STATS_ROWS_DYN, HEAD_DIM], pl.FP16],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
+        raw_ready_tid: pl.Scalar[pl.TASK_ID],
+        compressed_ready_tid: pl.Scalar[pl.TASK_ID],
+        merge_ready_tid: pl.Scalar[pl.TASK_ID],
+        CONTIGUOUS_CMP_PAGES: pl.constexpr,
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Run one DSpark-style gather/QK-PV/merge wave from physical roots."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        source_rows = pl.tensor.dim(sparse_kv, 0)
+        source_view = pl.reshape(sparse_kv, [source_rows, HEAD_DIM])
+        ori_block_num = pl.tensor.dim(ori_kv, 0)
+        ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
+        cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+        cmp_page_rows = pl.tensor.dim(cmp_kv, 1)
+        cmp_cache_rows = cmp_block_num * cmp_page_rows
+        cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+        cmp_page_size = pl.cast(cmp_page_rows, pl.INT32)
+        cmp_page_count = pl.cast(cmp_block_num, pl.INT32)
+        gather_blocks = (token_rows + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE
+        gather_cmp_blocks = gather_blocks * (PREFILL_ATTN_BLOCKS - 1)
+
+        # This is the post-0.60 DSpark donor contract: ``swa_indices`` already
+        # contains physical rows in a page-128 root, with -1 for invalid entries.
+        gather_ori_blocks = (token_rows + ORI_GATHER_TOKEN_TILE - 1) // ORI_GATHER_TOKEN_TILE
+        with pl.spmd(gather_ori_blocks, name_hint="physical_sparse_gather_ori", deps=[raw_ready_tid]) as gather_ori_tid:
+            gather_schedule_block = pl.tile.get_block_idx()
+            gather_token_block = gather_ori_blocks - 1 - gather_schedule_block
+            gather_local_t0 = gather_token_block * ORI_GATHER_TOKEN_TILE
+            for gather_dt in pl.range(ORI_GATHER_TOKEN_TILE):
+                gather_local_t = gather_local_t0 + gather_dt
+                gather_t = gather_local_t
+                if gather_t < active_rows:
+                    block_base = gather_local_t * PREFILL_SPARSE_PAD
+                    # One MGATHER row gather per query replaces PREFILL_ATTN_TILE scalar
+                    # index reads plus that many single-row copies.
+                    #
+                    # Slots outside the window hold -1, and physical_sparse_build_bias
+                    # already masks their columns with -inf, so their gathered rows are
+                    # multiplied by an exactly-zero probability. They therefore only have
+                    # to be a real initialised row, not a zero one. Right-aligned CP
+                    # windows put the query's own row at WIN - 1; left-aligned short
+                    # windows may leave that slot invalid, so fall back to row zero.
+                    # Both avoid MGATHER's expensive out-of-bounds path.
+                    gather_own = pl.max(pl.read(swa_indices, [gather_t, WIN - 1]), pl.cast(0, pl.INT32))
+                    gather_idx = pl.load(swa_indices, [gather_t, 0], [1, PREFILL_ATTN_TILE])
+                    gather_flag = pl.minimum(pl.maximum(pl.add(gather_idx, 1), 0), 1)
+                    gather_fix = pl.add(pl.mul(gather_flag, pl.sub(gather_idx, gather_own)), gather_own)
+                    ori_stage = pl.tile.mgather(ori_kv_flat, gather_fix, coalesce="row")
+                    pl.store(ori_stage, [block_base, 0], source_view)
+
+        cmp_block_table_view = pl.reshape(cmp_block_table, [1, CMP_MAX_BLOCKS])
+        with pl.spmd(gather_cmp_blocks, name_hint="physical_sparse_gather_cmp", deps=[compressed_ready_tid]) as gather_cmp_tid:
+            gather_block = pl.tile.get_block_idx()
+            gather_schedule_block = (gather_block // (PREFILL_ATTN_BLOCKS - 1))
+            gather_token_block = gather_blocks - 1 - gather_schedule_block
+            gather_sb = (gather_block - gather_schedule_block * (PREFILL_ATTN_BLOCKS - 1) + 1)
+            gather_local_t0 = gather_token_block * GATHER_TOKEN_TILE
+            gather_k0 = gather_sb * PREFILL_ATTN_TILE
+            for gather_dt in pl.range(GATHER_TOKEN_TILE):
+                gather_local_t = gather_local_t0 + gather_dt
+                gather_t = gather_local_t
+                if gather_t < active_rows:
+                    gather_block_valid = pl.read(valid_block_mask, [gather_t, gather_sb])
+                    if gather_block_valid > 0:
+                        block_base = (gather_local_t * PREFILL_SPARSE_PAD + gather_k0)
+                        if cmp_page_size == 128:
+                            gather_cmp_start = gather_k0 - WIN
+                            gather_cmp_valid = pl.min(PREFILL_ATTN_TILE, IDX_TOPK - gather_cmp_start)
+                            gather_slots = pl.load(
+                                cmp_indices, [gather_t, gather_cmp_start], [1, PREFILL_ATTN_TILE],
+                                valid_shape=[1, gather_cmp_valid],
                             )
-                            vector_selected = pl.tile.reinterpret_view(vector_selected_fp16, pl.BF16)
-                            pl.store(vector_selected, [block_base, 0], source_view)
-                    else:
-                        stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                            gather_cmp_k = gather_k0 + gather_ki - WIN
-                            if gather_cmp_k < IDX_TOPK:
-                                logical_slot = pl.read(cmp_indices, [gather_t, gather_cmp_k])
-                                if logical_slot >= 0:
-                                    logical_block = logical_slot // cmp_page_rows
-                                    if logical_block < CMP_MAX_BLOCKS:
-                                        if CONTIGUOUS_CMP_PAGES:
-                                            physical_block = pl.cast(logical_block + 1, pl.INT32)
-                                        else:
-                                            physical_block = pl.read(cmp_block_table, [logical_block])
-                                        # Validity comes from the indices; physical page 0 is valid
-                                        # in caller-owned MTP cache pools.
-                                        if physical_block >= 0 and physical_block < cmp_block_num:
-                                            page = pl.cast(physical_block, pl.INDEX)
-                                            row = logical_slot % cmp_page_rows
-                                            kv_row = cmp_kv[page:page + 1, row:row + 1, 0:1, 0:HEAD_DIM]
-                                            stage[gather_ki:gather_ki + 1, :] = pl.reshape(kv_row, [1, HEAD_DIM])
-                        source_view[block_base : block_base + PREFILL_ATTN_TILE, 0:HEAD_DIM] = stage
+                            gather_slots = pl.tile.fillpad(gather_slots, pad_value=pl.PadValue.min)
+                            gather_slots_plus_one = pl.add(gather_slots, 1)
+                            gather_slots_positive = pl.maximum(gather_slots_plus_one, 0)
+                            gather_slot_valid = pl.minimum(gather_slots_positive, 1)
+                            gather_slots_nonnegative = pl.maximum(gather_slots, 0)
+                            gather_logical_blocks = pl.tile.shrs(gather_slots_nonnegative, 7)
+                            gather_page_starts = pl.mul(gather_logical_blocks, 128)
+                            gather_rows = pl.sub(gather_slots_nonnegative, gather_page_starts)
+                            gather_negative_blocks = pl.mul(gather_logical_blocks, -1)
+                            gather_table_distance = pl.add(gather_negative_blocks, CMP_MAX_BLOCKS)
+                            gather_table_nonnegative = pl.maximum(gather_table_distance, 0)
+                            gather_table_valid = pl.minimum(gather_table_nonnegative, 1)
+                            gather_nonnegative_blocks = pl.maximum(gather_logical_blocks, 0)
+                            gather_table_indices = pl.minimum(gather_nonnegative_blocks, CMP_MAX_BLOCKS - 1)
+                            if CONTIGUOUS_CMP_PAGES:
+                                # CP roots reserve page zero and store logical page p at p + 1.
+                                gather_page_offset = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
+                                gather_pages = pl.add(gather_page_offset, gather_logical_blocks)
+                            else:
+                                gather_table = pl.load(cmp_block_table_view, [0, 0], [1, CMP_MAX_BLOCKS])
+                                gather_table_tmp = pl.tile.full([1, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
+                                gather_pages = pl.tile.gather(gather_table, gather_table_indices, gather_table_tmp)
+                            gather_pages_plus_one = pl.add(gather_pages, 1)
+                            gather_pages_positive = pl.maximum(gather_pages_plus_one, 0)
+                            gather_page_nonnegative = pl.minimum(gather_pages_positive, 1)
+                            gather_negative_pages = pl.mul(gather_pages, -1)
+                            gather_page_distance = pl.add(gather_negative_pages, cmp_page_count)
+                            gather_page_distance_positive = pl.maximum(gather_page_distance, 0)
+                            gather_page_in_range = pl.minimum(gather_page_distance_positive, 1)
+                            gather_logical_valid = pl.mul(gather_slot_valid, gather_table_valid)
+                            gather_physical_valid = pl.mul(gather_page_nonnegative, gather_page_in_range)
+                            gather_valid = pl.mul(gather_logical_valid, gather_physical_valid)
+                            gather_physical_page_starts = pl.mul(gather_pages, 128)
+                            gather_physical_rows = pl.add(gather_physical_page_starts, gather_rows)
+                            gather_rows_plus_one = pl.add(gather_physical_rows, 1)
+                            gather_masked_rows = pl.mul(gather_valid, gather_rows_plus_one)
+                            gather_vector_rows = pl.sub(gather_masked_rows, 1)
+                            gather_safe_rows = pl.maximum(gather_vector_rows, 0)
+                            # Eight INT32 rows satisfy the 32-byte reduction-column alignment.
+                            gather_reduce_ones = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=1)
+                            gather_valid_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid)
+                            gather_reduce_tmp = pl.tile.full([8, PREFILL_ATTN_TILE], dtype=pl.INT32, value=0)
+                            gather_count_tile = pl.tile.row_sum(gather_valid_matrix, gather_reduce_tmp)
+                            gather_count = pl.tile.read(gather_count_tile, [0, 0])
+                            gather_valid_count = pl.cast(gather_count, pl.INDEX)
+                            gather_lane_ends = pl.tile.arange(1, [1, PREFILL_ATTN_TILE], dtype=pl.INT32)
+                            gather_valid_ends = pl.mul(gather_lane_ends, gather_valid)
+                            gather_end_matrix = pl.tile.col_expand_mul(gather_reduce_ones, gather_valid_ends)
+                            gather_end_tile = pl.tile.row_max(gather_end_matrix, gather_reduce_tmp)
+                            gather_end = pl.tile.read(gather_end_tile, [0, 0])
+                            gather_valid_end = pl.cast(gather_end, pl.INDEX)
+                            if gather_valid_count == 0:
+                                gather_empty_stage = pl.tile.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                                pl.store(gather_empty_stage, [block_base, 0], source_view)
+                            elif gather_valid_end == gather_valid_count:
+                                gather_prefix_indices = pl.tile.set_validshape(gather_safe_rows, 1, gather_valid_count)
+                                gather_prefix_stage = pl.tile.mgather(cmp_kv_flat, gather_prefix_indices, coalesce="row")
+                                gather_prefix_filled = pl.tile.fillpad_inplace(gather_prefix_stage)
+                                gather_prefix_full = pl.tile.set_validshape(gather_prefix_filled, PREFILL_ATTN_TILE, HEAD_DIM)
+                                pl.store(gather_prefix_full, [block_base, 0], source_view)
+                            else:
+                                gather_mask_ones = pl.tile.full([HEAD_DIM // 32, PREFILL_ATTN_TILE], dtype=pl.INT32, value=-1)
+                                gather_mask_columns = pl.tile.col_expand_mul(gather_mask_ones, gather_valid)
+                                gather_mask_words = pl.tile.transpose(gather_mask_columns, axis1=0, axis2=1)
+                                gather_mask = pl.tile.reinterpret_view(gather_mask_words, pl.UINT8)
+                                vector_stage = pl.tile.mgather(cmp_kv_flat, gather_safe_rows, coalesce="row")
+                                vector_stage_fp16 = pl.tile.reinterpret_view(vector_stage, pl.FP16)
+                                gather_select_tmp = pl.tile.full([1, HEAD_DIM], dtype=pl.FP16, value=0.0)
+                                gather_zero = pl.cast(0.0, pl.FP16)
+                                vector_selected_fp16 = pl.tile.sels(
+                                    gather_mask, vector_stage_fp16, gather_select_tmp, gather_zero,
+                                )
+                                vector_selected = pl.tile.reinterpret_view(vector_selected_fp16, pl.BF16)
+                                pl.store(vector_selected, [block_base, 0], source_view)
+                        else:
+                            stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                            for gather_ki in pl.range(PREFILL_ATTN_TILE):
+                                gather_cmp_k = gather_k0 + gather_ki - WIN
+                                if gather_cmp_k < IDX_TOPK:
+                                    logical_slot = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                                    if logical_slot >= 0:
+                                        logical_block = logical_slot // cmp_page_rows
+                                        if logical_block < CMP_MAX_BLOCKS:
+                                            if CONTIGUOUS_CMP_PAGES:
+                                                physical_block = pl.cast(logical_block + 1, pl.INT32)
+                                            else:
+                                                physical_block = pl.read(cmp_block_table, [logical_block])
+                                            # Validity comes from the indices; physical page 0 is valid
+                                            # in caller-owned MTP cache pools.
+                                            if physical_block >= 0 and physical_block < cmp_block_num:
+                                                page = pl.cast(physical_block, pl.INDEX)
+                                                row = logical_slot % cmp_page_rows
+                                                kv_row = cmp_kv[page:page + 1, row:row + 1, 0:1, 0:HEAD_DIM]
+                                                stage[gather_ki:gather_ki + 1, :] = pl.reshape(kv_row, [1, HEAD_DIM])
+                            source_view[block_base : block_base + PREFILL_ATTN_TILE, 0:HEAD_DIM] = stage
 
-    with pl.spmd(
-        (token_rows + BIAS_TOKEN_TILE - 1) // BIAS_TOKEN_TILE,
-        name_hint="physical_sparse_build_bias",
-        deps=[compressed_ready_tid],
-    ) as bias_tid:
-        bias_block = pl.tile.get_block_idx()
-        bias_local_t0 = bias_block * BIAS_TOKEN_TILE
-        bias_t0 = bias_local_t0
-        if bias_t0 < active_rows:
-            bias_rows = pl.min(BIAS_TOKEN_TILE, active_rows - bias_t0)
-            raw_rows = pl.slice(swa_indices, [BIAS_TOKEN_TILE, WIN], [bias_t0, 0], valid_shape=[bias_rows, WIN])
-            raw_index = pl.cast(raw_rows, target_type=pl.FP32)
-            raw_flag = pl.minimum(pl.maximum(pl.add(raw_index, 1.0), 0.0), 1.0)
-            raw_bias = pl.mul(pl.sub(raw_flag, 1.0), -FP32_NEG_INF)
-            raw_bias_valid = pl.slice(raw_bias, [BIAS_TOKEN_TILE, WIN], [0, 0], valid_shape=[bias_rows, WIN])
-            pl.assemble(sparse_bias, raw_bias_valid, [bias_local_t0, 0])
-            if SPARSE_CMP_BIAS_COLS > 0:
-                cmp_rows = pl.slice(
-                    cmp_indices,
-                    [BIAS_TOKEN_TILE, SPARSE_CMP_BIAS_COLS],
-                    [bias_t0, 0],
-                    valid_shape=[bias_rows, SPARSE_CMP_BIAS_COLS],
-                )
-                cmp_index = pl.cast(cmp_rows, target_type=pl.FP32)
-                cmp_flag = pl.minimum(pl.maximum(pl.add(cmp_index, 1.0), 0.0), 1.0)
-                cmp_bias = pl.mul(pl.sub(cmp_flag, 1.0), -FP32_NEG_INF)
-                cmp_bias_valid = pl.slice(cmp_bias, [BIAS_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [0, 0], valid_shape=[bias_rows, SPARSE_CMP_BIAS_COLS])
-                pl.assemble(sparse_bias, cmp_bias_valid, [bias_local_t0, WIN])
-            if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
-                pad_bias = pl.full(
-                    [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS],
-                    dtype=pl.FP32,
-                    value=FP32_NEG_INF,
-                )
-                pad_bias_valid = pl.slice(pad_bias, [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], [0, 0], valid_shape=[bias_rows, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS])
-                pl.assemble(sparse_bias, pad_bias_valid, [bias_local_t0, SPARSE_BIAS_COLS])
+        with pl.spmd(
+            (token_rows + BIAS_TOKEN_TILE - 1) // BIAS_TOKEN_TILE,
+            name_hint="physical_sparse_build_bias",
+            deps=[compressed_ready_tid],
+        ) as bias_tid:
+            bias_block = pl.tile.get_block_idx()
+            bias_local_t0 = bias_block * BIAS_TOKEN_TILE
+            bias_t0 = bias_local_t0
+            if bias_t0 < active_rows:
+                bias_rows = pl.min(BIAS_TOKEN_TILE, active_rows - bias_t0)
+                raw_rows = pl.slice(swa_indices, [BIAS_TOKEN_TILE, WIN], [bias_t0, 0], valid_shape=[bias_rows, WIN])
+                raw_index = pl.cast(raw_rows, target_type=pl.FP32)
+                raw_flag = pl.minimum(pl.maximum(pl.add(raw_index, 1.0), 0.0), 1.0)
+                raw_bias = pl.mul(pl.sub(raw_flag, 1.0), -FP32_NEG_INF)
+                raw_bias_valid = pl.slice(raw_bias, [BIAS_TOKEN_TILE, WIN], [0, 0], valid_shape=[bias_rows, WIN])
+                pl.assemble(sparse_bias, raw_bias_valid, [bias_local_t0, 0])
+                if SPARSE_CMP_BIAS_COLS > 0:
+                    cmp_rows = pl.slice(
+                        cmp_indices,
+                        [BIAS_TOKEN_TILE, SPARSE_CMP_BIAS_COLS],
+                        [bias_t0, 0],
+                        valid_shape=[bias_rows, SPARSE_CMP_BIAS_COLS],
+                    )
+                    cmp_index = pl.cast(cmp_rows, target_type=pl.FP32)
+                    cmp_flag = pl.minimum(pl.maximum(pl.add(cmp_index, 1.0), 0.0), 1.0)
+                    cmp_bias = pl.mul(pl.sub(cmp_flag, 1.0), -FP32_NEG_INF)
+                    cmp_bias_valid = pl.slice(cmp_bias, [BIAS_TOKEN_TILE, SPARSE_CMP_BIAS_COLS], [0, 0], valid_shape=[bias_rows, SPARSE_CMP_BIAS_COLS])
+                    pl.assemble(sparse_bias, cmp_bias_valid, [bias_local_t0, WIN])
+                if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+                    pad_bias = pl.full(
+                        [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS],
+                        dtype=pl.FP32,
+                        value=FP32_NEG_INF,
+                    )
+                    pad_bias_valid = pl.slice(pad_bias, [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], [0, 0], valid_shape=[bias_rows, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS])
+                    pl.assemble(sparse_bias, pad_bias_valid, [bias_local_t0, SPARSE_BIAS_COLS])
 
-    source_ready_tid = pl.system.task_dummy(deps=[gather_ori_tid, gather_cmp_tid, bias_tid])
-    staged_source_rows = pl.tensor.dim(sparse_kv, 0)
-    bias_rows = pl.tensor.dim(sparse_bias, 0)
-    staged_kv = pl.reshape(sparse_kv, [staged_source_rows, HEAD_DIM])
-    staged_bias = pl.reshape(sparse_bias, [bias_rows, PREFILL_SPARSE_PAD])
-    return _staged_sparse_wave(
-        q, staged_kv, staged_bias, valid_block_mask, attn_sink,
-        active_rows, o_packed_heads, sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        source_ready_tid, merge_ready_tid, pl.cast(0, pl.INDEX),
-        pl.const(PREFILL_SPARSE_PAD, pl.INDEX), pl.const(0, pl.INDEX),
-    )
-
-
-@pl.jit.inline(auto_scope=False)
-def _physical_sparse_heads(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    packed_init_tid: pl.Scalar[pl.TASK_ID],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
-    CONTIGUOUS_CMP_PAGES: pl.constexpr,
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Run a segment-sized physical-gather wave with split source dependencies."""
-    token_rows = pl.tensor.dim(q, 0)
-    source_rows = token_rows * PREFILL_SPARSE_PAD
-    stats_rows = token_rows * H * PREFILL_ATTN_BLOCKS
-    rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = packed_init_tid
-    # Keep gathered KV on the caller's ring, separate from the FP32 head
-    # partials. A combined allocation can pin wrap padding on the inner ring.
-    sparse_kv = pl.create_tensor([source_rows, HEAD_DIM], dtype=pl.BF16)
-    with pl.scope():
-        sparse_bias = pl.create_tensor([token_rows, PREFILL_SPARSE_PAD], dtype=pl.FP32)
-        sparse_blk_mi = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
-        sparse_blk_li = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
-        sparse_blk_oi = pl.create_tensor([stats_rows, HEAD_DIM], dtype=pl.FP16)
-        rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
-        rope_tid = _staged_attn_prepare_rope(
-            freqs_cos,
-            freqs_sin,
-            rope_cos_il,
-            rope_sin_signed,
-            rope_swap_idx,
-            active_rows,
-            raw_ready_dep,
+        source_ready_tid = pl.system.task_dummy(deps=[gather_ori_tid, gather_cmp_tid, bias_tid])
+        staged_source_rows = pl.tensor.dim(sparse_kv, 0)
+        bias_rows = pl.tensor.dim(sparse_bias, 0)
+        staged_kv = pl.reshape(sparse_kv, [staged_source_rows, HEAD_DIM])
+        staged_bias = pl.reshape(sparse_bias, [bias_rows, PREFILL_SPARSE_PAD])
+        return planned_staged_wave(
+            q, staged_kv, staged_bias, valid_block_mask, attn_sink,
+            active_rows, o_packed_heads, sparse_blk_mi, sparse_blk_li, sparse_blk_oi,
+            rope_cos_il, rope_sin_signed, rope_swap_idx,
+            source_ready_tid, merge_ready_tid, pl.cast(0, pl.INDEX),
+            pl.const(PREFILL_SPARSE_PAD, pl.INDEX), pl.const(0, pl.INDEX),
         )
-        merge_ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_tid])
-        merge_tid = _physical_sparse_wave(
-            q,
-            ori_kv,
-            swa_indices,
-            cmp_kv,
-            cmp_block_table,
-            cmp_indices,
-            valid_block_mask,
-            attn_sink,
-            active_rows,
-            o_packed_heads,
-            sparse_kv,
-            sparse_bias,
-            sparse_blk_mi,
-            sparse_blk_li,
-            sparse_blk_oi,
-            rope_cos_il,
-            rope_sin_signed,
-            rope_swap_idx,
-            raw_ready_dep,
-            compressed_ready_dep,
-            merge_ready_tid,
-            CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
-        )
-        completion[0] = merge_tid
 
-    return o_packed_heads, completion[0]
+    return _physical_sparse_wave
+
+_physical_sparse_wave = make_physical_sparse_wave()
 
 
-@pl.jit.inline(auto_scope=False)
-def _staged_attn_o_proj(
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
-    heads_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Project aligned packed heads and write the logical output rows."""
-    projection_rows = pl.tensor.dim(o_packed_heads, 0) // H
-    output_rows = pl.tensor.dim(attn_out, 0)
-    output_group_rows = O_GROUPS * projection_rows
-    attn_out_view = pl.reshape(attn_out, [output_rows, D])
-    o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
-    o_r = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.FP32, manual_dep=True)
-    o_r_i8 = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.INT8, manual_dep=True)
-    act_scale_dq = pl.create_tensor([O_GROUPS, projection_rows], dtype=pl.FP32, manual_dep=True)
-    partials = pl.create_tensor([projection_rows, O_GROUPS * D], dtype=pl.INT32, manual_dep=True)
-    proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+def make_physical_sparse_heads(fixed_rows=0):
+    planned_rope = make_staged_attn_prepare_rope(fixed_rows)
+    planned_wave = make_physical_sparse_wave(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def _physical_sparse_heads(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        packed_init_tid: pl.Scalar[pl.TASK_ID],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+        CONTIGUOUS_CMP_PAGES: pl.constexpr,
+    ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+        """Run a segment-sized physical-gather wave with split source dependencies."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        source_rows = token_rows * PREFILL_SPARSE_PAD
+        stats_rows = token_rows * H * PREFILL_ATTN_BLOCKS
+        rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
+        completion = pl.array.create(1, pl.TASK_ID)
+        completion[0] = packed_init_tid
+        # Keep gathered KV on the caller's ring, separate from the FP32 head
+        # partials. A combined allocation can pin wrap padding on the inner ring.
+        sparse_kv = pl.create_tensor([source_rows, HEAD_DIM], dtype=pl.BF16)
+        with pl.scope():
+            sparse_bias = pl.create_tensor([token_rows, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+            sparse_blk_mi = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
+            sparse_blk_li = pl.create_tensor([stats_rows, 1], dtype=pl.FP32)
+            sparse_blk_oi = pl.create_tensor([stats_rows, HEAD_DIM], dtype=pl.FP16)
+            rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
+            rope_tid = planned_rope(
+                freqs_cos,
+                freqs_sin,
+                rope_cos_il,
+                rope_sin_signed,
+                rope_swap_idx,
+                active_rows,
+                raw_ready_dep,
+            )
+            merge_ready_tid = pl.system.task_dummy(deps=[packed_init_tid, rope_tid])
+            merge_tid = planned_wave(
+                q,
+                ori_kv,
+                swa_indices,
+                cmp_kv,
+                cmp_block_table,
+                cmp_indices,
+                valid_block_mask,
+                attn_sink,
+                active_rows,
+                o_packed_heads,
+                sparse_kv,
+                sparse_bias,
+                sparse_blk_mi,
+                sparse_blk_li,
+                sparse_blk_oi,
+                rope_cos_il,
+                rope_sin_signed,
+                rope_swap_idx,
+                raw_ready_dep,
+                compressed_ready_dep,
+                merge_ready_tid,
+                CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
+            )
+            completion[0] = merge_tid
 
-    # Explicit scratch ordering with automatic allocator retention.
-    with pl.scope():
-        for g in pl.parallel(O_GROUPS):
-            row_base_o = g * projection_rows
-            out_col_g = g * O_LORA
-            # Rows and N fragments share one task, and both indices come from the
-            # block index. n0 addresses an NZ fractal row, and a scalar computed
-            # outside the task reaches it as an opaque parameter that no
-            # alignment proof can see through.
-            with pl.spmd(
-                (projection_rows // STAGED_SWA_PROJ_A_ROW_TILE) * PA_NFRAGS,
-                name_hint="staged_swa_proj_a_mm",
-                deps=[heads_dep],
-            ) as pa_tid:
-                pa_blk = pl.tile.get_block_idx()
-                nf = pa_blk % PA_NFRAGS
-                n0 = nf * PROJ_A_MM_N_TILE
-                pa_rb = pa_blk // PA_NFRAGS
-                pa_r0 = pa_rb * STAGED_SWA_PROJ_A_ROW_TILE
-                pa_src0 = row_base_o + pa_r0
-                acc_a = pl.create_tensor([1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
-                    k0 = kb * A_K_TILE
-                    xa_k_chunk = o_packed[pa_src0 : pa_src0 + STAGED_SWA_PROJ_A_ROW_TILE, k0 : k0 + A_K_TILE]
-                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
-            proj_a_tids[g] = pa_tid
+        return o_packed_heads, completion[0]
 
-        for g in pl.parallel(O_GROUPS):
-            col_g = g * O_LORA
-            # STAGED_QUANT_T_TILE rows per block: amax is order-free and each element
-            # quantizes independently, so the coarser block is bit-identical.
-            with pl.spmd(
-                projection_rows // STAGED_QUANT_T_TILE,
-                name_hint="staged_swa_quant",
-                deps=[proj_a_tids[g]],
-            ) as q_tid:
-                qt = pl.tile.get_block_idx() * STAGED_QUANT_T_TILE
-                g_amax = pl.full([1, STAGED_QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k1 in pl.range(0, O_LORA, STAGED_QUANT_COL_TILE):
-                    oc = o_r[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE]
-                    oc_abs = pl.maximum(oc, pl.neg(oc))
-                    oc_amax = pl.reshape(pl.row_max(oc_abs), [1, STAGED_QUANT_T_TILE])
-                    g_amax = pl.maximum(g_amax, oc_amax)
-                g_scale_num = pl.full([1, STAGED_QUANT_T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-                g_sq_row = pl.div(g_scale_num, g_amax)
-                act_scale_dq[g : g + 1, qt : qt + STAGED_QUANT_T_TILE] = pl.recip(g_sq_row)
-                g_sq_col = pl.reshape(g_sq_row, [STAGED_QUANT_T_TILE, 1])
-                for k1 in pl.range(0, O_LORA, STAGED_QUANT_COL_TILE):
-                    oc = o_r[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE]
-                    oq_scaled = pl.row_expand_mul(oc, g_sq_col)
-                    oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
-                    oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
-                    oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
-                    o_r_i8[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE] = oq_i8
-            quant_tids[g] = q_tid
+    return _physical_sparse_heads
 
-        # One task per group, D slabs across its blocks: n0 addresses an NZ
-        # fractal row, so it has to be built inside the task from the block
-        # index rather than captured from the enclosing loop.
-        for g in pl.range(O_GROUPS):
-            col_g = g * O_LORA
-            with pl.spmd(
-                STAGED_SWA_PB_DSLABS,
-                name_hint="staged_swa_proj_b_mm",
-                deps=[quant_tids[g]],
-            ) as pb_tid:
-                dc = pl.tile.get_block_idx()
-                d0 = dc * STAGED_SWA_PROJ_B_D_TILE
-                for nf in pl.range(STAGED_SWA_PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                    n0 = d0 + nf * PROJ_B_MM_N_TILE
-                    for pb_rb in pl.range(projection_rows // STAGED_SWA_PROJ_B_ROW_TILE):
-                        pb_r0 = pb_rb * STAGED_SWA_PROJ_B_ROW_TILE
-                        acc_b = pl.create_tensor([1, STAGED_SWA_PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                        for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                            k0 = kb * B_K_TILE
-                            b_act = o_r_i8[pb_r0 : pb_r0 + STAGED_SWA_PROJ_B_ROW_TILE, col_g + k0 : col_g + k0 + B_K_TILE]
-                            b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
-                            acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                        partials = pl.assemble(partials, acc_b, [pb_r0, g * D + n0])
-            proj_b_tids[g] = pb_tid
+_physical_sparse_heads = make_physical_sparse_heads()
 
-    act_t_blks = (output_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
-    with pl.spmd(
-        (D // PROJ_B_ACT_N_TILE) * act_t_blks,
-        name_hint="staged_swa_proj_b_act",
-        deps=[proj_b_tids[i] for i in range(O_GROUPS)],
-    ) as act_tid:
-        act_idx = pl.tile.get_block_idx()
-        nreg = act_idx // act_t_blks
-        tblk = act_idx - nreg * act_t_blks
-        ob_n0 = nreg * PROJ_B_ACT_N_TILE
-        t0 = tblk * PROJ_B_ACT_TASK_T_TILE
-        wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
-        wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
-        for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
-            acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
+
+def make_staged_attn_o_proj(fixed_rows=0):
+    @pl.jit.inline(auto_scope=False)
+    def _staged_attn_o_proj(
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
+        heads_dep: pl.Scalar[pl.TASK_ID],
+    ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+        """Project aligned packed heads and write the logical output rows."""
+        projection_rows = pl.tensor.dim(o_packed_heads, 0) // H
+        if fixed_rows > 0:
+            projection_rows = ((fixed_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        output_rows = pl.tensor.dim(attn_out, 0)
+        if fixed_rows > 0:
+            output_rows = fixed_rows
+        output_group_rows = O_GROUPS * projection_rows
+        attn_out_view = pl.reshape(attn_out, [output_rows, D])
+        o_packed = pl.reshape(o_packed_heads, [output_group_rows, O_GROUP_IN])
+        o_r = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.FP32, manual_dep=True)
+        o_r_i8 = pl.create_tensor([projection_rows, O_GROUPS * O_LORA], dtype=pl.INT8, manual_dep=True)
+        act_scale_dq = pl.create_tensor([O_GROUPS, projection_rows], dtype=pl.FP32, manual_dep=True)
+        partials = pl.create_tensor([projection_rows, O_GROUPS * D], dtype=pl.INT32, manual_dep=True)
+        proj_a_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+        quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+        proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+
+        # Explicit scratch ordering with automatic allocator retention.
+        with pl.scope():
+            for g in pl.parallel(O_GROUPS):
+                row_base_o = g * projection_rows
+                out_col_g = g * O_LORA
+                # Rows and N fragments share one task, and both indices come from the
+                # block index. n0 addresses an NZ fractal row, and a scalar computed
+                # outside the task reaches it as an opaque parameter that no
+                # alignment proof can see through.
+                with pl.spmd(
+                    (projection_rows // STAGED_SWA_PROJ_A_ROW_TILE) * PA_NFRAGS,
+                    name_hint="staged_swa_proj_a_mm",
+                    deps=[heads_dep],
+                ) as pa_tid:
+                    pa_blk = pl.tile.get_block_idx()
+                    nf = pa_blk % PA_NFRAGS
+                    n0 = nf * PROJ_A_MM_N_TILE
+                    pa_rb = pa_blk // PA_NFRAGS
+                    pa_r0 = pa_rb * STAGED_SWA_PROJ_A_ROW_TILE
+                    pa_src0 = row_base_o + pa_r0
+                    acc_a = pl.create_tensor([1, STAGED_SWA_PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
+                        k0 = kb * A_K_TILE
+                        xa_k_chunk = o_packed[pa_src0 : pa_src0 + STAGED_SWA_PROJ_A_ROW_TILE, k0 : k0 + A_K_TILE]
+                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
+                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+                proj_a_tids[g] = pa_tid
+
+            for g in pl.parallel(O_GROUPS):
+                col_g = g * O_LORA
+                # STAGED_QUANT_T_TILE rows per block: amax is order-free and each element
+                # quantizes independently, so the coarser block is bit-identical.
+                with pl.spmd(
+                    projection_rows // STAGED_QUANT_T_TILE,
+                    name_hint="staged_swa_quant",
+                    deps=[proj_a_tids[g]],
+                ) as q_tid:
+                    qt = pl.tile.get_block_idx() * STAGED_QUANT_T_TILE
+                    g_amax = pl.full([1, STAGED_QUANT_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                    for k1 in pl.range(0, O_LORA, STAGED_QUANT_COL_TILE):
+                        oc = o_r[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE]
+                        oc_abs = pl.maximum(oc, pl.neg(oc))
+                        oc_amax = pl.reshape(pl.row_max(oc_abs), [1, STAGED_QUANT_T_TILE])
+                        g_amax = pl.maximum(g_amax, oc_amax)
+                    g_scale_num = pl.full([1, STAGED_QUANT_T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                    g_sq_row = pl.div(g_scale_num, g_amax)
+                    act_scale_dq[g : g + 1, qt : qt + STAGED_QUANT_T_TILE] = pl.recip(g_sq_row)
+                    g_sq_col = pl.reshape(g_sq_row, [STAGED_QUANT_T_TILE, 1])
+                    for k1 in pl.range(0, O_LORA, STAGED_QUANT_COL_TILE):
+                        oc = o_r[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE]
+                        oq_scaled = pl.row_expand_mul(oc, g_sq_col)
+                        oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
+                        oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
+                        oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
+                        o_r_i8[qt : qt + STAGED_QUANT_T_TILE, col_g + k1 : col_g + k1 + STAGED_QUANT_COL_TILE] = oq_i8
+                quant_tids[g] = q_tid
+
+            # One task per group, D slabs across its blocks: n0 addresses an NZ
+            # fractal row, so it has to be built inside the task from the block
+            # index rather than captured from the enclosing loop.
             for g in pl.range(O_GROUPS):
-                p_g = partials[b_tb : b_tb + PROJ_B_ACT_T_TILE, g * D + ob_n0 : g * D + ob_n0 + PROJ_B_ACT_N_TILE]
-                g_scale_row = act_scale_dq[g : g + 1, b_tb : b_tb + PROJ_B_ACT_T_TILE]
-                g_scale = pl.reshape(g_scale_row, [PROJ_B_ACT_T_TILE, 1])
-                p_g_f32 = pl.cast(p_g, target_type=pl.FP32, mode="none")
-                acc = pl.add(acc, pl.row_expand_mul(p_g_f32, g_scale))
-            out_t = pl.col_expand_mul(acc, wb_scale_chunk)
-            out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
-            if b_tb < output_rows:
-                valid_rows = pl.min(PROJ_B_ACT_T_TILE, output_rows - b_tb)
-                output_tile = pl.slice(
-                    out_bf16, [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], [0, 0],
-                    valid_shape=[valid_rows, PROJ_B_ACT_N_TILE],
-                )
-                pl.assemble(attn_out_view, output_tile, [b_tb, ob_n0])
+                col_g = g * O_LORA
+                with pl.spmd(
+                    STAGED_SWA_PB_DSLABS,
+                    name_hint="staged_swa_proj_b_mm",
+                    deps=[quant_tids[g]],
+                ) as pb_tid:
+                    dc = pl.tile.get_block_idx()
+                    d0 = dc * STAGED_SWA_PROJ_B_D_TILE
+                    for nf in pl.range(STAGED_SWA_PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
+                        n0 = d0 + nf * PROJ_B_MM_N_TILE
+                        for pb_rb in pl.range(projection_rows // STAGED_SWA_PROJ_B_ROW_TILE):
+                            pb_r0 = pb_rb * STAGED_SWA_PROJ_B_ROW_TILE
+                            acc_b = pl.create_tensor([1, STAGED_SWA_PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
+                                k0 = kb * B_K_TILE
+                                b_act = o_r_i8[pb_r0 : pb_r0 + STAGED_SWA_PROJ_B_ROW_TILE, col_g + k0 : col_g + k0 + B_K_TILE]
+                                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, k0 : k0 + B_K_TILE]
+                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
+                            partials = pl.assemble(partials, acc_b, [pb_r0, g * D + n0])
+                proj_b_tids[g] = pb_tid
 
-    return attn_out, act_tid
+        act_t_blks = (output_rows + PROJ_B_ACT_TASK_T_TILE - 1) // PROJ_B_ACT_TASK_T_TILE
+        with pl.spmd(
+            (D // PROJ_B_ACT_N_TILE) * act_t_blks,
+            name_hint="staged_swa_proj_b_act",
+            deps=[proj_b_tids[i] for i in range(O_GROUPS)],
+        ) as act_tid:
+            act_idx = pl.tile.get_block_idx()
+            nreg = act_idx // act_t_blks
+            tblk = act_idx - nreg * act_t_blks
+            ob_n0 = nreg * PROJ_B_ACT_N_TILE
+            t0 = tblk * PROJ_B_ACT_TASK_T_TILE
+            wb_scale = wo_b_scale[ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE]
+            wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
+            for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
+                acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
+                for g in pl.range(O_GROUPS):
+                    p_g = partials[b_tb : b_tb + PROJ_B_ACT_T_TILE, g * D + ob_n0 : g * D + ob_n0 + PROJ_B_ACT_N_TILE]
+                    g_scale_row = act_scale_dq[g : g + 1, b_tb : b_tb + PROJ_B_ACT_T_TILE]
+                    g_scale = pl.reshape(g_scale_row, [PROJ_B_ACT_T_TILE, 1])
+                    p_g_f32 = pl.cast(p_g, target_type=pl.FP32, mode="none")
+                    acc = pl.add(acc, pl.row_expand_mul(p_g_f32, g_scale))
+                out_t = pl.col_expand_mul(acc, wb_scale_chunk)
+                out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
+                if b_tb < output_rows:
+                    valid_rows = pl.min(PROJ_B_ACT_T_TILE, output_rows - b_tb)
+                    output_tile = pl.slice(
+                        out_bf16, [PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], [0, 0],
+                        valid_shape=[valid_rows, PROJ_B_ACT_N_TILE],
+                    )
+                    pl.assemble(attn_out_view, output_tile, [b_tb, ob_n0])
+
+        return attn_out, act_tid
+
+    return _staged_attn_o_proj
+
+_staged_attn_o_proj = make_staged_attn_o_proj()
 
 
-@pl.jit.inline(auto_scope=False)
-def _hca_segment_heads(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    predecessor_valid: pl.Scalar[pl.INDEX],
-    cmp_work_kv: pl.Tensor[[HCA_CMP_WORK_ROWS_DYN, HEAD_DIM], pl.BF16],
-    cmp_work_valid: pl.Tensor[[HCA_CMP_WORK_TILES_DYN, HCA_ATTN_TILE], pl.FP32],
-    position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    hist_kv: pl.Tensor[[HCA_RAW_ROWS_DYN, HEAD_DIM], pl.BF16],
-    raw_valid: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.FP32],
-    stream_state_m: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
-    stream_state_l: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
-    stream_heads: pl.Tensor[[HCA_HEAD_ROWS_DYN, HEAD_DIM], pl.FP32],
-    cmp_partial_m: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
-    cmp_partial_l: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
-    cmp_partial_o: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, HEAD_DIM], pl.FP32],
-    rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    cmp_ready_dep: pl.Scalar[pl.TASK_ID],
-    rope_ready_dep: pl.Scalar[pl.TASK_ID],
-    packed_ready_dep: pl.Scalar[pl.TASK_ID],
-    wave_completion: pl.Array[1, pl.TASK_ID],
-):
-    """Gather raw history and compute one runtime-sized HCA segment."""
-    token_rows = pl.tensor.dim(q, 0)
-    query_head_rows = token_rows * H
-    packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
-    # The gather arena is sized by the compressed cache the caller supplied, so its
-    # row count is the ceiling on how many compressed rows a query can attend to.
-    cmp_work_rows_avail = pl.tensor.dim(cmp_work_kv, 0)
-    full_cache_rows = pl.tensor.dim(full_kv, 0) * BLOCK_SIZE
-    full_kv_flat = pl.reshape(full_kv, [full_cache_rows, HEAD_DIM])
-    hist_source_rows = pl.tensor.dim(hist_kv, 0)
-    hist_view = pl.reshape(hist_kv, [hist_source_rows, HEAD_DIM])
-    raw_mask_rows = pl.tensor.dim(raw_valid, 0)
-    raw_valid_view = pl.reshape(raw_valid, [raw_mask_rows, WIN])
-
-    # The window of token t is two contiguous runs of ``full_kv_flat`` (predecessor
-    # tail, then current segment) that meet exactly at the boundary, so one packed
-    # strip makes every window a single contiguous slice: WIN zero rows, then the
-    # predecessor tail, then the current rows. Token t reads
-    # ``hist_view[t + 1 + pv : t + 1 + pv + WIN]``, and a candidate that predates the
-    # window start lands in the zero pad. Packing copies pv + active_rows rows once
-    # instead of WIN rows per token -- 384 KB instead of 33.5 MB.
-    #
-    # The same block also writes its token tile's validity rows: candidate k is in
-    # the window when t + 1 + k >= WIN - pv, so the mask is a prefix of zeros
-    # followed by ones -- one TRI per token instead of WIN scalar writes. Keeping it
-    # here rather than in its own spmd matters: a separate one-block-per-token kernel
-    # measured 442 us of span for three operations and added a dependency edge in
-    # front of the QK/PV task.
-    with pl.spmd(
-        (token_rows + 2 * WIN + HCA_HIST_PACK_ROW_TILE - 1) // HCA_HIST_PACK_ROW_TILE,
-        name_hint="native_hca_hist_pack",
-        deps=[raw_ready_dep],
-    ) as raw_gather_tid:
-        hist_blk = pl.tile.get_block_idx()
-        hist_row0 = hist_blk * HCA_HIST_PACK_ROW_TILE
-        hist_limit = WIN + predecessor_valid + active_rows
-        hist_zero_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for hist_dr in pl.range(HCA_HIST_PACK_ROW_TILE):
-            hist_dst = hist_row0 + hist_dr
-            if hist_dst < WIN:
-                hist_view[hist_dst:hist_dst + 1, 0:HEAD_DIM] = hist_zero_row
-            else:
-                if hist_dst < hist_limit:
+def make_hca_segment_heads(fixed_rows: int = 0):
+    @pl.jit.inline(auto_scope=False)
+    def _hca_hist_pack_stage(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        predecessor_valid: pl.Scalar[pl.INDEX],
+        active_rows: pl.Scalar[pl.INDEX],
+        hist_kv: pl.Tensor[[HCA_RAW_ROWS_DYN, HEAD_DIM], pl.BF16],
+        raw_valid: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.FP32],
+        stage_ready_dep0: pl.Scalar[pl.TASK_ID],
+    ):
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        full_cache_rows = pl.tensor.dim(full_kv, 0) * BLOCK_SIZE
+        full_kv_flat = pl.reshape(full_kv, [full_cache_rows, HEAD_DIM])
+        hist_source_rows = pl.tensor.dim(hist_kv, 0)
+        hist_view = pl.reshape(hist_kv, [hist_source_rows, HEAD_DIM])
+        raw_mask_rows = pl.tensor.dim(raw_valid, 0)
+        raw_valid_view = pl.reshape(raw_valid, [raw_mask_rows, WIN])
+        with pl.spmd((token_rows + 2 * WIN + HCA_HIST_PACK_ROW_TILE - 1) // HCA_HIST_PACK_ROW_TILE, name_hint='native_hca_hist_pack', deps=[stage_ready_dep0]) as raw_gather_tid:
+            hist_blk = pl.tile.get_block_idx()
+            hist_row0 = hist_blk * HCA_HIST_PACK_ROW_TILE
+            hist_limit = WIN + predecessor_valid + active_rows
+            hist_zero_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for hist_dr in pl.range(HCA_HIST_PACK_ROW_TILE):
+                hist_dst = hist_row0 + hist_dr
+                if hist_dst < WIN:
+                    hist_view[hist_dst:hist_dst + 1, 0:HEAD_DIM] = hist_zero_row
+                elif hist_dst < hist_limit:
                     hist_off = hist_dst - WIN
                     hist_src = hist_off
                     if hist_off >= predecessor_valid:
                         hist_src = WIN + hist_off - predecessor_valid
-                    hist_view[hist_dst:hist_dst + 1, 0:HEAD_DIM] = full_kv_flat[
-                        hist_src:hist_src + 1, 0:HEAD_DIM
-                    ]
-        hist_mask_t0 = hist_blk * HCA_HIST_MASK_TOKEN_TILE
-        for hist_mt in pl.range(HCA_HIST_MASK_TOKEN_TILE):
-            hist_mask_t = hist_mask_t0 + hist_mt
-            if hist_mask_t < token_rows:
-                hist_diagonal = pl.cast(WIN - predecessor_valid - hist_mask_t - 1, pl.INT32)
-                hist_mask = pl.tile.tri(hist_diagonal, [1, WIN], dtype=pl.INT32, upper=True)
-                hist_mask_row = pl.cast(hist_mask, target_type=pl.FP32)
-                pl.store(hist_mask_row, [hist_mask_t, 0], raw_valid_view)
+                    hist_view[hist_dst:hist_dst + 1, 0:HEAD_DIM] = full_kv_flat[hist_src:hist_src + 1, 0:HEAD_DIM]
+            hist_mask_t0 = hist_blk * HCA_HIST_MASK_TOKEN_TILE
+            for hist_mt in pl.range(HCA_HIST_MASK_TOKEN_TILE):
+                hist_mask_t = hist_mask_t0 + hist_mt
+                if hist_mask_t < token_rows:
+                    hist_diagonal = pl.cast(WIN - predecessor_valid - hist_mask_t - 1, pl.INT32)
+                    hist_mask = pl.tile.tri(hist_diagonal, [1, WIN], dtype=pl.INT32, upper=True)
+                    hist_mask_row = pl.cast(hist_mask, target_type=pl.FP32)
+                    pl.store(hist_mask_row, [hist_mask_t, 0], raw_valid_view)
+        return raw_gather_tid
 
+    @pl.jit.inline(auto_scope=False)
+    def _hca_raw_qk_pv_stage(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        predecessor_valid: pl.Scalar[pl.INDEX],
+        active_rows: pl.Scalar[pl.INDEX],
+        hist_kv: pl.Tensor[[HCA_RAW_ROWS_DYN, HEAD_DIM], pl.BF16],
+        raw_valid: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.FP32],
+        stream_state_m: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_state_l: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_heads: pl.Tensor[[HCA_HEAD_ROWS_DYN, HEAD_DIM], pl.FP32],
+        stage_ready_dep0: pl.Scalar[pl.TASK_ID],
+    ):
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        query_head_rows = token_rows * H
+        hist_source_rows = pl.tensor.dim(hist_kv, 0)
+        hist_view = pl.reshape(hist_kv, [hist_source_rows, HEAD_DIM])
+        raw_mask_rows = pl.tensor.dim(raw_valid, 0)
+        raw_valid_view = pl.reshape(raw_valid, [raw_mask_rows, WIN])
+        q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
+        with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint='native_hca_raw_qk_pv', deps=[stage_ready_dep0]) as raw_heads_tid:
+            raw_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
+            for raw_query_offset in pl.range(HCA_QUERY_TILE):
+                raw_local_t = raw_query_begin + raw_query_offset
+                raw_t = raw_local_t
+                if raw_t < active_rows and raw_t < token_rows:
+                    raw_src = raw_local_t + 1 + predecessor_valid
+                    raw_kv_tile = hist_view[raw_src:raw_src + WIN, 0:HEAD_DIM]
+                    raw_valid_row = raw_valid_view[raw_local_t:raw_local_t + 1, 0:WIN]
+                    raw_valid_zero = pl.full([QK_M_TILE, WIN], dtype=pl.FP32, value=0.0)
+                    raw_valid_tile = pl.col_expand_add(raw_valid_zero, raw_valid_row)
+                    raw_bias = pl.mul(pl.sub(raw_valid_tile, 1.0), -FP32_NEG_INF)
+                    raw_token_row = raw_local_t * H
+                    for raw_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                        raw_h0 = raw_hb * QK_M_TILE
+                        raw_q_row = raw_t * H + raw_h0
+                        raw_q = q_flat[raw_q_row:raw_q_row + QK_M_TILE, 0:HEAD_DIM]
+                        raw_scores = pl.matmul(raw_q, raw_kv_tile, b_trans=True, out_dtype=pl.FP32)
+                        raw_scores = pl.add(pl.mul(raw_scores, SOFTMAX_SCALE), raw_bias)
+                        raw_m = pl.row_max(raw_scores)
+                        raw_exp = pl.exp(pl.row_expand_sub(raw_scores, raw_m))
+                        raw_exp = pl.mul(raw_exp, raw_valid_tile)
+                        raw_l = pl.row_sum(raw_exp)
+                        raw_o = pl.matmul(pl.cast(raw_exp, target_type=pl.BF16, mode='rint'), raw_kv_tile, out_dtype=pl.FP32)
+                        for raw_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                            raw_src_h0 = raw_sub * HEAD_TILE
+                            raw_dst = raw_token_row + raw_h0 + raw_src_h0
+                            stream_state_m[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_m[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
+                            stream_state_l[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_l[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
+                            stream_heads[raw_dst:raw_dst + HEAD_TILE, 0:HEAD_DIM] = raw_o[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:HEAD_DIM]
+        return raw_heads_tid
 
-    q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
-    with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint="native_hca_raw_qk_pv", deps=[raw_gather_tid]) as raw_heads_tid:
-        raw_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
-        for raw_query_offset in pl.range(HCA_QUERY_TILE):
-            raw_local_t = raw_query_begin + raw_query_offset
-            raw_t = raw_local_t
-            if raw_t < active_rows and raw_t < token_rows:
-                raw_src = raw_local_t + 1 + predecessor_valid
-                raw_kv_tile = hist_view[raw_src:raw_src + WIN, 0:HEAD_DIM]
-                raw_valid_row = raw_valid_view[raw_local_t:raw_local_t + 1, 0:WIN]
-                raw_valid_zero = pl.full([QK_M_TILE, WIN], dtype=pl.FP32, value=0.0)
-                raw_valid_tile = pl.col_expand_add(raw_valid_zero, raw_valid_row)
-                raw_bias = pl.mul(pl.sub(raw_valid_tile, 1.0), -FP32_NEG_INF)
-                raw_token_row = raw_local_t * H
-                for raw_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                    raw_h0 = raw_hb * QK_M_TILE
-                    raw_q_row = raw_t * H + raw_h0
-                    raw_q = q_flat[raw_q_row:raw_q_row + QK_M_TILE, 0:HEAD_DIM]
-                    raw_scores = pl.matmul(raw_q, raw_kv_tile, b_trans=True, out_dtype=pl.FP32)
-                    raw_scores = pl.add(pl.mul(raw_scores, SOFTMAX_SCALE), raw_bias)
-                    raw_m = pl.row_max(raw_scores)
-                    raw_exp = pl.exp(pl.row_expand_sub(raw_scores, raw_m))
-                    raw_exp = pl.mul(raw_exp, raw_valid_tile)
-                    raw_l = pl.row_sum(raw_exp)
-                    raw_o = pl.matmul(pl.cast(raw_exp, target_type=pl.BF16, mode="rint"), raw_kv_tile, out_dtype=pl.FP32)
-                    for raw_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                        raw_src_h0 = raw_sub * HEAD_TILE
-                        raw_dst = raw_token_row + raw_h0 + raw_src_h0
-                        stream_state_m[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_m[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
-                        stream_state_l[raw_dst:raw_dst + HEAD_TILE, 0:1] = raw_l[raw_src_h0:raw_src_h0 + HEAD_TILE, 0:1]
-                        stream_heads[raw_dst:raw_dst + HEAD_TILE, 0:HEAD_DIM] = raw_o[
-                            raw_src_h0:raw_src_h0 + HEAD_TILE, 0:HEAD_DIM
-                        ]
+    @pl.jit.inline(auto_scope=False)
+    def _hca_cmp_qk_pv_stage(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        cmp_work_kv: pl.Tensor[[HCA_CMP_WORK_ROWS_DYN, HEAD_DIM], pl.BF16],
+        cmp_work_valid: pl.Tensor[[HCA_CMP_WORK_TILES_DYN, HCA_ATTN_TILE], pl.FP32],
+        position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
+        active_rows: pl.Scalar[pl.INDEX],
+        cmp_partial_m: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_l: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_o: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, HEAD_DIM], pl.FP32],
+        stage_ready_dep0: pl.Scalar[pl.TASK_ID],
+    ):
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        query_head_rows = token_rows * H
+        cmp_work_rows_avail = pl.tensor.dim(cmp_work_kv, 0)
+        q_flat = pl.reshape(q, [query_head_rows, HEAD_DIM])
+        with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint='native_hca_cmp_qk_pv', deps=[stage_ready_dep0]) as cmp_qk_tid:
+            cmp_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
+            for cmp_query_offset in pl.range(HCA_QUERY_TILE):
+                qk_local_t = cmp_query_begin + cmp_query_offset
+                qk_t = qk_local_t
+                qk_token_base = qk_local_t * H
+                if qk_t < active_rows and qk_t < token_rows:
+                    qk_position_i32 = pl.read(position_ids, [qk_t])
+                    if qk_position_i32 >= 0:
+                        qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
+                        qk_visible_rows = pl.min(qk_visible_rows, cmp_work_rows_avail)
+                        neutral_m = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
+                        neutral_l = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
+                        neutral_o = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                        for qk_h_idx in pl.range(H // HEAD_TILE):
+                            neutral_row = qk_token_base + qk_h_idx * HEAD_TILE
+                            cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
+                            cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
+                            cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
+                        for qk_work in pl.range((qk_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
+                            qk_work_row = qk_work * HCA_ATTN_TILE
+                            qk_valid_rows = pl.min(HCA_ATTN_TILE, qk_visible_rows - qk_work_row)
+                            qk_kv = cmp_work_kv[qk_work_row:qk_work_row + HCA_ATTN_TILE, 0:HEAD_DIM]
+                            qk_valid_row = cmp_work_valid[qk_work:qk_work + 1, :]
+                            qk_valid_zero = pl.full([QK_M_TILE, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
+                            qk_valid = pl.col_expand_add(qk_valid_zero, qk_valid_row)
+                            qk_bias = pl.mul(pl.sub(qk_valid, 1.0), -FP32_NEG_INF)
+                            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                                qk_h0 = qk_hb * QK_M_TILE
+                                qk_q_row = qk_t * H + qk_h0
+                                qk_q = q_flat[qk_q_row:qk_q_row + QK_M_TILE, 0:HEAD_DIM]
+                                qk_scores = pl.matmul(qk_q, qk_kv, b_trans=True, out_dtype=pl.FP32)
+                                qk_scores = pl.add(pl.mul(qk_scores, SOFTMAX_SCALE), qk_bias)
+                                qk_scores = pl.set_validshape(qk_scores, QK_M_TILE, qk_valid_rows)
+                                qk_scores = pl.fillpad(qk_scores, pad_value=pl.PadValue.min)
+                                qk_m = pl.row_max(qk_scores)
+                                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_m))
+                                qk_exp = pl.mul(qk_exp, qk_valid)
+                                qk_l = pl.row_sum(qk_exp)
+                                qk_o = pl.matmul(pl.cast(qk_exp, target_type=pl.BF16, mode='rint'), qk_kv, out_dtype=pl.FP32)
+                                for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
+                                    qk_src_h0 = qk_sub * HEAD_TILE
+                                    qk_row = qk_token_base + qk_h0 + qk_src_h0
+                                    qk_cur_m = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                                    qk_cur_l = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
+                                    qk_cur_o = qk_o[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:HEAD_DIM]
+                                    qk_run_m_padded = cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8]
+                                    qk_run_l_padded = cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8]
+                                    qk_run_m_transposed = pl.transpose(qk_run_m_padded, axis1=0, axis2=1)
+                                    qk_run_l_transposed = pl.transpose(qk_run_l_padded, axis1=0, axis2=1)
+                                    qk_run_m = pl.reshape(qk_run_m_transposed[0:1, :], [HEAD_TILE, 1])
+                                    qk_run_l = pl.reshape(qk_run_l_transposed[0:1, :], [HEAD_TILE, 1])
+                                    qk_run_o = cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM]
+                                    qk_next_m = pl.maximum(qk_run_m, qk_cur_m)
+                                    qk_alpha = pl.exp(pl.sub(qk_run_m, qk_next_m))
+                                    qk_beta = pl.exp(pl.sub(qk_cur_m, qk_next_m))
+                                    qk_next_l = pl.add(pl.mul(qk_alpha, qk_run_l), pl.mul(qk_beta, qk_cur_l))
+                                    qk_next_o = pl.add(pl.row_expand_mul(qk_run_o, qk_alpha), pl.row_expand_mul(qk_cur_o, qk_beta))
+                                    qk_stat_zeros = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
+                                    cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_m)
+                                    cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_l)
+                                    cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_next_o
+        return cmp_qk_tid
 
-    with pl.spmd((token_rows + HCA_QUERY_TILE - 1) // HCA_QUERY_TILE, name_hint="native_hca_cmp_qk_pv", deps=[cmp_ready_dep]) as cmp_qk_tid:
-        cmp_query_begin = pl.tile.get_block_idx() * HCA_QUERY_TILE
-        for cmp_query_offset in pl.range(HCA_QUERY_TILE):
-            # Each query walks its visible compressed work tiles in order and folds
-            # each tile's online-softmax partial into one running (m, l, o) per head row.
-            qk_local_t = cmp_query_begin + cmp_query_offset
-            qk_t = qk_local_t
-            qk_token_base = qk_local_t * H
-            if qk_t < active_rows and qk_t < token_rows:
-                qk_position_i32 = pl.read(position_ids, [qk_t])
-                if qk_position_i32 >= 0:
-                    qk_visible_rows = (qk_position_i32 + 1) // HCA_COMPRESS_RATIO
-                    qk_visible_rows = pl.min(qk_visible_rows, cmp_work_rows_avail)
-                    neutral_m = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=FP32_NEG_INF)
-                    neutral_l = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                    neutral_o = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                    for qk_h_idx in pl.range(H // HEAD_TILE):
-                        neutral_row = qk_token_base + qk_h_idx * HEAD_TILE
-                        cmp_partial_m[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_m
-                        cmp_partial_l[neutral_row:neutral_row + HEAD_TILE, 0:8] = neutral_l
-                        cmp_partial_o[neutral_row:neutral_row + HEAD_TILE, 0:HEAD_DIM] = neutral_o
-                    for qk_work in pl.range((qk_visible_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE):
-                        qk_work_row = qk_work * HCA_ATTN_TILE
-                        qk_valid_rows = pl.min(HCA_ATTN_TILE, qk_visible_rows - qk_work_row)
-                        qk_kv = cmp_work_kv[qk_work_row:qk_work_row + HCA_ATTN_TILE, 0:HEAD_DIM]
-                        qk_valid_row = cmp_work_valid[qk_work:qk_work + 1, :]
-                        qk_valid_zero = pl.full([QK_M_TILE, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
-                        qk_valid = pl.col_expand_add(qk_valid_zero, qk_valid_row)
-                        qk_bias = pl.mul(pl.sub(qk_valid, 1.0), -FP32_NEG_INF)
-                        for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                            qk_h0 = qk_hb * QK_M_TILE
-                            qk_q_row = qk_t * H + qk_h0
-                            qk_q = q_flat[qk_q_row:qk_q_row + QK_M_TILE, 0:HEAD_DIM]
-                            qk_scores = pl.matmul(qk_q, qk_kv, b_trans=True, out_dtype=pl.FP32)
-                            qk_scores = pl.add(pl.mul(qk_scores, SOFTMAX_SCALE), qk_bias)
-                            qk_scores = pl.set_validshape(qk_scores, QK_M_TILE, qk_valid_rows)
-                            qk_scores = pl.fillpad(qk_scores, pad_value=pl.PadValue.min)
-                            qk_m = pl.row_max(qk_scores)
-                            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_m))
-                            qk_exp = pl.mul(qk_exp, qk_valid)
-                            qk_l = pl.row_sum(qk_exp)
-                            qk_o = pl.matmul(pl.cast(qk_exp, target_type=pl.BF16, mode="rint"), qk_kv, out_dtype=pl.FP32)
-                            for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
-                                qk_src_h0 = qk_sub * HEAD_TILE
-                                qk_row = qk_token_base + qk_h0 + qk_src_h0
-                                qk_cur_m = qk_m[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
-                                qk_cur_l = qk_l[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:1]
-                                qk_cur_o = qk_o[qk_src_h0:qk_src_h0 + HEAD_TILE, 0:HEAD_DIM]
-                                # Read col0 as a dense [HEAD_TILE, 1] vector: a column
-                                # view of a padded tile keeps the row pitch.
-                                qk_run_m_padded = cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8]
-                                qk_run_l_padded = cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8]
-                                qk_run_m_transposed = pl.transpose(qk_run_m_padded, axis1=0, axis2=1)
-                                qk_run_l_transposed = pl.transpose(qk_run_l_padded, axis1=0, axis2=1)
-                                qk_run_m = pl.reshape(qk_run_m_transposed[0:1, :], [HEAD_TILE, 1])
-                                qk_run_l = pl.reshape(qk_run_l_transposed[0:1, :], [HEAD_TILE, 1])
-                                qk_run_o = cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM]
-                                qk_next_m = pl.maximum(qk_run_m, qk_cur_m)
-                                qk_alpha = pl.exp(pl.sub(qk_run_m, qk_next_m))
-                                qk_beta = pl.exp(pl.sub(qk_cur_m, qk_next_m))
-                                qk_next_l = pl.add(pl.mul(qk_alpha, qk_run_l), pl.mul(qk_beta, qk_cur_l))
-                                qk_next_o = pl.add(
-                                    pl.row_expand_mul(qk_run_o, qk_alpha),
-                                    pl.row_expand_mul(qk_cur_o, qk_beta),
-                                )
-                                # Write whole scratch rows: a narrow column
-                                # store ignores the padded row pitch.
-                                qk_stat_zeros = pl.full([HEAD_TILE, 8], dtype=pl.FP32, value=0.0)
-                                cmp_partial_m[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_m)
-                                cmp_partial_l[qk_row:qk_row + HEAD_TILE, 0:8] = pl.row_expand_add(qk_stat_zeros, qk_next_l)
-                                cmp_partial_o[qk_row:qk_row + HEAD_TILE, 0:HEAD_DIM] = qk_next_o
+    @pl.jit.inline(auto_scope=False)
+    def _hca_merge_rope_stage(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        cmp_work_kv: pl.Tensor[[HCA_CMP_WORK_ROWS_DYN, HEAD_DIM], pl.BF16],
+        position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        stream_state_m: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_state_l: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_heads: pl.Tensor[[HCA_HEAD_ROWS_DYN, HEAD_DIM], pl.FP32],
+        cmp_partial_m: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_l: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_o: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, HEAD_DIM], pl.FP32],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        stage_ready_dep0: pl.Scalar[pl.TASK_ID],
+        stage_ready_dep1: pl.Scalar[pl.TASK_ID],
+        stage_ready_dep2: pl.Scalar[pl.TASK_ID],
+        stage_ready_dep3: pl.Scalar[pl.TASK_ID],
+    ):
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        packed_rows = pl.tensor.dim(o_packed_heads, 0) // H
+        cmp_work_rows_avail = pl.tensor.dim(cmp_work_kv, 0)
+        attn_sink_col = pl.reshape(attn_sink, [H, 1])
+        with pl.spmd(token_rows, name_hint='native_hca_merge_rope_pack', deps=[stage_ready_dep0, stage_ready_dep1, stage_ready_dep2, stage_ready_dep3]) as merge_tid:
+            merge_local_t = pl.tile.get_block_idx()
+            merge_t = merge_local_t
+            if merge_t < active_rows:
+                merge_position_i32 = pl.read(position_ids, [merge_t])
+                merge_visible_rows = (merge_position_i32 + 1) // HCA_COMPRESS_RATIO
+                merge_visible_rows = pl.min(merge_visible_rows, cmp_work_rows_avail)
+                merge_cos = rope_cos_il[merge_t:merge_t + 1, 0:ROPE_DIM]
+                merge_sin = rope_sin_signed[merge_t:merge_t + 1, 0:ROPE_DIM]
+                merge_cols = pl.col_expand_mul(pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0), pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), pl.FP32))
+                merge_pairs = pl.cast(pl.cast(pl.mul(merge_cols, 0.5), pl.INT32, mode='trunc'), pl.FP32)
+                merge_lanes = pl.sub(merge_cols, pl.mul(merge_pairs, 2.0))
+                merge_swap_idx = pl.cast(pl.sub(pl.add(merge_cols, 1.0), pl.mul(merge_lanes, 2.0)), pl.INT32)
+                for merge_h_idx in pl.range(H // HEAD_TILE):
+                    merge_h0 = merge_h_idx * HEAD_TILE
+                    merge_stream_row = merge_local_t * H + merge_h0
+                    merge_m = stream_state_m[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
+                    merge_l = stream_state_l[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
+                    merge_o = stream_heads[merge_stream_row:merge_stream_row + HEAD_TILE, 0:HEAD_DIM]
+                    for merge_fold in pl.range(pl.min(merge_visible_rows, 1)):
+                        merge_row = merge_stream_row + merge_fold
+                        merge_cmp_m_padded = cmp_partial_m[merge_row:merge_row + HEAD_TILE, 0:8]
+                        merge_cmp_l_padded = cmp_partial_l[merge_row:merge_row + HEAD_TILE, 0:8]
+                        merge_cmp_m_transposed = pl.transpose(merge_cmp_m_padded, axis1=0, axis2=1)
+                        merge_cmp_l_transposed = pl.transpose(merge_cmp_l_padded, axis1=0, axis2=1)
+                        merge_cmp_m = pl.reshape(merge_cmp_m_transposed[0:1, :], [HEAD_TILE, 1])
+                        merge_cmp_l = pl.reshape(merge_cmp_l_transposed[0:1, :], [HEAD_TILE, 1])
+                        merge_cmp_o = cmp_partial_o[merge_row:merge_row + HEAD_TILE, 0:HEAD_DIM]
+                        merge_m_new = pl.maximum(merge_m, merge_cmp_m)
+                        merge_alpha = pl.exp(pl.sub(merge_m, merge_m_new))
+                        merge_beta = pl.exp(pl.sub(merge_cmp_m, merge_m_new))
+                        merge_l = pl.add(pl.mul(merge_alpha, merge_l), pl.mul(merge_beta, merge_cmp_l))
+                        merge_o = pl.add(pl.row_expand_mul(merge_o, merge_alpha), pl.row_expand_mul(merge_cmp_o, merge_beta))
+                        merge_m = merge_m_new
+                    merge_sink = attn_sink_col[merge_h0:merge_h0 + HEAD_TILE, 0:1]
+                    merge_sink_tile = pl.add(pl.sub(merge_m, merge_m), merge_sink)
+                    merge_denom = pl.add(merge_l, pl.exp(pl.sub(merge_sink_tile, merge_m)))
+                    merge_full = pl.row_expand_div(merge_o, merge_denom)
+                    merge_nope_bf16 = pl.cast(merge_full[:, 0:NOPE_DIM], target_type=pl.BF16, mode='rint')
+                    merge_rope = merge_full[:, NOPE_DIM:HEAD_DIM]
+                    merge_swapped = pl.gather(merge_rope, dim=-1, index=merge_swap_idx)
+                    merge_rot = pl.add(pl.col_expand_mul(merge_rope, merge_cos), pl.col_expand_mul(merge_swapped, merge_sin))
+                    merge_rope_bf16 = pl.cast(merge_rot, target_type=pl.BF16, mode='rint')
+                    merge_group0 = merge_h0 // HEADS_PER_GROUP
+                    for merge_subgroup in pl.unroll(HEAD_TILE // HEADS_PER_GROUP):
+                        merge_src_h0 = merge_subgroup * HEADS_PER_GROUP
+                        merge_pack_row = (merge_group0 + merge_subgroup) * packed_rows + merge_t
+                        merge_dst_head = merge_pack_row * HEADS_PER_GROUP
+                        pl.assemble(o_packed_heads, merge_nope_bf16[merge_src_h0:merge_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM], [merge_dst_head, 0])
+                        pl.assemble(o_packed_heads, merge_rope_bf16[merge_src_h0:merge_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM], [merge_dst_head, NOPE_DIM])
+        return merge_tid
 
-    attn_sink_col = pl.reshape(attn_sink, [H, 1])
-    with pl.spmd(token_rows, name_hint="native_hca_merge_rope_pack", deps=[raw_heads_tid, cmp_qk_tid, rope_ready_dep, packed_ready_dep]) as merge_tid:
-        # At MTP's one-work-tile extent, token parallelism alone saturates the
-        # device.  Fold the head tiles into each token block so position/RoPE
-        # rows stay live and the merge does not fan out four tiny blocks.
-        merge_local_t = pl.tile.get_block_idx()
-        merge_t = merge_local_t
-        if merge_t < active_rows:
-            merge_position_i32 = pl.read(position_ids, [merge_t])
-            merge_visible_rows = (merge_position_i32 + 1) // HCA_COMPRESS_RATIO
-            merge_visible_rows = pl.min(merge_visible_rows, cmp_work_rows_avail)
-            merge_cos = rope_cos_il[merge_t:merge_t + 1, 0:ROPE_DIM]
-            merge_sin = rope_sin_signed[merge_t:merge_t + 1, 0:ROPE_DIM]
-            # Build the odd/even RoPE channel permutation.
-            merge_cols = pl.col_expand_mul(
-                pl.full([HEAD_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-                pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), pl.FP32),
-            )
-            merge_pairs = pl.cast(pl.cast(pl.mul(merge_cols, 0.5), pl.INT32, mode="trunc"), pl.FP32)
-            merge_lanes = pl.sub(merge_cols, pl.mul(merge_pairs, 2.0))
-            merge_swap_idx = pl.cast(pl.sub(pl.add(merge_cols, 1.0), pl.mul(merge_lanes, 2.0)), pl.INT32)
-            for merge_h_idx in pl.range(H // HEAD_TILE):
-                merge_h0 = merge_h_idx * HEAD_TILE
-                merge_stream_row = merge_local_t * H + merge_h0
-                merge_m = stream_state_m[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
-                merge_l = stream_state_l[merge_stream_row:merge_stream_row + HEAD_TILE, 0:1]
-                merge_o = stream_heads[merge_stream_row:merge_stream_row + HEAD_TILE, 0:HEAD_DIM]
-                for merge_fold in pl.range(pl.min(merge_visible_rows, 1)):
-                    merge_row = merge_stream_row + merge_fold
-                    merge_cmp_m_padded = cmp_partial_m[merge_row:merge_row + HEAD_TILE, 0:8]
-                    merge_cmp_l_padded = cmp_partial_l[merge_row:merge_row + HEAD_TILE, 0:8]
-                    # Read col0 as a dense [HEAD_TILE, 1] vector: a column
-                    # view of a padded tile keeps the row pitch.
-                    merge_cmp_m_transposed = pl.transpose(merge_cmp_m_padded, axis1=0, axis2=1)
-                    merge_cmp_l_transposed = pl.transpose(merge_cmp_l_padded, axis1=0, axis2=1)
-                    merge_cmp_m = pl.reshape(merge_cmp_m_transposed[0:1, :], [HEAD_TILE, 1])
-                    merge_cmp_l = pl.reshape(merge_cmp_l_transposed[0:1, :], [HEAD_TILE, 1])
-                    merge_cmp_o = cmp_partial_o[merge_row:merge_row + HEAD_TILE, 0:HEAD_DIM]
-                    merge_m_new = pl.maximum(merge_m, merge_cmp_m)
-                    merge_alpha = pl.exp(pl.sub(merge_m, merge_m_new))
-                    merge_beta = pl.exp(pl.sub(merge_cmp_m, merge_m_new))
-                    merge_l = pl.add(pl.mul(merge_alpha, merge_l), pl.mul(merge_beta, merge_cmp_l))
-                    merge_o = pl.add(
-                        pl.row_expand_mul(merge_o, merge_alpha),
-                        pl.row_expand_mul(merge_cmp_o, merge_beta),
-                    )
-                    merge_m = merge_m_new
-
-                merge_sink = attn_sink_col[merge_h0:merge_h0 + HEAD_TILE, 0:1]
-                merge_sink_tile = pl.add(pl.sub(merge_m, merge_m), merge_sink)
-                merge_denom = pl.add(merge_l, pl.exp(pl.sub(merge_sink_tile, merge_m)))
-                merge_full = pl.row_expand_div(merge_o, merge_denom)
-                merge_nope_bf16 = pl.cast(merge_full[:, 0:NOPE_DIM], target_type=pl.BF16, mode="rint")
-                merge_rope = merge_full[:, NOPE_DIM:HEAD_DIM]
-                merge_swapped = pl.gather(merge_rope, dim=-1, index=merge_swap_idx)
-                merge_rot = pl.add(
-                    pl.col_expand_mul(merge_rope, merge_cos),
-                    pl.col_expand_mul(merge_swapped, merge_sin),
+    @pl.jit.inline(auto_scope=False)
+    def _hca_segment_heads(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        predecessor_valid: pl.Scalar[pl.INDEX],
+        cmp_work_kv: pl.Tensor[[HCA_CMP_WORK_ROWS_DYN, HEAD_DIM], pl.BF16],
+        cmp_work_valid: pl.Tensor[[HCA_CMP_WORK_TILES_DYN, HCA_ATTN_TILE], pl.FP32],
+        position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        hist_kv: pl.Tensor[[HCA_RAW_ROWS_DYN, HEAD_DIM], pl.BF16],
+        raw_valid: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.FP32],
+        stream_state_m: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_state_l: pl.Tensor[[HCA_HEAD_ROWS_DYN, 1], pl.FP32],
+        stream_heads: pl.Tensor[[HCA_HEAD_ROWS_DYN, HEAD_DIM], pl.FP32],
+        cmp_partial_m: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_l: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, 8], pl.FP32],
+        cmp_partial_o: pl.Tensor[[HCA_PARTIAL_ROWS_DYN, HEAD_DIM], pl.FP32],
+        rope_cos_il: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        rope_sin_signed: pl.Tensor[[PREFILL_ATTN_ROPE_ROWS_DYN, ROPE_DIM], pl.FP32],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        cmp_ready_dep: pl.Scalar[pl.TASK_ID],
+        rope_ready_dep: pl.Scalar[pl.TASK_ID],
+        packed_ready_dep: pl.Scalar[pl.TASK_ID],
+        wave_completion: pl.Array[1, pl.TASK_ID],
+    ):
+        if fixed_rows > 0:
+            with pl.graph("hca_hist_pack", deps=[raw_ready_dep]) as raw_gather_tid:
+                hca_hist_pack_invalid_dep = pl.system.task_invalid()
+                _hca_hist_pack_internal_done = _hca_hist_pack_stage(
+                    q, full_kv, predecessor_valid, active_rows, hist_kv, raw_valid,
+                    hca_hist_pack_invalid_dep,
                 )
-                merge_rope_bf16 = pl.cast(merge_rot, target_type=pl.BF16, mode="rint")
-                merge_group0 = merge_h0 // HEADS_PER_GROUP
-                for merge_subgroup in pl.unroll(HEAD_TILE // HEADS_PER_GROUP):
-                    merge_src_h0 = merge_subgroup * HEADS_PER_GROUP
-                    merge_pack_row = ((merge_group0 + merge_subgroup) * packed_rows + merge_t)
-                    merge_dst_head = merge_pack_row * HEADS_PER_GROUP
-                    pl.assemble(
-                        o_packed_heads,
-                        merge_nope_bf16[merge_src_h0: merge_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM],
-                        [merge_dst_head, 0],
+        else:
+            raw_gather_tid = _hca_hist_pack_stage(
+                q, full_kv, predecessor_valid, active_rows, hist_kv, raw_valid, raw_ready_dep,
+            )
+        if fixed_rows > 0:
+            with pl.graph("hca_raw_qk_pv", deps=[raw_gather_tid]) as raw_heads_tid:
+                hca_raw_qk_pv_invalid_dep = pl.system.task_invalid()
+                _hca_raw_qk_pv_internal_done = _hca_raw_qk_pv_stage(
+                    q, predecessor_valid, active_rows, hist_kv, raw_valid, stream_state_m, stream_state_l,
+                    stream_heads, hca_raw_qk_pv_invalid_dep,
+                )
+        else:
+            raw_heads_tid = _hca_raw_qk_pv_stage(
+                q, predecessor_valid, active_rows, hist_kv, raw_valid, stream_state_m, stream_state_l,
+                stream_heads, raw_gather_tid,
+            )
+        if fixed_rows > 0:
+            with pl.graph("hca_cmp_qk_pv", deps=[cmp_ready_dep]) as cmp_qk_tid:
+                hca_cmp_qk_pv_invalid_dep = pl.system.task_invalid()
+                _hca_cmp_qk_pv_internal_done = _hca_cmp_qk_pv_stage(
+                    q, cmp_work_kv, cmp_work_valid, position_ids, active_rows, cmp_partial_m, cmp_partial_l,
+                    cmp_partial_o, hca_cmp_qk_pv_invalid_dep,
+                )
+        else:
+            cmp_qk_tid = _hca_cmp_qk_pv_stage(
+                q, cmp_work_kv, cmp_work_valid, position_ids, active_rows, cmp_partial_m, cmp_partial_l,
+                cmp_partial_o, cmp_ready_dep,
+            )
+        if fixed_rows > 0:
+            with pl.graph("hca_merge_rope", deps=[raw_heads_tid, cmp_qk_tid, rope_ready_dep, packed_ready_dep]) as merge_tid:
+                hca_merge_rope_invalid_dep = pl.system.task_invalid()
+                _hca_merge_rope_internal_done = _hca_merge_rope_stage(
+                    q, cmp_work_kv, position_ids, attn_sink, active_rows, o_packed_heads, stream_state_m,
+                    stream_state_l, stream_heads, cmp_partial_m, cmp_partial_l, cmp_partial_o, rope_cos_il,
+                    rope_sin_signed, hca_merge_rope_invalid_dep, hca_merge_rope_invalid_dep,
+                    hca_merge_rope_invalid_dep, hca_merge_rope_invalid_dep,
+                )
+        else:
+            merge_tid = _hca_merge_rope_stage(
+                q, cmp_work_kv, position_ids, attn_sink, active_rows, o_packed_heads, stream_state_m,
+                stream_state_l, stream_heads, cmp_partial_m, cmp_partial_l, cmp_partial_o, rope_cos_il,
+                rope_sin_signed, raw_heads_tid, cmp_qk_tid, rope_ready_dep, packed_ready_dep,
+            )
+        wave_completion[0] = merge_tid
+
+    return _hca_segment_heads
+
+
+_hca_segment_heads = make_hca_segment_heads()
+
+
+def make_hca_heads(fixed_rows: int = 0):
+    segment_heads = make_hca_segment_heads(fixed_rows)
+
+    @pl.jit.inline(auto_scope=False)
+    def _hca_heads(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        predecessor_valid: pl.Scalar[pl.INDEX],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        active_rows: pl.Scalar[pl.INDEX],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
+        packed_init_tid: pl.Scalar[pl.TASK_ID],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+    ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+        """Gather compressed history and prepare one runtime-sized HCA segment."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        hist_rows = token_rows + 2 * WIN
+        head_rows = token_rows * H
+        partial_rows = head_rows
+        rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
+        cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+        cmp_page_rows = pl.tensor.dim(cmp_kv, 1)
+        cmp_cache_rows = cmp_block_num * cmp_page_rows
+        cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
+        completion = pl.array.create(1, pl.TASK_ID)
+        completion[0] = packed_init_tid
+
+        # Explicit scratch ordering with automatic allocator retention.
+        with pl.scope():
+            tile_cmp_visible_rows = pl.create_tensor([1], dtype=pl.INT32, manual_dep=True)
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="native_hca_cmp_plan",
+                deps=[packed_init_tid, compressed_ready_dep],
+            ) as cmp_plan_tid:
+                plan_visible_rows = pl.cast(0, pl.INDEX)
+                if active_rows > 0:
+                    plan_last_t = active_rows - 1
+                    plan_max_pos = pl.read(position_ids, [plan_last_t])
+                    plan_visible_rows = (plan_max_pos + 1) // HCA_COMPRESS_RATIO
+                plan_visible_rows = pl.max(plan_visible_rows, 0)
+                plan_visible_rows = pl.min(plan_visible_rows, cmp_cache_rows)
+                pl.write(tile_cmp_visible_rows, [0], pl.cast(plan_visible_rows, pl.INT32))
+
+            # HCA_CMP_WORK_COUNT is derived from max_position_embeddings, so it sizes the
+            # arena for a 1M-token context: 64 work tiles even when the compressed cache
+            # this program was handed holds 16 rows. The kernel cannot gather more rows
+            # than that cache holds, so the runtime capacity is the correct bound. A
+            # level-4 trace showed the 63 empty blocks costing 352 us of critical path
+            # (12.0%) while the whole task did 603 core-us of work: they were queued
+            # behind the previous wave's native_hca_cmp_qk_pv and the next one waited.
+            cmp_work_tiles = (cmp_cache_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
+            cmp_work_rows = cmp_work_tiles * HCA_ATTN_TILE
+            cmp_work_kv = pl.create_tensor([cmp_work_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+            cmp_work_valid = pl.create_tensor([cmp_work_tiles, HCA_ATTN_TILE], dtype=pl.FP32, manual_dep=True)
+            with pl.spmd(cmp_work_tiles, name_hint="native_hca_cmp_gather", deps=[cmp_plan_tid]) as cmp_gather_tid:
+                gather_work = pl.tile.get_block_idx()
+                gather_dst0 = gather_work * HCA_ATTN_TILE
+                gather_visible = pl.cast(pl.read(tile_cmp_visible_rows, [0]), pl.INDEX)
+                gather_rows = pl.max(0, pl.min(HCA_ATTN_TILE, gather_visible - gather_dst0))
+                gather_stage = pl.full([HCA_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                gather_valid = pl.full([1, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
+                for gather_local in pl.range(gather_rows):
+                    gather_slot = gather_dst0 + gather_local
+                    gather_table_col = gather_slot // cmp_page_rows
+                    if gather_table_col < CMP_MAX_BLOCKS:
+                        gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
+                        if gather_block_i32 >= 0:
+                            if gather_block_i32 < cmp_block_num:
+                                gather_block = pl.cast(gather_block_i32, pl.INDEX)
+                                gather_src = gather_block * cmp_page_rows + gather_slot % cmp_page_rows
+                                gather_stage[gather_local:gather_local + 1, :] = cmp_kv_flat[gather_src:gather_src + 1, :]
+                                pl.write(gather_valid, [0, gather_local], 1.0)
+                cmp_work_kv[gather_dst0:gather_dst0 + HCA_ATTN_TILE, :] = gather_stage
+                cmp_work_valid[gather_work:gather_work + 1, :] = gather_valid
+
+            rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
+            rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
+            rope_cs_tid = _staged_attn_prepare_rope(
+                freqs_cos,
+                freqs_sin,
+                rope_cos_il,
+                rope_sin_signed,
+                rope_swap_idx,
+                active_rows,
+                raw_ready_dep,
+            )
+
+            hist_kv = pl.create_tensor([hist_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+            raw_valid = pl.create_tensor([token_rows, WIN], dtype=pl.FP32, manual_dep=True)
+            stream_state_m = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
+            stream_state_l = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
+            stream_heads = pl.create_tensor([head_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
+            cmp_partial_m = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
+            cmp_partial_l = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
+            cmp_partial_o = pl.create_tensor([partial_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
+            wave_completion = pl.array.create(1, pl.TASK_ID)
+            # Raw packing consumes neither compressed KV nor RoPE. Keep readiness
+            # edges on their consumers; merge still waits for RoPE and packed init.
+            segment_heads(
+                q,
+                full_kv,
+                predecessor_valid,
+                cmp_work_kv,
+                cmp_work_valid,
+                position_ids,
+                attn_sink,
+                active_rows,
+                o_packed_heads,
+                hist_kv,
+                raw_valid,
+                stream_state_m,
+                stream_state_l,
+                stream_heads,
+                cmp_partial_m,
+                cmp_partial_l,
+                cmp_partial_o,
+                rope_cos_il,
+                rope_sin_signed,
+                raw_ready_dep,
+                cmp_gather_tid,
+                rope_cs_tid,
+                packed_init_tid,
+                wave_completion,
+            )
+            completion[0] = wave_completion[0]
+
+        return o_packed_heads, completion[0]
+
+    return _hca_heads
+
+
+_hca_heads = make_hca_heads()
+
+
+def make_hca_attn(fixed_rows: int = 0):
+    heads_impl = make_hca_heads(fixed_rows)
+    projection_impl = make_staged_attn_o_proj(fixed_rows)
+
+    @pl.jit.inline(auto_scope=False)
+    def hca_attn(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        predecessor_valid: pl.Scalar[pl.INT32],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
+        active_rows: pl.Scalar[pl.INT32],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+        o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Run variable-length C128 attention over physical cache roots."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        packed_head_rows = projection_rows * H
+        active = pl.cast(active_rows, pl.INDEX)
+        active = pl.min(token_rows, pl.max(active, 0))
+        predecessor_rows = pl.cast(predecessor_valid, pl.INDEX)
+        predecessor_rows = pl.min(WIN, pl.max(predecessor_rows, 0))
+        completion = pl.array.create(1, pl.TASK_ID)
+        completion[0] = compressed_ready_dep
+        with pl.scope():
+            o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+            # Zero-fill, 4 query tiles per block: every one of the 256 one-tile blocks ran
+            # under 5 us, so dispatch dominated. STAGED_SWA_QUERY_TILE itself is shared with
+            # the tuned SWA wave and must not change -- only this fill's blocking does.
+            with pl.spmd(
+                packed_head_rows // (STAGED_SWA_QUERY_TILE * PACKED_INIT_TILES),
+                name_hint="native_hca_packed_init",
+                deps=[raw_ready_dep],
+            ) as packed_init_tid:
+                packed_blk = pl.tile.get_block_idx()
+                # One tile per iteration: a [STAGED_SWA_QUERY_TILE, HEAD_DIM] BF16 fill is already
+                # 128 KB of UB, so the tile size must stay put -- only the block count drops.
+                for packed_i in pl.range(PACKED_INIT_TILES):
+                    packed_row = (packed_blk * PACKED_INIT_TILES + packed_i) * STAGED_SWA_QUERY_TILE
+                    o_packed_heads[
+                        packed_row:packed_row + STAGED_SWA_QUERY_TILE,
+                        0:HEAD_DIM,
+                    ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+
+            o_packed_heads, heads_dep = heads_impl(
+                q,
+                full_kv,
+                predecessor_rows,
+                cmp_kv,
+                cmp_block_table,
+                position_ids,
+                attn_sink,
+                active,
+                freqs_cos,
+                freqs_sin,
+                o_packed_heads,
+                packed_init_tid,
+                raw_ready_dep,
+                compressed_ready_dep,
+            )
+            if fixed_rows > 0:
+                with pl.graph("hca_output_projection", deps=[heads_dep, o_proj_weight_dep]) as act_tid:
+                    projection_invalid_dep = pl.system.task_invalid()
+                    _attn_out, _projection_internal_done = projection_impl(
+                        o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, projection_invalid_dep,
                     )
-                    pl.assemble(
-                        o_packed_heads,
-                        merge_rope_bf16[merge_src_h0: merge_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM],
-                        [merge_dst_head, NOPE_DIM],
-                    )
+            else:
+                o_proj_dep = pl.system.task_dummy(deps=[heads_dep, o_proj_weight_dep])
+                _attn_out, act_tid = projection_impl(
+                    o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, o_proj_dep,
+                )
+            completion[0] = act_tid
 
-    wave_completion[0] = merge_tid
+        return completion[0]
+
+    return hca_attn
 
 
-@pl.jit.inline(auto_scope=False)
-def _hca_heads(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    predecessor_valid: pl.Scalar[pl.INDEX],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    active_rows: pl.Scalar[pl.INDEX],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor[[PREFILL_ATTN_PACKED_ROWS_DYN, HEAD_DIM], pl.BF16],
-    packed_init_tid: pl.Scalar[pl.TASK_ID],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
-) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
-    """Gather compressed history and prepare one runtime-sized HCA segment."""
-    token_rows = pl.tensor.dim(q, 0)
-    hist_rows = token_rows + 2 * WIN
-    head_rows = token_rows * H
-    partial_rows = head_rows
-    rope_rows = ((token_rows + STAGED_SWA_ROPE_CS_T_TILE - 1) // STAGED_SWA_ROPE_CS_T_TILE) * STAGED_SWA_ROPE_CS_T_TILE
-    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_page_rows = pl.tensor.dim(cmp_kv, 1)
-    cmp_cache_rows = cmp_block_num * cmp_page_rows
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = packed_init_tid
+hca_attn = make_hca_attn()
 
-    # Explicit scratch ordering with automatic allocator retention.
-    with pl.scope():
-        tile_cmp_visible_rows = pl.create_tensor([1], dtype=pl.INT32, manual_dep=True)
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="native_hca_cmp_plan",
-            deps=[packed_init_tid, compressed_ready_dep],
-        ) as cmp_plan_tid:
-            plan_visible_rows = pl.cast(0, pl.INDEX)
-            if active_rows > 0:
-                plan_last_t = active_rows - 1
-                plan_max_pos = pl.read(position_ids, [plan_last_t])
-                plan_visible_rows = (plan_max_pos + 1) // HCA_COMPRESS_RATIO
-            plan_visible_rows = pl.max(plan_visible_rows, 0)
-            plan_visible_rows = pl.min(plan_visible_rows, cmp_cache_rows)
-            pl.write(tile_cmp_visible_rows, [0], pl.cast(plan_visible_rows, pl.INT32))
 
-        # HCA_CMP_WORK_COUNT is derived from max_position_embeddings, so it sizes the
-        # arena for a 1M-token context: 64 work tiles even when the compressed cache
-        # this program was handed holds 16 rows. The kernel cannot gather more rows
-        # than that cache holds, so the runtime capacity is the correct bound. A
-        # level-4 trace showed the 63 empty blocks costing 352 us of critical path
-        # (12.0%) while the whole task did 603 core-us of work: they were queued
-        # behind the previous wave's native_hca_cmp_qk_pv and the next one waited.
-        cmp_work_tiles = (cmp_cache_rows + HCA_ATTN_TILE - 1) // HCA_ATTN_TILE
-        cmp_work_rows = cmp_work_tiles * HCA_ATTN_TILE
-        cmp_work_kv = pl.create_tensor([cmp_work_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        cmp_work_valid = pl.create_tensor([cmp_work_tiles, HCA_ATTN_TILE], dtype=pl.FP32, manual_dep=True)
-        with pl.spmd(cmp_work_tiles, name_hint="native_hca_cmp_gather", deps=[cmp_plan_tid]) as cmp_gather_tid:
-            gather_work = pl.tile.get_block_idx()
-            gather_dst0 = gather_work * HCA_ATTN_TILE
-            gather_visible = pl.cast(pl.read(tile_cmp_visible_rows, [0]), pl.INDEX)
-            gather_rows = pl.max(0, pl.min(HCA_ATTN_TILE, gather_visible - gather_dst0))
-            gather_stage = pl.full([HCA_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            gather_valid = pl.full([1, HCA_ATTN_TILE], dtype=pl.FP32, value=0.0)
-            for gather_local in pl.range(gather_rows):
-                gather_slot = gather_dst0 + gather_local
-                gather_table_col = gather_slot // cmp_page_rows
-                if gather_table_col < CMP_MAX_BLOCKS:
-                    gather_block_i32 = pl.read(cmp_block_table, [gather_table_col])
-                    if gather_block_i32 >= 0:
-                        if gather_block_i32 < cmp_block_num:
-                            gather_block = pl.cast(gather_block_i32, pl.INDEX)
-                            gather_src = gather_block * cmp_page_rows + gather_slot % cmp_page_rows
-                            gather_stage[gather_local:gather_local + 1, :] = cmp_kv_flat[gather_src:gather_src + 1, :]
-                            pl.write(gather_valid, [0, gather_local], 1.0)
-            cmp_work_kv[gather_dst0:gather_dst0 + HCA_ATTN_TILE, :] = gather_stage
-            cmp_work_valid[gather_work:gather_work + 1, :] = gather_valid
+def make_physical_sparse_attn(fixed_rows=0):
+    planned_o_proj = make_staged_attn_o_proj(fixed_rows)
+    planned_heads = make_physical_sparse_heads(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def physical_sparse_attn(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
+        active_rows: pl.Scalar[pl.INT32],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+        CONTIGUOUS_CMP_PAGES: pl.constexpr,
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Run TopK attention; contiguous compressed roots bypass cmp_block_table."""
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        packed_head_rows = projection_rows * H
+        active = pl.cast(active_rows, pl.INDEX)
+        active = pl.min(token_rows, pl.max(active, 0))
+        completion = pl.array.create(1, pl.TASK_ID)
+        completion[0] = compressed_ready_dep
+        with pl.scope():
+            o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+            # Same fix as native_hca_packed_init: all 256 one-tile blocks ran under 5 us,
+            # so dispatch dominated. Four tiles per block, one pl.full per iteration --
+            # the tile itself is 128 KB of UB and must not grow.
+            with pl.spmd(
+                packed_head_rows // (STAGED_SWA_QUERY_TILE * PACKED_INIT_TILES),
+                name_hint="physical_sparse_packed_init",
+                deps=[raw_ready_dep],
+            ) as packed_init_tid:
+                packed_blk = pl.tile.get_block_idx()
+                for packed_i in pl.range(PACKED_INIT_TILES):
+                    packed_row = (packed_blk * PACKED_INIT_TILES + packed_i) * STAGED_SWA_QUERY_TILE
+                    o_packed_heads[
+                        packed_row : packed_row + STAGED_SWA_QUERY_TILE,
+                        0:HEAD_DIM,
+                    ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
 
-        rope_cos_il = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_sin_signed = pl.create_tensor([rope_rows, ROPE_DIM], dtype=pl.FP32, manual_dep=True)
-        rope_swap_idx = pl.create_tensor([HEAD_TILE, ROPE_DIM], dtype=pl.INT32, manual_dep=True)
-        rope_cs_tid = _staged_attn_prepare_rope(
-            freqs_cos,
-            freqs_sin,
-            rope_cos_il,
-            rope_sin_signed,
-            rope_swap_idx,
-            active_rows,
-            raw_ready_dep,
+            o_packed_heads, heads_tid = planned_heads(
+                q,
+                ori_kv,
+                swa_indices,
+                cmp_kv,
+                cmp_block_table,
+                cmp_indices,
+                valid_block_mask,
+                attn_sink,
+                active,
+                freqs_cos,
+                freqs_sin,
+                o_packed_heads,
+                packed_init_tid,
+                raw_ready_dep,
+                compressed_ready_dep,
+                CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
+            )
+            _attn_out, projection_tid = planned_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_tid)
+            completion[0] = projection_tid
+
+        # PR #1073 publishes the final output dependency after leaving the
+        # tile-local scope.  Keep that exact post-0.60 lifetime pattern here.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="physical_sparse_publish", deps=[completion[0]]) as publish_tid:
+            completion_anchor = pl.read(attn_out, [0, 0])
+            pl.write(attn_out, [0, 0], completion_anchor)
+        return publish_tid
+
+    return physical_sparse_attn
+
+physical_sparse_attn = make_physical_sparse_attn()
+
+
+def make_staged_sparse_attn(fixed_rows=0):
+    planned_heads = make_staged_swa_heads(fixed_rows)
+    planned_projection = make_staged_attn_o_proj(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def staged_sparse_attn(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
+        active_rows: pl.Scalar[pl.INT32],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+        kv_query_stride: pl.Scalar[pl.INDEX],
+        kv_row_origin: pl.Scalar[pl.INDEX],
+    ) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+        """Return projection completion and the last staged-source read completion.
+
+        Staging may overwrite its source, bias and mask after the heads merge has
+        finished; the output projection continues using its private packed heads.
+        """
+        token_rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            token_rows = fixed_rows
+        projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
+        packed_head_rows = projection_rows * H
+        active = pl.cast(active_rows, pl.INDEX)
+        active = pl.min(token_rows, pl.max(active, 0))
+        completion = pl.array.create(2, pl.TASK_ID)
+        completion[0] = prior_dep
+        completion[1] = prior_dep
+        with pl.scope():
+            o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
+            packed_blocks_per_group = projection_rows * HEADS_PER_GROUP // STAGED_SWA_QUERY_TILE
+            live_blocks_per_group = active * HEADS_PER_GROUP // STAGED_SWA_QUERY_TILE
+            if fixed_rows > 0:
+                live_blocks_per_group = 0
+            padding_blocks_per_group = packed_blocks_per_group - live_blocks_per_group
+            packed_init_tids = pl.array.create(1, pl.TASK_ID)
+            packed_init_tids[0] = prior_dep
+            if padding_blocks_per_group > 0:
+                # Merge overwrites live rows. Keep the boundary tile zeroed for padding.
+                with pl.spmd(
+                    O_GROUPS * padding_blocks_per_group,
+                    name_hint="staged_swa_packed_init",
+                    deps=[prior_dep],
+                ) as padding_init_tid:
+                    block = pl.tile.get_block_idx()
+                    group = block // padding_blocks_per_group
+                    group_block = live_blocks_per_group + block % padding_blocks_per_group
+                    packed_row = (group * packed_blocks_per_group + group_block) * STAGED_SWA_QUERY_TILE
+                    packed_zero = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                    o_packed_heads[packed_row : packed_row + STAGED_SWA_QUERY_TILE, 0:HEAD_DIM] = packed_zero
+                packed_init_tids[0] = padding_init_tid
+            packed_init_tid = packed_init_tids[0]
+
+            o_packed_heads, heads_dep = planned_heads(
+                q,
+                sparse_kv,
+                sparse_bias,
+                valid_block_mask,
+                attn_sink,
+                active,
+                freqs_cos,
+                freqs_sin,
+                o_packed_heads,
+                packed_init_tid,
+                prior_dep,
+                kv_query_stride,
+                kv_row_origin,
+            )
+            _attn_out, act_tid = planned_projection(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
+            completion[0] = act_tid
+            completion[1] = heads_dep
+
+        # ``attn_out`` is caller-owned GM storage written by the projection tasks.
+        # Returning its scoped SSA version makes the generated runtime C++ refer to
+        # an inner-scope alias after that scope has ended.  Only the completion
+        # token needs to cross this boundary.
+        return completion[0], completion[1]
+
+    return staged_sparse_attn
+
+
+staged_sparse_attn = make_staged_sparse_attn()
+
+
+def make_prefill_staged_attention(fixed_rows=0):
+    planned_attention = make_staged_sparse_attn(fixed_rows)
+    planned_post = make_hc_post_prefill_split(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def prefill_staged_attention(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
+        sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+        post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
+        comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
+        x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+        active_rows: pl.Scalar[pl.INT32],
+        prior_dep: pl.Scalar[pl.TASK_ID],
+        kv_query_stride: pl.Scalar[pl.INDEX],
+        kv_row_origin: pl.Scalar[pl.INDEX],
+        kv_span: pl.Scalar[pl.INDEX],
+    ) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+        """Shared staged attention, output projection, and HC residual update.
+
+        ``kv_query_stride`` / ``kv_row_origin`` describe the caller's sparse-K layout
+        (see ``_staged_sparse_wave``); ``kv_span`` is how many rows past its base one
+        query can address, which is what narrows the staged view to the active rows.
+        """
+        rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            rows = fixed_rows
+        active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
+        compute_rows = pl.max(active, 1)
+        if fixed_rows > 0:
+            compute_rows = fixed_rows
+        # Rows the last query can reach: its base plus its span.
+        source_rows = (compute_rows - 1) * kv_query_stride + kv_row_origin + kv_span
+        q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
+        kv_active = pl.slice(sparse_kv, [source_rows, HEAD_DIM], [0, 0])
+        bias_active = pl.slice(sparse_bias, [compute_rows, PREFILL_SPARSE_PAD], [0, 0])
+        mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
+        cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
+        sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
+        attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
+        attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
+        attention_done, sources_done = planned_attention(
+            q_active, kv_active, bias_active, mask_active, attn_sink,
+            cos_active, sin_active, wo_a, wo_b, wo_b_scale,
+            attn_active, active_rows, prior_dep,
+            kv_query_stride, kv_row_origin,
         )
+        pad_ready = pl.system.task_dummy(deps=[])
+        planned_post(attn_out, residual, post, comb, x_out, active_rows, pad_ready)
+        return attention_done, sources_done
 
-        hist_kv = pl.create_tensor([hist_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        raw_valid = pl.create_tensor([token_rows, WIN], dtype=pl.FP32, manual_dep=True)
-        stream_state_m = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
-        stream_state_l = pl.create_tensor([head_rows, 1], dtype=pl.FP32, manual_dep=True)
-        stream_heads = pl.create_tensor([head_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
-        cmp_partial_m = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
-        cmp_partial_l = pl.create_tensor([partial_rows, 8], dtype=pl.FP32, manual_dep=True)
-        cmp_partial_o = pl.create_tensor([partial_rows, HEAD_DIM], dtype=pl.FP32, manual_dep=True)
-        wave_completion = pl.array.create(1, pl.TASK_ID)
-        # Raw packing consumes neither compressed KV nor RoPE. Keep readiness
-        # edges on their consumers; merge still waits for RoPE and packed init.
-        _hca_segment_heads(
-            q,
-            full_kv,
-            predecessor_valid,
-            cmp_work_kv,
-            cmp_work_valid,
-            position_ids,
-            attn_sink,
-            active_rows,
-            o_packed_heads,
-            hist_kv,
-            raw_valid,
-            stream_state_m,
-            stream_state_l,
-            stream_heads,
-            cmp_partial_m,
-            cmp_partial_l,
-            cmp_partial_o,
-            rope_cos_il,
-            rope_sin_signed,
-            raw_ready_dep,
-            cmp_gather_tid,
-            rope_cs_tid,
-            packed_init_tid,
-            wave_completion,
-        )
-        completion[0] = wave_completion[0]
-
-    return o_packed_heads, completion[0]
+    return prefill_staged_attention
 
 
-@pl.jit.inline(auto_scope=False)
-def hca_attn(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    full_kv: pl.Tensor[[HCA_FULL_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    predecessor_valid: pl.Scalar[pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[PREFILL_ATTN_ROWS_DYN], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
-    active_rows: pl.Scalar[pl.INT32],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
-    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run variable-length C128 attention over physical cache roots."""
-    token_rows = pl.tensor.dim(q, 0)
-    projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
-    packed_head_rows = projection_rows * H
-    active = pl.cast(active_rows, pl.INDEX)
-    active = pl.min(token_rows, pl.max(active, 0))
-    predecessor_rows = pl.cast(predecessor_valid, pl.INDEX)
-    predecessor_rows = pl.min(WIN, pl.max(predecessor_rows, 0))
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = compressed_ready_dep
-    with pl.scope():
-        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        # Zero-fill, 4 query tiles per block: every one of the 256 one-tile blocks ran
-        # under 5 us, so dispatch dominated. STAGED_SWA_QUERY_TILE itself is shared with
-        # the tuned SWA wave and must not change -- only this fill's blocking does.
-        with pl.spmd(
-            packed_head_rows // (STAGED_SWA_QUERY_TILE * PACKED_INIT_TILES),
-            name_hint="native_hca_packed_init",
-            deps=[raw_ready_dep],
-        ) as packed_init_tid:
-            packed_blk = pl.tile.get_block_idx()
-            # One tile per iteration: a [STAGED_SWA_QUERY_TILE, HEAD_DIM] BF16 fill is already
-            # 128 KB of UB, so the tile size must stay put -- only the block count drops.
-            for packed_i in pl.range(PACKED_INIT_TILES):
-                packed_row = (packed_blk * PACKED_INIT_TILES + packed_i) * STAGED_SWA_QUERY_TILE
-                o_packed_heads[
-                    packed_row:packed_row + STAGED_SWA_QUERY_TILE,
-                    0:HEAD_DIM,
-                ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-
-        o_packed_heads, heads_dep = _hca_heads(
-            q,
-            full_kv,
-            predecessor_rows,
-            cmp_kv,
-            cmp_block_table,
-            position_ids,
-            attn_sink,
-            active,
-            freqs_cos,
-            freqs_sin,
-            o_packed_heads,
-            packed_init_tid,
-            raw_ready_dep,
-            compressed_ready_dep,
-        )
-        o_proj_dep = pl.system.task_dummy(deps=[heads_dep, o_proj_weight_dep])
-        _attn_out, act_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, o_proj_dep)
-        completion[0] = act_tid
-
-    return completion[0]
+prefill_staged_attention = make_prefill_staged_attention()
 
 
-@pl.jit.inline(auto_scope=False)
-def physical_sparse_attn(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
-    active_rows: pl.Scalar[pl.INT32],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
-    CONTIGUOUS_CMP_PAGES: pl.constexpr,
-) -> pl.Scalar[pl.TASK_ID]:
-    """Run TopK attention; contiguous compressed roots bypass cmp_block_table."""
-    token_rows = pl.tensor.dim(q, 0)
-    projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
-    packed_head_rows = projection_rows * H
-    active = pl.cast(active_rows, pl.INDEX)
-    active = pl.min(token_rows, pl.max(active, 0))
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = compressed_ready_dep
-    with pl.scope():
-        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        # Same fix as native_hca_packed_init: all 256 one-tile blocks ran under 5 us,
-        # so dispatch dominated. Four tiles per block, one pl.full per iteration --
-        # the tile itself is 128 KB of UB and must not grow.
-        with pl.spmd(
-            packed_head_rows // (STAGED_SWA_QUERY_TILE * PACKED_INIT_TILES),
-            name_hint="physical_sparse_packed_init",
-            deps=[raw_ready_dep],
-        ) as packed_init_tid:
-            packed_blk = pl.tile.get_block_idx()
-            for packed_i in pl.range(PACKED_INIT_TILES):
-                packed_row = (packed_blk * PACKED_INIT_TILES + packed_i) * STAGED_SWA_QUERY_TILE
-                o_packed_heads[
-                    packed_row : packed_row + STAGED_SWA_QUERY_TILE,
-                    0:HEAD_DIM,
-                ] = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-
-        o_packed_heads, heads_tid = _physical_sparse_heads(
-            q,
-            ori_kv,
-            swa_indices,
-            cmp_kv,
-            cmp_block_table,
-            cmp_indices,
-            valid_block_mask,
-            attn_sink,
-            active,
-            freqs_cos,
-            freqs_sin,
-            o_packed_heads,
-            packed_init_tid,
-            raw_ready_dep,
-            compressed_ready_dep,
+def make_prefill_physical_attention(fixed_rows=0):
+    planned_hc_post = make_hc_post_prefill(fixed_rows)
+    planned_sparse_attn = make_physical_sparse_attn(fixed_rows)
+    @pl.jit.inline(auto_scope=False)
+    def prefill_physical_attention(
+        q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
+        ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+        swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
+        cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
+        cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+        cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
+        valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+        attn_sink: pl.Tensor[[H], pl.FP32],
+        freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
+        wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
+        wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
+        wo_b_scale: pl.Tensor[[D], pl.FP32],
+        residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+        post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
+        comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
+        x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
+        active_rows: pl.Scalar[pl.INT32],
+        raw_ready_dep: pl.Scalar[pl.TASK_ID],
+        compressed_ready_dep: pl.Scalar[pl.TASK_ID],
+        CONTIGUOUS_CMP_PAGES: pl.constexpr,
+    ) -> pl.Scalar[pl.TASK_ID]:
+        """Shared physical-cache attention, output projection, and HC residual update."""
+        rows = pl.tensor.dim(q, 0)
+        if fixed_rows > 0:
+            rows = fixed_rows
+        active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
+        compute_rows = pl.max(active, 1)
+        if fixed_rows > 0:
+            compute_rows = fixed_rows
+        q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
+        raw_indices = pl.slice(swa_indices, [compute_rows, WIN], [0, 0])
+        compressed_indices = pl.slice(cmp_indices, [compute_rows, IDX_TOPK], [0, 0])
+        mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
+        cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
+        sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
+        attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
+        attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
+        attention_done = planned_sparse_attn(
+            q_active, ori_kv, raw_indices, cmp_kv, cmp_block_table, compressed_indices, mask_active, attn_sink,
+            cos_active, sin_active, wo_a, wo_b, wo_b_scale,
+            attn_active, active_rows, raw_ready_dep, compressed_ready_dep,
             CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
         )
-        _attn_out, projection_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_tid)
-        completion[0] = projection_tid
+        planned_hc_post(attn_out, residual, post, comb, x_out, active_rows)
+        return attention_done
 
-    # PR #1073 publishes the final output dependency after leaving the
-    # tile-local scope.  Keep that exact post-0.60 lifetime pattern here.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="physical_sparse_publish", deps=[completion[0]]) as publish_tid:
-        completion_anchor = pl.read(attn_out, [0, 0])
-        pl.write(attn_out, [0, 0], completion_anchor)
-    return publish_tid
+    return prefill_physical_attention
+
+prefill_physical_attention = make_prefill_physical_attention()
 
 
-@pl.jit.inline(auto_scope=False)
-def staged_sparse_attn(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, D], pl.BF16],
-    active_rows: pl.Scalar[pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    kv_query_stride: pl.Scalar[pl.INDEX],
-    kv_row_origin: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
-    """Return projection completion and the last staged-source read completion.
+def make_prefill_physical_attention_stage(fixed_rows):
+    planned_attention = make_prefill_physical_attention(fixed_rows)
 
-    Staging may overwrite its source, bias and mask after the heads merge has
-    finished; the output projection continues using its private packed heads.
-    """
-    token_rows = pl.tensor.dim(q, 0)
-    projection_rows = ((token_rows + STAGED_SWA_PROJ_A_ROW_TILE - 1) // STAGED_SWA_PROJ_A_ROW_TILE) * STAGED_SWA_PROJ_A_ROW_TILE
-    packed_head_rows = projection_rows * H
-    active = pl.cast(active_rows, pl.INDEX)
-    active = pl.min(token_rows, pl.max(active, 0))
-    completion = pl.array.create(2, pl.TASK_ID)
-    completion[0] = prior_dep
-    completion[1] = prior_dep
-    with pl.scope():
-        o_packed_heads = pl.create_tensor([packed_head_rows, HEAD_DIM], dtype=pl.BF16, manual_dep=True)
-        packed_blocks_per_group = projection_rows * HEADS_PER_GROUP // STAGED_SWA_QUERY_TILE
-        live_blocks_per_group = active * HEADS_PER_GROUP // STAGED_SWA_QUERY_TILE
-        padding_blocks_per_group = packed_blocks_per_group - live_blocks_per_group
-        packed_init_tids = pl.array.create(1, pl.TASK_ID)
-        packed_init_tids[0] = prior_dep
-        if padding_blocks_per_group > 0:
-            # Merge overwrites live rows. Keep the boundary tile zeroed for padding.
-            with pl.spmd(
-                O_GROUPS * padding_blocks_per_group,
-                name_hint="staged_swa_packed_init",
-                deps=[prior_dep],
-            ) as padding_init_tid:
-                block = pl.tile.get_block_idx()
-                group = block // padding_blocks_per_group
-                group_block = live_blocks_per_group + block % padding_blocks_per_group
-                packed_row = (group * packed_blocks_per_group + group_block) * STAGED_SWA_QUERY_TILE
-                packed_zero = pl.full([STAGED_SWA_QUERY_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                o_packed_heads[packed_row : packed_row + STAGED_SWA_QUERY_TILE, 0:HEAD_DIM] = packed_zero
-            packed_init_tids[0] = padding_init_tid
-        packed_init_tid = packed_init_tids[0]
-
-        o_packed_heads, heads_dep = _staged_swa_heads(
-            q,
-            sparse_kv,
-            sparse_bias,
-            valid_block_mask,
-            attn_sink,
-            active,
-            freqs_cos,
-            freqs_sin,
-            o_packed_heads,
-            packed_init_tid,
-            prior_dep,
-            kv_query_stride,
-            kv_row_origin,
-        )
-        _attn_out, act_tid = _staged_attn_o_proj(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-        completion[0] = act_tid
-        completion[1] = heads_dep
-
-    # ``attn_out`` is caller-owned GM storage written by the projection tasks.
-    # Returning its scoped SSA version makes the generated runtime C++ refer to
-    # an inner-scope alias after that scope has ended.  Only the completion
-    # token needs to cross this boundary.
-    return completion[0], completion[1]
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_staged_attention(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    sparse_kv: pl.Tensor[[PREFILL_ATTN_SOURCE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    sparse_bias: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, PREFILL_SPARSE_PAD], pl.FP32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
-    post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
-    x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
-    active_rows: pl.Scalar[pl.INT32],
-    prior_dep: pl.Scalar[pl.TASK_ID],
-    kv_query_stride: pl.Scalar[pl.INDEX],
-    kv_row_origin: pl.Scalar[pl.INDEX],
-    kv_span: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
-    """Shared staged attention, output projection, and HC residual update.
-
-    ``kv_query_stride`` / ``kv_row_origin`` describe the caller's sparse-K layout
-    (see ``_staged_sparse_wave``); ``kv_span`` is how many rows past its base one
-    query can address, which is what narrows the staged view to the active rows.
-    """
-    rows = pl.tensor.dim(q, 0)
-    active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
-    compute_rows = pl.max(active, 1)
-    # Rows the last query can reach: its base plus its span.
-    source_rows = (compute_rows - 1) * kv_query_stride + kv_row_origin + kv_span
-    q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
-    kv_active = pl.slice(sparse_kv, [source_rows, HEAD_DIM], [0, 0])
-    bias_active = pl.slice(sparse_bias, [compute_rows, PREFILL_SPARSE_PAD], [0, 0])
-    mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
-    cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
-    sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
-    attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
-    attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
-    attention_done, sources_done = staged_sparse_attn(
-        q_active, kv_active, bias_active, mask_active, attn_sink,
-        cos_active, sin_active, wo_a, wo_b, wo_b_scale,
-        attn_active, active_rows, prior_dep,
-        kv_query_stride, kv_row_origin,
-    )
-    residual_view = pl.reshape(residual, [rows, HC_MULT, D])
-    post_view = pl.reshape(post, [rows, HC_MULT])
-    comb_view = pl.reshape(comb, [rows, HC_COMB])
-    output_view = pl.reshape(x_out, [rows, HC_MULT, D])
-    pad_ready = pl.system.task_dummy(deps=[])
-    hc_post_prefill_split(attn_out, residual_view, post_view, comb_view, output_view, active_rows, pad_ready)
-    return attention_done, sources_done
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_physical_attention(
-    q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
-    post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32],
-    x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32],
-    active_rows: pl.Scalar[pl.INT32],
-    raw_ready_dep: pl.Scalar[pl.TASK_ID],
-    compressed_ready_dep: pl.Scalar[pl.TASK_ID],
-    CONTIGUOUS_CMP_PAGES: pl.constexpr,
-) -> pl.Scalar[pl.TASK_ID]:
-    """Shared physical-cache attention, output projection, and HC residual update."""
-    rows = pl.tensor.dim(q, 0)
-    active = pl.min(rows, pl.max(pl.cast(active_rows, pl.INDEX), 0))
-    compute_rows = pl.max(active, 1)
-    q_active = pl.slice(q, [compute_rows, H, HEAD_DIM], [0, 0, 0])
-    raw_indices = pl.slice(swa_indices, [compute_rows, WIN], [0, 0])
-    compressed_indices = pl.slice(cmp_indices, [compute_rows, IDX_TOPK], [0, 0])
-    mask_active = pl.slice(valid_block_mask, [compute_rows, VALID_BLOCK_MASK_COLS], [0, 0])
-    cos_active = pl.slice(freqs_cos, [compute_rows, ROPE_DIM], [0, 0])
-    sin_active = pl.slice(freqs_sin, [compute_rows, ROPE_DIM], [0, 0])
-    attn_out = pl.create_tensor([rows, D], dtype=pl.BF16)
-    attn_active = pl.slice(attn_out, [compute_rows, D], [0, 0])
-    attention_done = physical_sparse_attn(
-        q_active, ori_kv, raw_indices, cmp_kv, cmp_block_table, compressed_indices, mask_active, attn_sink,
-        cos_active, sin_active, wo_a, wo_b, wo_b_scale,
-        attn_active, active_rows, raw_ready_dep, compressed_ready_dep,
-        CONTIGUOUS_CMP_PAGES=CONTIGUOUS_CMP_PAGES,
-    )
-    residual_view = pl.reshape(residual, [rows, HC_MULT, D])
-    post_view = pl.reshape(post, [rows, HC_MULT])
-    comb_view = pl.reshape(comb, [rows, HC_COMB])
-    output_view = pl.reshape(x_out, [rows, HC_MULT, D])
-    hc_post_prefill(attn_out, residual_view, post_view, comb_view, output_view, active_rows)
-    return attention_done
+    @pl.jit.inline(auto_scope=False)
+    def prefill_physical_attention_stage(q: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, H, HEAD_DIM], pl.BF16], ori_kv: pl.Tensor[[PHYSICAL_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16], swa_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, WIN], pl.INT32], cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE_DYN, 1, HEAD_DIM], pl.BF16], cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32], cmp_indices: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, IDX_TOPK], pl.INT32], valid_block_mask: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, VALID_BLOCK_MASK_COLS], pl.INT32], attn_sink: pl.Tensor[[H], pl.FP32], freqs_cos: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16], freqs_sin: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, ROPE_DIM], pl.BF16], wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ], wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ], wo_b_scale: pl.Tensor[[D], pl.FP32], residual: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32], post: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT], pl.FP32], comb: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_COMB], pl.FP32], x_out: pl.Tensor[[PREFILL_ATTN_ROWS_DYN, HC_MULT, D], pl.FP32], active_rows: pl.Scalar[pl.INT32], raw_ready_dep: pl.Scalar[pl.TASK_ID], compressed_ready_dep: pl.Scalar[pl.TASK_ID], CONTIGUOUS_CMP_PAGES: pl.constexpr) -> pl.Scalar[pl.TASK_ID]:
+        with pl.graph('prefill_physical_attention_stage', deps=[raw_ready_dep, compressed_ready_dep]) as stage_done:
+            internal_invalid_dependency = pl.system.task_invalid()
+            _internal_completion = planned_attention(q, ori_kv, swa_indices, cmp_kv, cmp_block_table, cmp_indices, valid_block_mask, attn_sink, freqs_cos, freqs_sin, wo_a, wo_b, wo_b_scale, residual, post, comb, x_out, active_rows, internal_invalid_dependency, internal_invalid_dependency, CONTIGUOUS_CMP_PAGES)
+        return stage_done
+    return prefill_physical_attention_stage
 
 
 def _sparse_attn(

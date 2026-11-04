@@ -63,13 +63,13 @@ from prefill_cp_zigzag import (
     cp_segment_tile_active,
     cp_segment_predecessor_active,
 )
-from hc_post import hc_post_prefill
+from hc_post import make_hc_post_prefill
 from prefill_sparse_attn import (
     HCA_MAX_COMPRESSED_ROWS,
-    hca_attn,
+    make_hca_attn,
     build_tensor_specs as build_sparse_attn_tensor_specs,
 )
-from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare
+from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare, kv_proj_rope_fixed
 from utils import build_rope_tables
 
 import pypto.language as pl
@@ -89,7 +89,7 @@ from prefill_compressor_ratio128 import (
     golden_prefill_compressor_ratio128,
     prefill_compressor_ratio128,
 )
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, prefill_attention_prolog, kv_proj_rope
+from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, prefill_attention_prolog
 from rmsnorm import golden_rms_norm
 from prefill_sparse_attn import (
     golden_prefill_sparse_attn,
@@ -453,7 +453,11 @@ def build_hca_metadata(cp_size: int = CP_SIZE, *, num_tokens: int | None = None,
     return metadata
 
 
-@pl.jit.inline
+hca_attn_recorded = make_hca_attn(SEGMENT_ROWS)
+hca_hc_post_recorded = make_hc_post_prefill(TAIL_ROWS)
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_attention_hca(
     x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -596,7 +600,7 @@ def prefill_attention_hca(
         x_flat, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, gamma_cq, rope_cos_flat, rope_sin_flat,
         normed, post, comb, rope_cos_il, rope_sin_signed, rope_swap_idx, q, qr, qr_scale,
-    )
+     LOCAL_ROWS)
 
     local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], dtype=pl.BF16)
     # Each block owns eight complete rows; partial tails keep row-wise masking.
@@ -757,16 +761,7 @@ def prefill_attention_hca(
         augmented_rope_sin_signed,
         augmented_rope_swap_idx,
     )
-    kv_proj_rope(
-        effective_x,
-        wkv,
-        gamma_ckv,
-        augmented_rope_cos_il,
-        augmented_rope_sin_signed,
-        augmented_rope_swap_idx,
-        augmented_kv,
-        leaf_lowering_tid,
-    )
+    kv_proj_rope_fixed(effective_x, wkv, gamma_ckv, augmented_rope_cos_il, augmented_rope_sin_signed, augmented_rope_swap_idx, augmented_kv, leaf_lowering_tid, LOCAL_AUGMENTED_ROWS)
 
     # A continued chunk's first segment has no in-chunk predecessor: its window
     # reaches into the previous chunk, whose KV is already projected and RoPEd in
@@ -843,16 +838,7 @@ def prefill_attention_hca(
         final_rope_sin,
     )
     rope_prepare(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
-    kv_proj_rope(
-        final_hidden,
-        wkv,
-        gamma_ckv,
-        final_rope_cos_il,
-        final_rope_sin_signed,
-        final_rope_swap_idx,
-        final_kv,
-        final_hidden_tid,
-    )
+    kv_proj_rope_fixed(final_hidden, wkv, gamma_ckv, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx, final_kv, final_hidden_tid, TAIL_ROWS)
 
     scratch_state = pl.create_tensor(
         [
@@ -1049,8 +1035,8 @@ def prefill_attention_hca(
 
     part0_active = part0_active_host
     part1_active = part1_active_host
-    part0_rows = pl.max(1, pl.min(SEGMENT_ROWS, part0_active))
-    part1_rows = pl.max(1, pl.min(SEGMENT_ROWS, part1_active))
+    part0_rows = SEGMENT_ROWS
+    part1_rows = SEGMENT_ROWS
     attn_out = pl.create_tensor([LOCAL_ROWS, D], dtype=pl.BF16)
     q_part0 = pl.slice(q, [part0_rows, H, HEAD_DIM], [0, 0, 0])
     full_kv_part0_flat = pl.slice(augmented_kv, [ROWS_PER_AUGMENTED_PART, HEAD_DIM], [0, 0])
@@ -1071,7 +1057,7 @@ def prefill_attention_hca(
         part0_last_position = pl.cast(part0_start + part0_active - 1, pl.INT32)
     part0_cmp_rows = pl.max(1, pl.min(HCA_MAX_COMPRESSED_ROWS, (part0_last_position + 1) // COMPRESS_RATIO))
     part0_cmp_kv = pl.slice(attn_cmp_kv, [part0_cmp_rows, 1, 1, HEAD_DIM], [0, 0, 0, 0])
-    part0_attn_tid = hca_attn(
+    part0_attn_tid = hca_attn_recorded(
         q_part0,
         full_kv_part0,
         part0_predecessor_valid,
@@ -1108,7 +1094,7 @@ def prefill_attention_hca(
         part1_last_position = pl.cast(part1_start + part1_active - 1, pl.INT32)
     part1_cmp_rows = pl.max(1, pl.min(HCA_MAX_COMPRESSED_ROWS, (part1_last_position + 1) // COMPRESS_RATIO))
     part1_cmp_kv = pl.slice(attn_cmp_kv, [part1_cmp_rows, 1, 1, HEAD_DIM], [0, 0, 0, 0])
-    attention_done_tid = hca_attn(
+    attention_done_tid = hca_attn_recorded(
         q_part1,
         full_kv_part1,
         part1_predecessor_valid,
@@ -1132,9 +1118,12 @@ def prefill_attention_hca(
         residual_tile = pl.slice(x_flat, [TAIL_ROWS, HC_MULT, D], [row0, 0, 0])
         active = cp_segment_tile_active(request_length, segment_span, my_rank, tile // MAX_SEGMENT_TILES, tile % MAX_SEGMENT_TILES)
         attn_out_tile = pl.slice(attn_out, [TAIL_ROWS, D], [row0, 0])
-        y_tile = pl.create_tensor([TAIL_ROWS, HC_MULT, D], dtype=pl.FP32)
-        hc_post_prefill(attn_out_tile, residual_tile, post_tile, comb_tile, y_tile, active)
-        x_out_flat[row0 : row0 + TAIL_ROWS, 0:HC_MULT, 0:D] = y_tile
+        y_tile = pl.slice(x_out_flat, [TAIL_ROWS, HC_MULT, D], [row0, 0, 0])
+        post_ready_tid = part0_attn_tid
+        if tile >= MAX_SEGMENT_TILES:
+            post_ready_tid = attention_done_tid
+        with pl.graph("hca_hc_post", deps=[post_ready_tid]):
+            hca_hc_post_recorded(attn_out_tile, residual_tile, post_tile, comb_tile, y_tile, active)
 
     with pl.at(
         level=pl.Level.CORE_GROUP,
@@ -1147,7 +1136,7 @@ def prefill_attention_hca(
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
 
     x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
-    return x_out
+    return compress_state, kv_cache, cmp_kv, x_out
 
 
 @pl.jit

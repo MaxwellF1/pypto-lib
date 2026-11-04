@@ -43,7 +43,7 @@ from prefill_cp_zigzag import (
 )
 from prefill_cp_exchange import _prefill_cp_hidden_tail_exchange_wave
 from golden import TensorSpec
-from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare_prefill
+from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare_prefill, kv_proj_rope_fixed
 from prefill_sparse_attn import (
     BIAS_TOKEN_TILE,
     PREFILL_ATTN_BLOCKS,
@@ -77,6 +77,7 @@ from prefill_sparse_attn import (
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
     prefill_staged_attention,
+    make_prefill_staged_attention,
 )
 
 
@@ -161,9 +162,9 @@ def _prefill_mtp_attention_swa(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, gamma_cq, rope_cos_t, rope_sin_t,
         x_normed, post, comb, cos_il, sin_signed, swap_idx, q, qr, qr_scale,
-    )
+     T)
     late_dep = pl.system.task_dummy(deps=[rms_tid])
-    kv_proj_rope(x_normed, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv, late_dep)
+    kv_proj_rope_fixed(x_normed, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv, late_dep, T)
 
     block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
@@ -880,7 +881,10 @@ def _cp_swa_stage_sources(
     return gather_tid, bias_tid
 
 
-@pl.jit.inline
+prefill_staged_attention_recorded = make_prefill_staged_attention(SEGMENT_ROWS)
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_attention_swa(
     x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -1000,7 +1004,7 @@ def prefill_attention_swa(
         hc_post = pl.slice(post, [hc_rows, HC_MULT], [hc_offset, 0])
         hc_comb = pl.slice(comb, [hc_rows, HC_MULT * HC_MULT], [hc_offset, 0])
         hc_normed = pl.slice(normed, [hc_rows, D], [hc_offset, 0])
-        hc_pre_norm(hc_x, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, hc_mixed, hc_post, hc_comb, hc_normed)
+        hc_pre_norm(hc_x, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, hc_mixed, hc_post, hc_comb, hc_normed, 0)
     # Q projection is token-local; retain each part's physical row offset.
     for q_part in pl.unroll(LOCAL_PARTS):
         q_active = pl.cast(0, pl.INT32)
@@ -1238,16 +1242,7 @@ def prefill_attention_swa(
         final_rope_sin,
     )
     rope_prepare_prefill(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
-    kv_proj_rope(
-        final_hidden,
-        wkv,
-        gamma_ckv,
-        final_rope_cos_il,
-        final_rope_sin_signed,
-        final_rope_swap_idx,
-        final_kv,
-        final_hidden_tid,
-    )
+    kv_proj_rope_fixed(final_hidden, wkv, gamma_ckv, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx, final_kv, final_hidden_tid, TAIL_ROWS)
 
     raw_blocks = pl.tensor.dim(kv_cache, 0)
     raw_rows = raw_blocks * BLOCK_ROWS
@@ -1281,13 +1276,15 @@ def prefill_attention_swa(
     post_part0 = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [0, 0])
     comb_part0 = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [0, 0])
     out_part0 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [0, 0, 0])
-    part0_attn_tid, part0_sources_tid = prefill_staged_attention(
-        q_part0, kv_part0, bias_part0, mask_part0, attn_sink,
-        cos_part0, sin_part0, wo_a, wo_b, wo_b_scale,
-        residual_part0, post_part0, comb_part0, out_part0,
-        part0_active, stage_ready_tid,
-        pl.const(1, pl.INDEX), pl.const(1, pl.INDEX), pl.const(PREFILL_ATTN_TILE, pl.INDEX),
-    )
+    with pl.graph("swa_attention_part0", deps=[stage_ready_tid]) as part0_attn_tid:
+        part0_graph_prior = pl.system.task_invalid()
+        prefill_staged_attention_recorded(
+            q_part0, kv_part0, bias_part0, mask_part0, attn_sink,
+            cos_part0, sin_part0, wo_a, wo_b, wo_b_scale,
+            residual_part0, post_part0, comb_part0, out_part0,
+            part0_active, part0_graph_prior,
+            pl.const(1, pl.INDEX), pl.const(1, pl.INDEX), pl.const(PREFILL_ATTN_TILE, pl.INDEX),
+        )
     # Part 1 stages into its own buffers, so its attention need not wait for
     # part 0's heads to release a shared staging area.
     gather1_tid, bias1_tid = _cp_swa_stage_sources(
@@ -1317,20 +1314,22 @@ def prefill_attention_swa(
     post_part1 = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [SEGMENT_ROWS, 0])
     comb_part1 = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [SEGMENT_ROWS, 0])
     out_part1 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [SEGMENT_ROWS, 0, 0])
-    attention_done_tid, part1_sources_tid = prefill_staged_attention(
-        q_part1, kv_part1, bias_part1, mask_part1, attn_sink,
-        cos_part1, sin_part1, wo_a, wo_b, wo_b_scale,
-        residual_part1, post_part1, comb_part1, out_part1,
-        part1_active, stage1_ready_tid,
-        pl.const(1, pl.INDEX), pl.const(1, pl.INDEX), pl.const(PREFILL_ATTN_TILE, pl.INDEX),
-    )
+    with pl.graph("swa_attention_part1", deps=[stage1_ready_tid]) as attention_done_tid:
+        part1_graph_prior = pl.system.task_invalid()
+        prefill_staged_attention_recorded(
+            q_part1, kv_part1, bias_part1, mask_part1, attn_sink,
+            cos_part1, sin_part1, wo_a, wo_b, wo_b_scale,
+            residual_part1, post_part1, comb_part1, out_part1,
+            part1_active, part1_graph_prior,
+            pl.const(1, pl.INDEX), pl.const(1, pl.INDEX), pl.const(PREFILL_ATTN_TILE, pl.INDEX),
+        )
 
     resource_done_tid = pl.system.task_dummy(deps=[tail_exchange_tid, raw_commit_tid, part0_attn_tid, attention_done_tid])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_swa_rank_complete", deps=[resource_done_tid]):
         for tile in pl.range(NUM_LOCAL_TILES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * TAIL_ROWS, 0, 0])
     x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, TAIL_ROWS, HC_MULT, D])
-    return x_out
+    return kv_cache, x_out, completion_token
 
 
 @pl.jit
@@ -1382,7 +1381,7 @@ def prefill_cp_swa_rank(
     segment_span_host = pl.read(prefill_plan_host, [0, 3])
     request_prefix_host = pl.read(prefill_plan_host, [0, 4])
     completion_token = pl.create_tensor([NUM_LOCAL_TILES, 1, 8], dtype=pl.FP32)
-    result = prefill_attention_swa(
+    prefill_attention_swa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -1415,7 +1414,7 @@ def prefill_cp_swa_rank(
     # mean), every leg's golden PASS: retiring gave 1512 / 1615 / 4332 us, not
     # retiring 1244 / 1252 / 1254 against a true kernel time of 1205-1211 us. The
     # arms do not overlap and only the second is a usable kernel number.
-    return result
+    return kv_cache, x_out, completion_token
 
 
 @pl.jit.host

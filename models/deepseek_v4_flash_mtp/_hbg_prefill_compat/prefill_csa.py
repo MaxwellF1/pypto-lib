@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+from graph_qkv_proj_rope import rope_prepare_shape_core
 """DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
 # ci: devices=2
 
@@ -64,19 +65,19 @@ from prefill_cp_zigzag import (
 )
 from prefill_indexer import (
     CP_INDEXER_SCORE_CAP,
-    _prefill_indexer_cp_score_topk,
+    _prefill_indexer_cp_score_topk_recorded,
     build_tensor_specs as build_indexer_tensor_specs,
 )
 from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
-    _prefill_indexer_compressor_with_completion,
+    _prefill_indexer_compressor_with_completion_recorded,
 )
 from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
     build_tensor_specs as build_sparse_attn_tensor_specs,
 )
-from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare
+from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, kv_proj_rope_fixed
 from utils import build_rope_tables
 
 import pypto.language as pl
@@ -96,7 +97,7 @@ from config import (
 )
 
 from prefill_compressor_ratio4 import (
-    compressor_ratio4,
+    compressor_ratio4_recorded,
     golden_prefill_compressor_ratio4,
 )
 from hc_post import golden_hc_post_prefill
@@ -110,13 +111,13 @@ from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
 )
-from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, prefill_attention_prolog, kv_proj_rope
+from qkv_proj_rope import golden_qkv_proj_rope, make_materialize_rope_rows, prefill_attention_prolog
 from rmsnorm import golden_rms_norm
 from prefill_sparse_attn import (
     PREFILL_ATTN_BLOCKS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    prefill_physical_attention,
+    make_prefill_physical_attention_stage,
 )
 
 # model config
@@ -915,39 +916,17 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
     return specs
 
 
+GRAPH_SCRATCH_IDX_BLOCKS_DYN = pl.dynamic("GRAPH_SCRATCH_IDX_BLOCKS_DYN")
+GRAPH_SCRATCH_MAIN_STATE_BLOCKS_DYN = pl.dynamic("GRAPH_SCRATCH_MAIN_STATE_BLOCKS_DYN")
+GRAPH_SCRATCH_INNER_STATE_BLOCKS_DYN = pl.dynamic("GRAPH_SCRATCH_INNER_STATE_BLOCKS_DYN")
+
+# Fixed physical segment capacity; kernels retain the live active-row guards.
+prefill_physical_attention_recorded = make_prefill_physical_attention_stage(SEGMENT_ROWS)
+
+materialize_rope_rows_recorded = make_materialize_rope_rows(SEGMENT_ROWS)
+
 @pl.jit.inline
-def _cp_csa_compress_pack_part(
-    effective_x: pl.Tensor[[MAX_COMPRESS_LEAVES * T, D], pl.BF16],
-    leaf_positions: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT32],
-    leaf_main_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64],
-    leaf_idx_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64],
-    leaf_main_state_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64],
-    leaf_inner_state_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64],
-    leaf_num_tokens: pl.Tensor[[MAX_COMPRESS_LEAVES], pl.INT32],
-    main_state_workspace: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    main_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32],
-    inner_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    idx_cache_blocks: pl.Scalar[pl.INDEX],
-    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16],
-    hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    segment: pl.Scalar[pl.INT32],
-    segment_start: pl.Scalar[pl.INT32],
-    segment_active_length: pl.Scalar[pl.INT32],
-    final_segment: pl.Scalar[pl.INT32],
-    request_length: pl.Scalar[pl.INT32],
-    segment_span: pl.Scalar[pl.INT32],
-):
+def _cp_csa_compress_pack_part(effective_x: pl.Tensor[[MAX_COMPRESS_LEAVES * T, D], pl.BF16], leaf_positions: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT32], leaf_main_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64], leaf_idx_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64], leaf_main_state_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64], leaf_inner_state_slots: pl.Tensor[[MAX_COMPRESS_LEAVES * T], pl.INT64], leaf_num_tokens: pl.Tensor[[MAX_COMPRESS_LEAVES], pl.INT32], main_state_workspace: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_workspace: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], main_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32], inner_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32], idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32], idx_scratch_buffer: pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8], idx_scale_scratch_buffer: pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32], main_state_scratch_buffer: pl.Tensor[[GRAPH_SCRATCH_MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_scratch_buffer: pl.Tensor[[GRAPH_SCRATCH_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], idx_cache_blocks: pl.Scalar[pl.INDEX], cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32], cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16], inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32], inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16], freqs_cos: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], freqs_sin: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16], segment: pl.Scalar[pl.INT32], segment_start: pl.Scalar[pl.INT32], segment_active_length: pl.Scalar[pl.INT32], final_segment: pl.Scalar[pl.INT32], request_length: pl.Scalar[pl.INT32], segment_span: pl.Scalar[pl.INT32]):
     """Build one owner part's compact payloads."""
     # Receiver-local compressed cache and state roots.
     main_state_blocks = pl.tensor.dim(main_state_workspace, 0)
@@ -958,8 +937,8 @@ def _cp_csa_compress_pack_part(
     payload_rows = EPOCHS * MAX_COMPRESSED_ROWS_PER_SEGMENT
     state_payload_rows = EPOCHS * STATE_ROWS_PER_RANK
     main_cache = pl.create_tensor([CP_PREFILL_CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    idx_cache = pl.create_tensor([idx_cache_blocks, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
-    idx_scale = pl.create_tensor([idx_cache_blocks, CMP_STORAGE_BLOCK_SIZE, 1, 1], dtype=pl.FP32)
+    idx_cache = idx_scratch_buffer
+    idx_scale = idx_scale_scratch_buffer
     main_payload = pl.create_tensor([payload_rows, HEAD_DIM], dtype=pl.BF16)
     idx_payload = pl.create_tensor([payload_rows, IDX_HEAD_DIM], dtype=pl.INT8)
     idx_scale_payload = pl.create_tensor([payload_rows, SCALE_TILE_COLS], dtype=pl.FP16)
@@ -977,15 +956,8 @@ def _cp_csa_compress_pack_part(
 
     # Alternate the input workspace and one scratch pair across serial leaves.
     # Physical pools and page IDs stay unchanged; only live boundary rows move.
-    main_state_scratch = pl.create_tensor([main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
-    inner_state_scratch = pl.create_tensor(
-        [
-            inner_state_blocks,
-            INNER_STATE_BLOCK_SIZE,
-            INNER_STATE_DIM,
-        ],
-        dtype=pl.FP32,
-    )
+    main_state_scratch = pl.reshape(main_state_scratch_buffer, [main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM])
+    inner_state_scratch = pl.reshape(inner_state_scratch_buffer, [inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM])
 
     # Each compressor leaf is a coarse stage.
     for leaf in pl.unroll(MAX_COMPRESS_LEAVES):
@@ -1016,7 +988,7 @@ def _cp_csa_compress_pack_part(
         inner_state_written = inner_state
         # Empty leaves still carry state below, but have no projections or writes.
         if active > 0:
-            main_cache_written, main_state_written = compressor_ratio4(
+            main_cache_written, main_state_written = compressor_ratio4_recorded(
                 x_leaf, main_state, main_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
                 freqs_cos, freqs_sin,
@@ -1024,7 +996,7 @@ def _cp_csa_compress_pack_part(
                 main_map_leaf, main_state_map_leaf,
                 main_completion,
             )
-            idx_cache_written, idx_scale_written, inner_state_written = _prefill_indexer_compressor_with_completion(
+            idx_cache_written, idx_scale_written, inner_state_written = _prefill_indexer_compressor_with_completion_recorded(
                 x_leaf, inner_state, inner_state_block_table,
                 inner_wkv, inner_wgate, inner_ape, inner_norm_w,
                 freqs_cos, freqs_sin, hadamard_idx,
@@ -1348,106 +1320,8 @@ def _prefill_cp_csa_history_exchange(
     return history_tid
 
 
-@pl.jit.inline
-def prefill_attention_csa(
-    x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32],
-    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[3], pl.FP32],
-    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
-    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16],
-    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ],
-    idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    idx_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
-    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    main_state_workspace0: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace0: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    main_state_workspace1: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace1: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    compress_state: pl.InOut[pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]],
-    compress_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32],
-    inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]],
-    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    kv_cache: pl.InOut[pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.InOut[pl.Tensor[[CP_CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    segment_lengths_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32],
-    owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32],
-    predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32],
-    query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32],
-    query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32],
-    overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32],
-    swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32],
-    history_slot_mapping: pl.Tensor[[T], pl.INT32],
-    final_segment_t: pl.Tensor[[1], pl.INT32],
-    reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    final_win_seg_src: pl.Tensor[[T], pl.INT32],
-    final_win_row_src: pl.Tensor[[T], pl.INT32],
-    final_slot_mapping: pl.Tensor[[T], pl.INT32],
-    leaf_positions_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32],
-    leaf_main_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
-    leaf_idx_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
-    leaf_main_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
-    leaf_inner_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
-    leaf_num_tokens_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32],
-    effective_x_workspace: pl.InOut[pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16]],
-    hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
-    tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    main_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, HEAD_DIM], pl.BF16],
-    idx_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8],
-    scale_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16],
-    record_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, META_DIM], pl.INT32],
-    main_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, MAIN_STATE_DIM], pl.FP32],
-    main_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32],
-    inner_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, INNER_STATE_DIM], pl.FP32],
-    inner_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32],
-    compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ],
-    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32]],
-    # §8.17.8e.2 leaf-capture completion token. Published atomically by the
-    # terminal cp_csa_rank_complete task (deps=[resource_done_tid]), which fans
-    # the four leaf-internal commit/transport TIDs via a pl.system.task_dummy.
-    # [NUM_MOE_WAVES, 1, 8] = 4 rows x 32B; one row per x_out tile producer so
-    # no row write is dead-store-eliminated. Consumed downstream by
-    # _attention_stage_barrier (copies row 0 into stage_token). The token's
-    # payload value is irrelevant -- only its producer/consumer edges matter.
-    # Placed before the scalars (Scalars-last rule: no tensor arg after a
-    # scalar arg in runtime TaskArgs).
-    completion_token: pl.Out[pl.Tensor[[NUM_MOE_WAVES, 1, 8], pl.FP32]],
-    cache_owner_rank: pl.Scalar[pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    tail_comm_epoch: pl.Scalar[pl.INT32],
-    compact_comm_epoch_base: pl.Scalar[pl.INT32],
-    request_length: pl.Scalar[pl.INT32],
-    segment_span: pl.Scalar[pl.INT32],
-    request_prefix: pl.Scalar[pl.INT32],
-):
+@pl.jit.inline(auto_scope=False)
+def prefill_attention_csa_staged(x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32], hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32], hc_attn_scale: pl.Tensor[[3], pl.FP32], hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32], attn_norm_w: pl.Tensor[[D], pl.BF16], wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ], wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ], wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32], wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ], gamma_cq: pl.Tensor[[Q_LORA], pl.BF16], gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16], freqs_cos: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], freqs_sin: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32], cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16], hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16], idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ], idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32], idx_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ], inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32], inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16], main_state_workspace0: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_workspace0: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], main_state_workspace1: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_workspace1: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], compress_state: pl.InOut[pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]], compress_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32], inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]], inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32], kv_cache: pl.InOut[pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]], cmp_kv: pl.InOut[pl.Tensor[[CP_CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]], cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32], idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]], idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]], idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32], segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32], segment_lengths_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32], segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32], owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32], predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32], query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32], query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32], overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32], swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32], history_slot_mapping: pl.Tensor[[T], pl.INT32], final_segment_t: pl.Tensor[[1], pl.INT32], reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32], owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32], final_win_seg_src: pl.Tensor[[T], pl.INT32], final_win_row_src: pl.Tensor[[T], pl.INT32], final_slot_mapping: pl.Tensor[[T], pl.INT32], leaf_positions_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32], leaf_main_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_idx_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_main_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_inner_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_num_tokens_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32], effective_x_workspace: pl.InOut[pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16]], hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16], tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], main_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, HEAD_DIM], pl.BF16], idx_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8], scale_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16], record_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, META_DIM], pl.INT32], main_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, MAIN_STATE_DIM], pl.FP32], main_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32], inner_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, INNER_STATE_DIM], pl.FP32], inner_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32], compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], attn_sink: pl.Tensor[[H], pl.FP32], wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ], wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ], wo_b_scale: pl.Tensor[[D], pl.FP32], x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32]], completion_token: pl.Out[pl.Tensor[[NUM_MOE_WAVES, 1, 8], pl.FP32]], graph_idx_scratch0: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]], graph_idx_scale_scratch0: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]], graph_main_state_scratch0: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]], graph_inner_state_scratch0: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]], graph_idx_scratch1: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]], graph_idx_scale_scratch1: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]], graph_main_state_scratch1: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]], graph_inner_state_scratch1: pl.InOut[pl.Tensor[[GRAPH_SCRATCH_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]], cache_owner_rank: pl.Scalar[pl.INT32], my_rank: pl.Scalar[pl.INT32], tail_comm_epoch: pl.Scalar[pl.INT32], compact_comm_epoch_base: pl.Scalar[pl.INT32], request_length: pl.Scalar[pl.INT32], segment_span: pl.Scalar[pl.INT32], request_prefix: pl.Scalar[pl.INT32]):
     """Run inline CP-CSA attention for one rank.
 
     ``tail_comm_epoch`` drives the shared cross-layer tail ready/consumed
@@ -1470,7 +1344,7 @@ def prefill_attention_csa(
     # existing pools so the temporary ABI is part of the real dataflow.
     history_base = request_prefix
     cp_tmp_candidate_rows = pl.min(history_base // COMPRESS_RATIO + CP_TMP_COMPRESSED_ROWS, CP_CANDIDATE_CAPACITY)
-    cp_tmp_cache_pages = 1 + (cp_tmp_candidate_rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+    cp_tmp_cache_pages = 1 + (CP_CANDIDATE_CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE
     cp_tmp_cache_rows = cp_tmp_cache_pages * BLOCK_SIZE
     cp_tmp_cmp_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cp_tmp_idx_kv = pl.create_tensor([cp_tmp_cache_pages, BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
@@ -1537,7 +1411,7 @@ def prefill_attention_csa(
         segment_qr_tile = pl.slice(qr, [SEGMENT_ROWS, Q_LORA], [row0, 0])
         segment_qr_scale_tile = pl.slice(qr_scale, [SEGMENT_ROWS, 1], [row0, 0])
         active = cp_segment_length(request_length, segment_span, my_rank, part)
-        materialize_rope_rows(freqs_cos, freqs_sin, segment_position_tile, active, segment_cos_tile, segment_sin_tile)
+        materialize_rope_rows_recorded(freqs_cos, freqs_sin, segment_position_tile, active, segment_cos_tile, segment_sin_tile)
         segment_cos_il = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
         segment_sin_signed = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.FP32)
         segment_swap_idx = pl.create_tensor([SEGMENT_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
@@ -1547,13 +1421,9 @@ def prefill_attention_csa(
             segment_normed_tile, segment_post_tile, segment_comb_tile,
             segment_cos_il, segment_sin_signed, segment_swap_idx,
             segment_q_tile, segment_qr_tile, segment_qr_scale_tile,
-        )
+         SEGMENT_ROWS)
         late_dep = pl.system.task_dummy(deps=[rms_tid])
-        kv_proj_rope(
-            segment_normed_tile, wkv, gamma_ckv,
-            segment_cos_il, segment_sin_signed, segment_swap_idx,
-            segment_kv_tile, late_dep,
-        )
+        kv_proj_rope_fixed(segment_normed_tile, wkv, gamma_ckv, segment_cos_il, segment_sin_signed, segment_swap_idx, segment_kv_tile, late_dep, SEGMENT_ROWS)
 
     local_hidden_tail = pl.create_tensor([EPOCHS * LOCAL_PARTS * T, D], dtype=pl.BF16)
     with pl.spmd(T // 16, name_hint="cp_csa_tail_assemble") as tail_assembled_tid:
@@ -1646,23 +1516,8 @@ def prefill_attention_csa(
             reproject_rope_sin[reproject_row : reproject_row + 1, :] = freqs_sin[
                 reproject_position : reproject_position + 1, :
             ]
-    rope_prepare(
-        reproject_rope_cos,
-        reproject_rope_sin,
-        reproject_rope_cos_il,
-        reproject_rope_sin_signed,
-        reproject_rope_swap_idx,
-    )
-    kv_proj_rope(
-        reproject_hidden,
-        wkv,
-        gamma_ckv,
-        reproject_rope_cos_il,
-        reproject_rope_sin_signed,
-        reproject_rope_swap_idx,
-        reproject_kv,
-        reproject_rope_tid,
-    )
+    rope_prepare_shape_core(reproject_rope_cos, reproject_rope_sin, reproject_rope_cos_il, reproject_rope_sin_signed, reproject_rope_swap_idx, True, LOCAL_REPROJECT_ROWS)
+    kv_proj_rope_fixed(reproject_hidden, wkv, gamma_ckv, reproject_rope_cos_il, reproject_rope_sin_signed, reproject_rope_swap_idx, reproject_kv, reproject_rope_tid, LOCAL_REPROJECT_ROWS)
 
     logical_kv = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_remote_kv_scatter"):
@@ -1777,37 +1632,7 @@ def prefill_attention_csa(
     part0_num_tokens = pl.slice(leaf_num_tokens_flat, [MAX_COMPRESS_LEAVES], [0])
     part0_segment = pl.cast(my_rank, pl.INT32)
     part0_segment_start = pl.cast(request_prefix + part0_segment * segment_span, pl.INT32)
-    (
-        part0_main_payload,
-        part0_idx_payload,
-        part0_idx_scale_payload,
-        part0_record_meta,
-        part0_main_state_payload,
-        part0_inner_state_payload,
-        part0_main_state_meta,
-        part0_inner_state_meta,
-    ) = _cp_csa_compress_pack_part(
-        part0_x,
-        part0_positions,
-        part0_main_slots,
-        part0_idx_slots,
-        part0_main_state_slots,
-        part0_inner_state_slots,
-        part0_num_tokens,
-        main_state_workspace0,
-        inner_state_workspace0,
-        compress_state_block_table,
-        inner_compress_state_block_table,
-        idx_block_table, idx_scratch_blocks,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        freqs_cos, freqs_sin,
-        hadamard_idx,
-        part0_segment,
-        part0_segment_start,
-        part0_active_host,
-        final_segment, request_length, segment_span,
-    )
+    (part0_main_payload, part0_idx_payload, part0_idx_scale_payload, part0_record_meta, part0_main_state_payload, part0_inner_state_payload, part0_main_state_meta, part0_inner_state_meta) = _cp_csa_compress_pack_part(part0_x, part0_positions, part0_main_slots, part0_idx_slots, part0_main_state_slots, part0_inner_state_slots, part0_num_tokens, main_state_workspace0, inner_state_workspace0, compress_state_block_table, inner_compress_state_block_table, idx_block_table, graph_idx_scratch0, graph_idx_scale_scratch0, graph_main_state_scratch0, graph_inner_state_scratch0, idx_scratch_blocks, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, inner_wkv, inner_wgate, inner_ape, inner_norm_w, freqs_cos, freqs_sin, hadamard_idx, part0_segment, part0_segment_start, part0_active_host, final_segment, request_length, segment_span)
 
     part1_row0 = part_leaf_rows
     part1_x = pl.slice(effective_x, [part_leaf_rows, D], [part1_row0, 0])
@@ -1819,37 +1644,7 @@ def prefill_attention_csa(
     part1_num_tokens = pl.slice(leaf_num_tokens_flat, [MAX_COMPRESS_LEAVES], [MAX_COMPRESS_LEAVES])
     part1_segment = pl.cast(NUM_SEGMENTS - 1 - my_rank, pl.INT32)
     part1_segment_start = pl.cast(request_prefix + part1_segment * segment_span, pl.INT32)
-    (
-        part1_main_payload,
-        part1_idx_payload,
-        part1_idx_scale_payload,
-        part1_record_meta,
-        part1_main_state_payload,
-        part1_inner_state_payload,
-        part1_main_state_meta,
-        part1_inner_state_meta,
-    ) = _cp_csa_compress_pack_part(
-        part1_x,
-        part1_positions,
-        part1_main_slots,
-        part1_idx_slots,
-        part1_main_state_slots,
-        part1_inner_state_slots,
-        part1_num_tokens,
-        main_state_workspace1,
-        inner_state_workspace1,
-        compress_state_block_table,
-        inner_compress_state_block_table,
-        idx_block_table, idx_scratch_blocks,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        freqs_cos, freqs_sin,
-        hadamard_idx,
-        part1_segment,
-        part1_segment_start,
-        part1_active_host,
-        final_segment, request_length, segment_span,
-    )
+    (part1_main_payload, part1_idx_payload, part1_idx_scale_payload, part1_record_meta, part1_main_state_payload, part1_inner_state_payload, part1_main_state_meta, part1_inner_state_meta) = _cp_csa_compress_pack_part(part1_x, part1_positions, part1_main_slots, part1_idx_slots, part1_main_state_slots, part1_inner_state_slots, part1_num_tokens, main_state_workspace1, inner_state_workspace1, compress_state_block_table, inner_compress_state_block_table, idx_block_table, graph_idx_scratch1, graph_idx_scale_scratch1, graph_main_state_scratch1, graph_inner_state_scratch1, idx_scratch_blocks, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, inner_wkv, inner_wgate, inner_ape, inner_norm_w, freqs_cos, freqs_sin, hadamard_idx, part1_segment, part1_segment_start, part1_active_host, final_segment, request_length, segment_span)
 
     packed_main_payload = pl.create_tensor([EPOCHS * ROWS_PER_RANK, HEAD_DIM], dtype=pl.BF16)
     packed_idx_payload = pl.create_tensor([EPOCHS * ROWS_PER_RANK, IDX_HEAD_DIM], dtype=pl.INT8)
@@ -2180,7 +1975,7 @@ def prefill_attention_csa(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_indexer_rope_rows"):
                 idx_cos[0:T, :] = pl.cast(rope_cos_flat[row0 : row0 + T, 0:QK_ROPE_HALF], target_type=pl.FP32)
                 idx_sin[0:T, :] = pl.cast(rope_sin_flat[row0 : row0 + T, 0:QK_ROPE_HALF], target_type=pl.FP32)
-            topk_tile, topk_tid = _prefill_indexer_cp_score_topk(
+            topk_tile, topk_tid = _prefill_indexer_cp_score_topk_recorded(
                 index_x_tile, qr_tile, qr_scale_tile,
                 idx_wq_b, idx_wq_b_scale, idx_weights_proj,
                 idx_cos, idx_sin, hadamard_idx,
@@ -2398,7 +2193,7 @@ def prefill_attention_csa(
     post_part0 = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [0, 0])
     comb_part0 = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [0, 0])
     out_part0 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [0, 0, 0])
-    part0_attn_tid = prefill_physical_attention(
+    part0_attn_tid = prefill_physical_attention_recorded(
         q_part0, cp_tmp_raw_kv, raw_indices_part0, cp_tmp_cmp_kv,
         cmp_block_table, cmp_indices_part0, mask_part0, attn_sink,
         cos_part0, sin_part0, wo_a, wo_b,
@@ -2417,7 +2212,7 @@ def prefill_attention_csa(
     post_part1 = pl.slice(post, [SEGMENT_ROWS, HC_MULT], [SEGMENT_ROWS, 0])
     comb_part1 = pl.slice(comb, [SEGMENT_ROWS, HC_MULT * HC_MULT], [SEGMENT_ROWS, 0])
     out_part1 = pl.slice(x_out_flat, [SEGMENT_ROWS, HC_MULT, D], [SEGMENT_ROWS, 0, 0])
-    part1_attn_tid = prefill_physical_attention(
+    part1_attn_tid = prefill_physical_attention_recorded(
         q_part1, cp_tmp_raw_kv, raw_indices_part1, cp_tmp_cmp_kv,
         cmp_block_table, cmp_indices_part1, mask_part1, attn_sink,
         cos_part1, sin_part1, wo_a, wo_b,
@@ -2457,8 +2252,21 @@ def prefill_attention_csa(
         for tile in pl.range(NUM_MOE_WAVES):
             completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(x_out_flat, [1, 1, 8], [tile * T, 0, 0])
 
-    x_out = pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D])
-    return x_out
+    return (compress_state, inner_compress_state, kv_cache, cmp_kv, idx_kv_cache, idx_kv_scale, effective_x_workspace, x_out, completion_token, graph_idx_scratch0, graph_idx_scale_scratch0, graph_main_state_scratch0, graph_inner_state_scratch0, graph_idx_scratch1, graph_idx_scale_scratch1, graph_main_state_scratch1, graph_inner_state_scratch1)
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_attention_csa(x_hc: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32], hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32], hc_attn_scale: pl.Tensor[[3], pl.FP32], hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32], attn_norm_w: pl.Tensor[[D], pl.BF16], wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ], wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ], wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32], wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ], gamma_cq: pl.Tensor[[Q_LORA], pl.BF16], gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16], freqs_cos: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], freqs_sin: pl.Tensor[[M.max_position_embeddings, ROPE_HEAD_DIM], pl.BF16], cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16], cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32], cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16], hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16], idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8, pl.NZ], idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32], idx_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ], inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16], inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32], inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16], main_state_workspace0: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_workspace0: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], main_state_workspace1: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32], inner_state_workspace1: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32], compress_state: pl.InOut[pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]], compress_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32], inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]], inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32], kv_cache: pl.InOut[pl.Tensor[[RAW_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]], cmp_kv: pl.InOut[pl.Tensor[[CP_CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]], cmp_block_table: pl.Tensor[[PREFILL_CMP_MAX_BLOCKS], pl.INT32], idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]], idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCKS_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]], idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32], segment_starts_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32], segment_lengths_t: pl.Tensor[[NUM_SEGMENTS], pl.INT32], segment_active_lengths: pl.Tensor[[LOCAL_PARTS], pl.INT32], owner_segments_t: pl.Tensor[[LOCAL_PARTS], pl.INT32], predecessor_segments: pl.Tensor[[LOCAL_PARTS], pl.INT32], query_positions: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32], query_requests: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T], pl.INT32], overlay_active_lengths: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, OVERLAY_SOURCES], pl.INT32], swa_indices: pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, WIN], pl.INT32], history_slot_mapping: pl.Tensor[[T], pl.INT32], final_segment_t: pl.Tensor[[1], pl.INT32], reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32], owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32], final_win_seg_src: pl.Tensor[[T], pl.INT32], final_win_row_src: pl.Tensor[[T], pl.INT32], final_slot_mapping: pl.Tensor[[T], pl.INT32], leaf_positions_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT32], leaf_main_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_idx_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_main_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_inner_state_slots_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64], leaf_num_tokens_input: pl.Tensor[[LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32], effective_x_workspace: pl.InOut[pl.Tensor[[LOCAL_LEAVES * T, D], pl.BF16]], hidden_tail_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16], tail_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], tail_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], main_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, HEAD_DIM], pl.BF16], idx_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, IDX_HEAD_DIM], pl.INT8], scale_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, SCALE_TILE_COLS], pl.FP16], record_window: pld.DistributedTensor[[RECORDS_PER_WINDOW, META_DIM], pl.INT32], main_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, MAIN_STATE_DIM], pl.FP32], main_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32], inner_state_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, INNER_STATE_DIM], pl.FP32], inner_state_meta_window: pld.DistributedTensor[[STATE_RECORDS_PER_WINDOW, STATE_META_DIM], pl.INT32], compact_ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], compact_consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32], attn_sink: pl.Tensor[[H], pl.FP32], wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16, pl.NZ], wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8, pl.NZ], wo_b_scale: pl.Tensor[[D], pl.FP32], x_out: pl.Out[pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32]], completion_token: pl.Out[pl.Tensor[[NUM_MOE_WAVES, 1, 8], pl.FP32]], cache_owner_rank: pl.Scalar[pl.INT32], my_rank: pl.Scalar[pl.INT32], tail_comm_epoch: pl.Scalar[pl.INT32], compact_comm_epoch_base: pl.Scalar[pl.INT32], request_length: pl.Scalar[pl.INT32], segment_span: pl.Scalar[pl.INT32], request_prefix: pl.Scalar[pl.INT32], graph_idx_blocks: pl.Scalar[pl.INDEX], graph_main_state_blocks: pl.Scalar[pl.INDEX], graph_inner_state_blocks: pl.Scalar[pl.INDEX]):
+    graph_idx_scratch0 = pl.create_tensor([graph_idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
+    graph_idx_scale_scratch0 = pl.create_tensor([graph_idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, 1], dtype=pl.FP32)
+    graph_main_state_scratch0 = pl.create_tensor([graph_main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    graph_inner_state_scratch0 = pl.create_tensor([graph_inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
+    graph_idx_scratch1 = pl.create_tensor([graph_idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], dtype=pl.INT8)
+    graph_idx_scale_scratch1 = pl.create_tensor([graph_idx_blocks, CMP_STORAGE_BLOCK_SIZE, 1, 1], dtype=pl.FP32)
+    graph_main_state_scratch1 = pl.create_tensor([graph_main_state_blocks, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    graph_inner_state_scratch1 = pl.create_tensor([graph_inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
+    (graph_result_compress_state, graph_result_inner_compress_state, graph_result_kv_cache, graph_result_cmp_kv, graph_result_idx_kv_cache, graph_result_idx_kv_scale, graph_result_effective_x_workspace, graph_result_x_out, graph_result_completion_token, graph_result_graph_idx_scratch0, graph_result_graph_idx_scale_scratch0, graph_result_graph_main_state_scratch0, graph_result_graph_inner_state_scratch0, graph_result_graph_idx_scratch1, graph_result_graph_idx_scale_scratch1, graph_result_graph_main_state_scratch1, graph_result_graph_inner_state_scratch1) = prefill_attention_csa_staged(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj, inner_wkv, inner_wgate, inner_ape, inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t, segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests, overlay_active_lengths, swa_indices, history_slot_mapping, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping, leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window, main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b, wo_b_scale, x_out, completion_token, graph_idx_scratch0, graph_idx_scale_scratch0, graph_main_state_scratch0, graph_inner_state_scratch0, graph_idx_scratch1, graph_idx_scale_scratch1, graph_main_state_scratch1, graph_inner_state_scratch1, cache_owner_rank, my_rank, tail_comm_epoch, compact_comm_epoch_base, request_length, segment_span, request_prefix)
+    return (graph_result_compress_state, graph_result_inner_compress_state, graph_result_kv_cache, graph_result_cmp_kv, graph_result_idx_kv_cache, graph_result_idx_kv_scale, graph_result_effective_x_workspace, graph_result_x_out, graph_result_completion_token)
 
 @pl.jit
 def prefill_cp_csa_rank(
@@ -2560,21 +2368,7 @@ def prefill_cp_csa_rank(
     segment_span_host = pl.read(prefill_plan_host, [0, 3])
     request_prefix_host = pl.read(prefill_plan_host, [0, 4])
     completion_token = pl.create_tensor([NUM_MOE_WAVES, 1, 8], dtype=pl.FP32)
-    return prefill_attention_csa(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
-        wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
-        cmp_norm_w, hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj, inner_wkv, inner_wgate, inner_ape,
-        inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state,
-        inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t,
-        segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests,
-        overlay_active_lengths, swa_indices, history_slot_mapping, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
-        leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
-        tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
-        main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
-        wo_b_scale, x_out, completion_token, cache_owner_host, my_rank,
-        pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
-        request_length_host, segment_span_host, request_prefix_host,
-    )
+    return prefill_attention_csa(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj, inner_wkv, inner_wgate, inner_ape, inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state, inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t, segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests, overlay_active_lengths, swa_indices, history_slot_mapping, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping, leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window, main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b, wo_b_scale, x_out, completion_token, cache_owner_host, my_rank, pl.cast(0, pl.INT32), pl.cast(0, pl.INT32), request_length_host, segment_span_host, request_prefix_host, pl.tensor.dim(idx_kv_cache, 0), pl.tensor.dim(main_state_workspace0, 0), pl.tensor.dim(inner_state_workspace0, 0))
 
 @pl.jit.host
 def prefill_cp_csa_test(
@@ -2743,6 +2537,20 @@ def prefill_cp_csa_test(
         )
 
 
+def _golden_csa_workspace_leaf(workspace, state, block_table, block_size, positions, active, leaf, carry_end):
+    """Materialize compressor writes and odd-leaf carry rows in the external workspace."""
+    if leaf % 2 == 0:
+        logical_positions = [int(position) for position in positions[:active]]
+    else:
+        logical_positions = range(max(0, carry_end - STATE_LEN), carry_end)
+    workspace_rows = workspace.view(-1, workspace.shape[-1])
+    state_rows = state.view(-1, state.shape[-1])
+    for position in logical_positions:
+        row = _lower_row(block_table, position, block_size)
+        if row >= 0:
+            workspace_rows[row].copy_(state_rows[row])
+
+
 def golden_prefill_cp_csa(tensors):
     """Compose CP-CSA golden outputs in logical-segment commit order."""
     from utils import int8_quant_per_row, unpack_nz
@@ -2852,6 +2660,18 @@ def golden_prefill_cp_csa(tensors):
             main_state.copy_(tensors["compress_state"][cache_owner])
             inner_state.copy_(tensors["inner_compress_state"][cache_owner])
 
+        main_workspace = tensors[f"main_state_workspace{part}"][rank]
+        inner_workspace = tensors[f"inner_state_workspace{part}"][rank]
+        carry_end = starts[segment]
+        if segment == 0:
+            for workspace, state, table_name, block_size in (
+                (main_workspace, main_state, "compress_state_block_table", MAIN_STATE_BLOCK_SIZE),
+                (inner_workspace, inner_state, "inner_compress_state_block_table", INNER_STATE_BLOCK_SIZE),
+            ):
+                _golden_csa_workspace_leaf(
+                    workspace, state, tensors[table_name][rank], block_size, [], 0, 1, carry_end,
+                )
+
         leaves: list[tuple[torch.Tensor, torch.Tensor]] = []
         if segment > 0 and lengths[segment] > 0:
             predecessor = segment - 1
@@ -2878,6 +2698,13 @@ def golden_prefill_cp_csa(tensors):
             else:
                 active = _active_tile(lengths[segment], leaf - 1)
             if active <= 0:
+                for workspace, state, table_name, block_size in (
+                    (main_workspace, main_state, "compress_state_block_table", MAIN_STATE_BLOCK_SIZE),
+                    (inner_workspace, inner_state, "inner_compress_state_block_table", INNER_STATE_BLOCK_SIZE),
+                ):
+                    _golden_csa_workspace_leaf(
+                        workspace, state, tensors[table_name][rank], block_size, positions, 0, leaf, carry_end,
+                    )
                 continue
             main_cache = torch.zeros(MAIN_LEAF_CACHE_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
             idx_cache = torch.zeros(IDX_LEAF_CACHE_BLOCKS, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
@@ -2943,6 +2770,14 @@ def golden_prefill_cp_csa(tensors):
                     "inner_state_slot_mapping": inner_state_map,
                 }
             )
+            carry_end = int(positions[active - 1]) + 1
+            for workspace, state, table_name, block_size in (
+                (main_workspace, main_state, "compress_state_block_table", MAIN_STATE_BLOCK_SIZE),
+                (inner_workspace, inner_state, "inner_compress_state_block_table", INNER_STATE_BLOCK_SIZE),
+            ):
+                _golden_csa_workspace_leaf(
+                    workspace, state, tensors[table_name][rank], block_size, positions, active, leaf, carry_end,
+                )
             for row in range(active):
                 local_row = int(main_map[row])
                 if local_row >= 0:

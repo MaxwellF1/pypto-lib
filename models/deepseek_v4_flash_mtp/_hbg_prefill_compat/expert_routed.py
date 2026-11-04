@@ -72,7 +72,7 @@ def expert_routed_tile_workspace(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y_tile: pl.Tensor[[RECV_TILE, D], pl.BF16],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    tile_gates: pl.Tensor[[N_LOCAL_EXPERTS, GATE_TILE_PAD], pl.INT32],
+    tile_gates: pl.Tensor[[1, GATE_TILE_PAD], pl.INT32],
     local_e: pl.Scalar[pl.INDEX],
     tile_row: pl.Scalar[pl.INDEX],
     routing_ready: pl.Scalar[pl.TASK_ID],
@@ -91,7 +91,7 @@ def expert_routed_tile_workspace(
 
     with pl.scope():
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm", deps=[routing_ready, reuse_ready], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0)) as gate_tid:
+        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm", deps=[routing_ready, reuse_ready], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0)) as gate_tid:
             pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
             nb_idx = pl.tile.get_block_idx()
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
@@ -104,7 +104,7 @@ def expert_routed_tile_workspace(
                     gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(k0 == 0))
                 gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
-        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm", deps=[routing_ready, reuse_ready], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0)) as up_tid:
+        with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm", deps=[routing_ready, reuse_ready], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0)) as up_tid:
             pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
             ub_idx = pl.tile.get_block_idx()
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
@@ -117,7 +117,7 @@ def expert_routed_tile_workspace(
                     up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(uk0 == 0))
                 up_tile_i32[:, u0 : u0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
 
-        with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act", deps=[routing_ready, gate_tid, up_tid], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0)) as act_tid:
+        with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act", deps=[routing_ready, gate_tid, up_tid], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0)) as act_tid:
             ab_idx = pl.tile.get_block_idx()
             expert_rows = pl.cast(pl.read(recv_expert_count, [local_e, 0]), pl.INDEX)
             valid_rows = pl.min(RECV_TILE, pl.max(0, expert_rows - tile_row))
@@ -143,7 +143,7 @@ def expert_routed_tile_workspace(
                 gated_valid = pl.set_validshape(gated, valid_rows, ACT_INTER_TILE)
                 h_tile_fp32[:, a0 : a0 + ACT_INTER_TILE] = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q", deps=[routing_ready, act_tid], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0)) as quant_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q", deps=[routing_ready, act_tid], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0)) as quant_tid:
             eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                 eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
@@ -162,7 +162,7 @@ def expert_routed_tile_workspace(
 
         pl.array.update_element(quant_dependencies, 0, quant_tid)
 
-    with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", deps=[routing_ready, quant_dependencies], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0), allow_early_resolve=True) as down_tid:
+    with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", deps=[routing_ready, quant_dependencies], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0), allow_early_resolve=True) as down_tid:
         pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
         wb_idx = pl.tile.get_block_idx()
         d_base = wb_idx * (W2_INNER * D_OUT_TILE)
@@ -175,7 +175,7 @@ def expert_routed_tile_workspace(
                 y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
-    with pl.spmd(D // (W2_ACT_INNER * D_OUT_ACT_TILE), name_hint="exp_w2_act", deps=[routing_ready, down_tid], predicate=(tile_gates[local_e, tile_row // RECV_TILE] > 0), allow_early_resolve=True) as w2_act_tid:
+    with pl.spmd(D // (W2_ACT_INNER * D_OUT_ACT_TILE), name_hint="exp_w2_act", deps=[routing_ready, down_tid], predicate=(tile_gates[0, tile_row // RECV_TILE] > 0), allow_early_resolve=True) as w2_act_tid:
         db_idx = pl.tile.get_block_idx()
         act_d_base = db_idx * (W2_ACT_INNER * D_OUT_ACT_TILE)
         w_row_blk = recv_weights[local_e : local_e + 1, tile_row : tile_row + RECV_TILE]
@@ -216,10 +216,11 @@ def expert_routed_tile(
     h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8, manual_dep=True)
     h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
     y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32, manual_dep=True)
+    expert_tile_gates = pl.slice(tile_gates, [1, GATE_TILE_PAD], [local_e, 0])
     return expert_routed_tile_workspace(
         recv_x, recv_scale_dq, recv_weights,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-        recv_y_tile, recv_expert_count, tile_gates,
+        recv_y_tile, recv_expert_count, expert_tile_gates,
         local_e, tile_row, routing_ready,
         gate_tile_i32, up_tile_i32, h_tile_fp32,
         h_tile_i8, h_tile_scale_dq, y_i32,
@@ -250,6 +251,7 @@ def expert_routed_test(
     tile_gates, gates_tid = expert_routing_gates(recv_expert_count, no_producer, no_producer)
     tile_start_tid = pl.system.task_dummy(deps=[output_init_tid, gates_tid])
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
+        expert_tile_gates = pl.slice(tile_gates, [1, GATE_TILE_PAD], [local_e, 0])
         gate_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32, manual_dep=True)
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32, manual_dep=True)
         h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32, manual_dep=True)
@@ -264,7 +266,7 @@ def expert_routed_test(
             reuse_ready = expert_routed_tile_workspace(
                 recv_x, recv_scale_dq, recv_weights,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                recv_y_tile, recv_expert_count, tile_gates,
+                recv_y_tile, recv_expert_count, expert_tile_gates,
                 local_e, tile_row, tile_start_tid,
                 gate_tile_i32, up_tile_i32, h_tile_fp32,
                 h_tile_i8, h_tile_scale_dq, y_i32,
