@@ -142,6 +142,7 @@ MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
 # vector epilogues (silu, down+resid) are UB-bound, so their frag drops to 64 to
 # fit the 184KB Vec buffer at M=128.
 MLP_M_TILE = 128
+PREFILL_WINDOW_TOKENS = MLP_M_TILE
 SILU_OUT_CHUNK = 64
 SILU_OUT_BLOCKS = INTERMEDIATE // SILU_OUT_CHUNK
 DOWN_RESID_CHUNK = 64
@@ -199,6 +200,12 @@ def _attention_phase_window(
     final_ti0: pl.Scalar[pl.INT32],
     finalize_tok: pl.Scalar[pl.INT32],
     rope_ready_deps: pl.Array[ROPE_READY_DEP_COUNT, pl.TASK_ID],
+    workspace_cur_mi_phase: pl.Tensor[[BATCH_PAD * (ATTN_PHASE_ACC_STAT_ROWS), 1], pl.FP32],
+    workspace_qkpv_order: pl.Tensor[[BATCH_PAD * (QKPV_PLAN_WORK_ITEMS)], pl.INT32],
+    workspace_qkpv_wcur: pl.Tensor[[BATCH_PAD * 16], pl.INT32],
+    workspace_partial_mi_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], pl.FP32],
+    workspace_partial_li_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], pl.FP32],
+    workspace_partial_oi_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_SCORE_ROWS), HEAD_DIM], pl.FP32],
 ) -> tuple[
     pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
     pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
@@ -207,20 +214,21 @@ def _attention_phase_window(
     cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
     v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
-    cur_mi_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
+    cur_mi_phase = pl.slice(workspace_cur_mi_phase, [ATTN_PHASE_ACC_STAT_ROWS, 1], [(b) * (ATTN_PHASE_ACC_STAT_ROWS), 0])
     if finalize_tok > 0:
         block_ctx_len = chunk_start + p0 + final_ti0 + finalize_tok
         block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-        qkpv_order = pl.create_tensor([QKPV_PLAN_WORK_ITEMS], dtype=pl.INT32)
-        qkpv_wcur = pl.create_tensor([1], dtype=pl.INT32)
-        partial_mi_phase = pl.create_tensor([QKPV_PARTIAL_STAT_ROWS, 1], dtype=pl.FP32)
-        partial_li_phase = pl.create_tensor([QKPV_PARTIAL_STAT_ROWS, 1], dtype=pl.FP32)
-        partial_oi_phase = pl.create_tensor([QKPV_PARTIAL_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
+        qkpv_order = pl.slice(workspace_qkpv_order, [QKPV_PLAN_WORK_ITEMS], [(b) * (QKPV_PLAN_WORK_ITEMS)])
+        qkpv_wcur = pl.slice(workspace_qkpv_wcur, [1], [b * 16])
+        partial_mi_phase = pl.slice(workspace_partial_mi_phase, [QKPV_PARTIAL_STAT_ROWS, 1], [(b) * (QKPV_PARTIAL_STAT_ROWS), 0])
+        partial_li_phase = pl.slice(workspace_partial_li_phase, [QKPV_PARTIAL_STAT_ROWS, 1], [(b) * (QKPV_PARTIAL_STAT_ROWS), 0])
+        partial_oi_phase = pl.slice(workspace_partial_oi_phase, [QKPV_PARTIAL_SCORE_ROWS, HEAD_DIM], [(b) * (QKPV_PARTIAL_SCORE_ROWS), 0])
         for sb_chunk in pl.range(0, block_ctx_blocks, QKPV_PLAN_SB_BATCH):
             with pl.at(
                 level=pl.Level.CORE_GROUP,
                 name_hint="qkpv_plan",
                 allow_early_resolve=True,
+                deps=[rope_ready_deps[0]],
             ):
                 pl.write(qkpv_wcur, [0], pl.cast(0, pl.INT32))
                 for plan_si in pl.unroll(QKPV_PLAN_SB_BATCH):
@@ -954,6 +962,114 @@ def _out_proj_aic_phase(
 
 
 @pl.jit.inline(auto_scope=False)
+def _prefill_mlp_band(
+    post_norm_mtile: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    gate_up_acc_b: pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32],
+    mlp_silu_b: pl.Tensor[[MLP_M_TILE, MLP_BAND_WIDTH], pl.BF16],
+    mlp_out_acc_tile: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.FP32],
+    layer_hidden_base: pl.Scalar[pl.INT32],
+    layer_inter_base: pl.Scalar[pl.INT32],
+    band_ob0: pl.Scalar[pl.INDEX],
+    band_inter0: pl.Scalar[pl.INDEX],
+    band_core_rot: pl.Scalar[pl.INDEX],
+    post_norm_ready: pl.Scalar[pl.TASK_ID],
+    seed_tid: pl.Scalar[pl.TASK_ID],
+    down_chain: pl.Array[MLP_PROJ_BANDS, pl.TASK_ID],
+    mlp_band: pl.Scalar[pl.INDEX],
+):
+    down_n_blocks = HIDDEN // K_CHUNK
+    band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
+    silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
+    with pl.manual_scope():
+        with pl.spmd(
+            GATE_UP_SPMD_BLOCKS,
+            name_hint="gate_up_proj_spmd",
+            deps=[post_norm_ready],
+        ) as gate_up_tid:
+            gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
+            for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                gate_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
+                    k0 = kb * K_CHUNK
+                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                    wgi = pl.slice(
+                        w_gate,
+                        [K_CHUNK, MLP_OUT_CHUNK],
+                        [layer_hidden_base + k0, o0],
+                    )
+                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
+                gate_up_acc_b = pl.assemble(
+                    gate_up_acc_b,
+                    gate_acc,
+                    [0, rel_ob * MLP_OUT_CHUNK],
+                )
+
+            up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
+            for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                up_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
+                    k0 = kb * K_CHUNK
+                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                    wui = pl.slice(
+                        w_up,
+                        [K_CHUNK, MLP_OUT_CHUNK],
+                        [layer_hidden_base + k0, o0],
+                    )
+                    up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
+                gate_up_acc_b = pl.assemble(
+                    gate_up_acc_b,
+                    up_acc,
+                    [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK],
+                )
+
+        with pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd", deps=[gate_up_tid]) as silu_tid:
+            silu_core = pl.tile.get_block_idx()
+            for rel_sb in pl.range(silu_core, silu_band_blocks, SILU_SPMD_BLOCKS):
+                so0 = rel_sb * SILU_OUT_CHUNK
+                silu_gate = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
+                silu_up = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [MLP_M_TILE, so0])
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
+                mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
+                mlp_silu_b = pl.assemble(
+                    mlp_silu_b,
+                    pl.cast(mlp_chunk, target_type=pl.BF16),
+                    [0, so0],
+                )
+
+        with pl.spmd(
+            DOWN_PROJ_SPMD_BLOCKS,
+            name_hint="down_proj_spmd",
+            deps=[seed_tid, silu_tid],
+        ) as down_tid:
+            down_core = pl.tile.get_block_idx()
+            for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
+                h0 = hb * K_CHUNK
+                down_acc = pl.create_tensor([MLP_M_TILE, K_CHUNK], dtype=pl.FP32)
+                for cb in pl.pipeline(0, band_k_chunks, stage=2):
+                    c0 = cb * MLP_OUT_CHUNK
+                    msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
+                    wdi = pl.slice(
+                        w_down,
+                        [MLP_OUT_CHUNK, K_CHUNK],
+                        [layer_inter_base + band_inter0 + c0, h0],
+                    )
+                    down_acc = pl.matmul_acc(down_acc, msi, wdi, init_cond=(cb == 0))
+                mlp_out_acc_tile = pl.assemble(
+                    mlp_out_acc_tile,
+                    down_acc,
+                    [0, h0],
+                    atomic=pl.AtomicType.Add,
+                )
+        pl.array.update_element(down_chain, mlp_band, down_tid)
+    return mlp_out_acc_tile
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
@@ -982,6 +1098,29 @@ def prefill_layer(
     window_done: pl.Tensor[[BATCH_PAD, 8], pl.FP32],
     layer_idx: pl.Scalar[pl.INT32],
     kv_tail: pl.Array[NUM_LAYERS * BATCH_PAD, pl.TASK_ID],
+    workspace_post_norm_mtile: pl.Tensor[[BATCH_PAD * (MLP_M_TILE), HIDDEN], pl.BF16],
+    workspace_resid1_mtile: pl.Tensor[[BATCH_PAD * (MLP_M_TILE), HIDDEN], pl.FP32],
+    workspace_x_gamma_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), HIDDEN], pl.BF16],
+    workspace_input_inv_rms_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), 1], pl.FP32],
+    workspace_q_proj_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), HIDDEN], pl.FP32],
+    workspace_k_proj_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), KV_HIDDEN], pl.FP32],
+    workspace_v_proj_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), KV_HIDDEN], pl.FP32],
+    workspace_attn_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), HIDDEN], pl.BF16],
+    workspace_out_proj_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE), HIDDEN], pl.FP32],
+    workspace_all_q_padded_tile: pl.Tensor[[BATCH_PAD * (TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD), HEAD_DIM], pl.BF16],
+    workspace_cur_li_phase: pl.Tensor[[BATCH_PAD * (ATTN_PHASE_ACC_STAT_ROWS), 1], pl.FP32],
+    workspace_oi_tmp_phase: pl.Tensor[[BATCH_PAD * (ATTN_PHASE_ACC_SCORE_ROWS), HEAD_DIM], pl.FP32],
+    workspace_mlp_out_acc_tile: pl.Tensor[[BATCH_PAD * (MLP_M_TILE), HIDDEN], pl.FP32],
+    workspace_gate_up_acc_b: pl.Tensor[[BATCH_PAD * MLP_PROJ_BANDS * (2 * MLP_M_TILE), MLP_BAND_WIDTH], pl.FP32],
+    workspace_mlp_silu_b: pl.Tensor[[BATCH_PAD * MLP_PROJ_BANDS * (MLP_M_TILE), MLP_BAND_WIDTH], pl.BF16],
+    workspace_cur_mi_phase: pl.Tensor[[BATCH_PAD * (ATTN_PHASE_ACC_STAT_ROWS), 1], pl.FP32],
+    workspace_qkpv_order: pl.Tensor[[BATCH_PAD * (QKPV_PLAN_WORK_ITEMS)], pl.INT32],
+    workspace_qkpv_wcur: pl.Tensor[[BATCH_PAD * 16], pl.INT32],
+    workspace_partial_mi_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], pl.FP32],
+    workspace_partial_li_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], pl.FP32],
+    workspace_partial_oi_phase: pl.Tensor[[BATCH_PAD * (QKPV_PARTIAL_SCORE_ROWS), HEAD_DIM], pl.FP32],
+    workspace_tail: pl.Array[BATCH_PAD, pl.TASK_ID],
+    record_mlp_graph: pl.constexpr = False,
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     out.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1008,8 +1147,8 @@ def prefill_layer(
     silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
 
     for b in pl.parallel(0, batch, 1):
-        post_norm_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16, manual_dep=True)
-        resid1_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32)
+        post_norm_mtile = pl.slice(workspace_post_norm_mtile, [MLP_M_TILE, HIDDEN], [(b) * (MLP_M_TILE), 0])
+        resid1_mtile = pl.slice(workspace_resid1_mtile, [MLP_M_TILE, HIDDEN], [(b) * (MLP_M_TILE), 0])
         window_done_row = pl.slice(window_done, [1, 8], [b, 0])
         post_norm_tids = pl.array.create(MLP_M_TILE // TOK_TILE, pl.TASK_ID)
         original_token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX) + group_p0
@@ -1031,13 +1170,14 @@ def prefill_layer(
                     slot_token_p0 = original_token_base + p0
                     valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
 
-                    x_gamma_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                    input_inv_rms_tile = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
+                    x_gamma_tile = pl.slice(workspace_x_gamma_tile, [TOK_TILE, HIDDEN], [(b) * (TOK_TILE), 0])
+                    input_inv_rms_tile = pl.slice(workspace_input_inv_rms_tile, [TOK_TILE, 1], [(b) * (TOK_TILE), 0])
 
                     with pl.spmd(
                         RMSNORM_SPMD_BLOCKS,
                         name_hint="x_gamma_spmd",
                         allow_early_resolve=True,
+                        deps=[workspace_tail[b]],
                     ) as x_gamma_tid:
                         xg_core = pl.tile.get_block_idx()
                         for work_id in pl.range(xg_core, X_GAMMA_HIDDEN_BLOCKS, RMSNORM_SPMD_BLOCKS):
@@ -1069,7 +1209,7 @@ def prefill_layer(
                     with pl.spmd(
                         RMSNORM_SPMD_BLOCKS,
                         name_hint="rms_recip_spmd",
-                        deps=[rms_recip_late],
+                        deps=[rms_recip_late, workspace_tail[b]],
                     ) as rms_recip_tid:
                         rms_core = pl.tile.get_block_idx()
                         for work_id in pl.range(rms_core, RMSNORM_WORK_ITEMS, RMSNORM_SPMD_BLOCKS):
@@ -1099,14 +1239,15 @@ def prefill_layer(
                                 )
                                 input_inv_rms_tile = pl.assemble(input_inv_rms_tile, inv_rms, [ti0, 0])
 
-                    q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
-                    k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
-                    v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
+                    q_proj_tile = pl.slice(workspace_q_proj_tile, [TOK_TILE, HIDDEN], [(b) * (TOK_TILE), 0])
+                    k_proj_tile = pl.slice(workspace_k_proj_tile, [TOK_TILE, KV_HIDDEN], [(b) * (TOK_TILE), 0])
+                    v_proj_tile = pl.slice(workspace_v_proj_tile, [TOK_TILE, KV_HIDDEN], [(b) * (TOK_TILE), 0])
                     fused_qkpv_deps = pl.array.create(ROPE_INPUT_DEP_COUNT, pl.TASK_ID)
                     if p0_idx == 0:
                         with pl.spmd(
                             Q_PROJ_SPMD_BLOCKS,
                             name_hint="q_proj_spmd",
+                            deps=[workspace_tail[b]],
                         ) as q_proj_tid:
                             q_core = pl.tile.get_block_idx()
                             for ob in pl.range(q_core, Q_OUT_BLOCKS, Q_PROJ_SPMD_BLOCKS):
@@ -1122,6 +1263,7 @@ def prefill_layer(
                         with pl.spmd(
                             KV_PROJ_SPMD_BLOCKS,
                             name_hint="kv_proj_spmd",
+                            deps=[workspace_tail[b]],
                         ) as kv_proj_tid:
                             kv_core = pl.tile.get_block_idx()
                             for work_id in pl.range(kv_core, KV_PROJ_WORK_ITEMS, KV_PROJ_SPMD_BLOCKS):
@@ -1148,12 +1290,9 @@ def prefill_layer(
                         fused_qkpv_deps[1] = q_proj_tid
                         fused_qkpv_deps[2] = kv_proj_tid
                         fused_qkpv_deps[3] = kv_tail[kv_tail_idx]
-                    attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                    out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
-                    all_q_padded_tile = pl.create_tensor(
-                        [TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM],
-                        dtype=pl.BF16,
-                    )
+                    attn_tile = pl.slice(workspace_attn_tile, [TOK_TILE, HIDDEN], [(b) * (TOK_TILE), 0])
+                    out_proj_tile = pl.slice(workspace_out_proj_tile, [TOK_TILE, HIDDEN], [(b) * (TOK_TILE), 0])
+                    all_q_padded_tile = pl.slice(workspace_all_q_padded_tile, [TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM], [(b) * (TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD), 0])
                     rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
                     for final_ti0 in pl.range(0, valid_tok, FINALIZE_TOK_GROUP):
                         with pl.scope():
@@ -1165,8 +1304,8 @@ def prefill_layer(
                             final_ti0_i32 = pl.cast(final_ti0, pl.INT32)
                             finalize_tok_i32 = pl.cast(finalize_tok, pl.INT32)
 
-                            cur_li_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
-                            oi_tmp_phase = pl.create_tensor([ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
+                            cur_li_phase = pl.slice(workspace_cur_li_phase, [ATTN_PHASE_ACC_STAT_ROWS, 1], [(b) * (ATTN_PHASE_ACC_STAT_ROWS), 0])
+                            oi_tmp_phase = pl.slice(workspace_oi_tmp_phase, [ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], [(b) * (ATTN_PHASE_ACC_SCORE_ROWS), 0])
                             block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
                             block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
                             pl.array.update_element(fused_qkpv_deps, 4, rope_ready_deps[0])
@@ -1229,6 +1368,9 @@ def prefill_layer(
                                         final_ti0_i32,
                                         finalize_tok_i32,
                                         rope_ready_deps,
+                                        workspace_cur_mi_phase, workspace_qkpv_order, workspace_qkpv_wcur,
+                                        workspace_partial_mi_phase, workspace_partial_li_phase,
+                                        workspace_partial_oi_phase,
                                     )
                             else:
                                 attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
@@ -1247,6 +1389,9 @@ def prefill_layer(
                                     final_ti0_i32,
                                     finalize_tok_i32,
                                     rope_ready_deps,
+                                    workspace_cur_mi_phase, workspace_qkpv_order, workspace_qkpv_wcur,
+                                    workspace_partial_mi_phase, workspace_partial_li_phase,
+                                    workspace_partial_oi_phase,
                                 )
                     resid1_tile = pl.slice(resid1_mtile, [TOK_TILE, HIDDEN], [p0, 0])
                     out_proj_tile = _out_proj_aic_phase(
@@ -1334,7 +1479,7 @@ def prefill_layer(
             # next batch tile opens more ring3 work.
             m0 = b * MLP_M_TILE
             post_norm_ready = pl.system.task_dummy(deps=[post_norm_tids])
-            mlp_out_acc_tile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32, manual_dep=True)
+            mlp_out_acc_tile = pl.slice(workspace_mlp_out_acc_tile, [MLP_M_TILE, HIDDEN], [(b) * (MLP_M_TILE), 0])
 
             # Seed the accumulator with the first-residual (folds the MLP residual add).
             with pl.spmd(
@@ -1356,93 +1501,32 @@ def prefill_layer(
                 with pl.scope():
                     band_ob0 = mlp_band * MLP_BAND_BLOCKS
                     band_inter0 = mlp_band * MLP_BAND_WIDTH
-                    gate_up_acc_b = pl.create_tensor([2 * MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.FP32)
-                    mlp_silu_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.BF16)
+                    gate_up_acc_b = pl.slice(workspace_gate_up_acc_b, [2 * MLP_M_TILE, MLP_BAND_WIDTH], [(b * MLP_PROJ_BANDS + mlp_band) * (2 * MLP_M_TILE), 0])
+                    mlp_silu_b = pl.slice(workspace_mlp_silu_b, [MLP_M_TILE, MLP_BAND_WIDTH], [(b * MLP_PROJ_BANDS + mlp_band) * (MLP_M_TILE), 0])
 
                     band_core_rot = (mlp_band * MLP_BAND_CORE_ROT_STEP) % GATE_UP_SPMD_BLOCKS
-                    with pl.manual_scope():
-                        with pl.spmd(
-                            GATE_UP_SPMD_BLOCKS,
-                            name_hint="gate_up_proj_spmd",
-                            deps=[post_norm_ready],
-                        ) as gate_up_tid:
-                            gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
-                            for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                gate_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
-                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
-                                    k0 = kb * K_CHUNK
-                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-                                    wgi = pl.slice(
-                                        w_gate,
-                                        [K_CHUNK, MLP_OUT_CHUNK],
-                                        [layer_hidden_base + k0, o0],
-                                    )
-                                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
-                                gate_up_acc_b = pl.assemble(
-                                    gate_up_acc_b,
-                                    gate_acc,
-                                    [0, rel_ob * MLP_OUT_CHUNK],
-                                )
-
-                            up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
-                            for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                up_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
-                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
-                                    k0 = kb * K_CHUNK
-                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-                                    wui = pl.slice(
-                                        w_up,
-                                        [K_CHUNK, MLP_OUT_CHUNK],
-                                        [layer_hidden_base + k0, o0],
-                                    )
-                                    up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
-                                gate_up_acc_b = pl.assemble(
-                                    gate_up_acc_b,
-                                    up_acc,
-                                    [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK],
-                                )
-
-                        with pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd", deps=[gate_up_tid]) as silu_tid:
-                            silu_core = pl.tile.get_block_idx()
-                            for rel_sb in pl.range(silu_core, silu_band_blocks, SILU_SPMD_BLOCKS):
-                                so0 = rel_sb * SILU_OUT_CHUNK
-                                silu_gate = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
-                                silu_up = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [MLP_M_TILE, so0])
-                                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
-                                mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
-                                mlp_silu_b = pl.assemble(
-                                    mlp_silu_b,
-                                    pl.cast(mlp_chunk, target_type=pl.BF16),
-                                    [0, so0],
-                                )
-
-                        with pl.spmd(
-                            DOWN_PROJ_SPMD_BLOCKS,
-                            name_hint="down_proj_spmd",
-                            deps=[seed_tid, silu_tid],
-                        ) as down_tid:
-                            down_core = pl.tile.get_block_idx()
-                            for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
-                                h0 = hb * K_CHUNK
-                                down_acc = pl.create_tensor([MLP_M_TILE, K_CHUNK], dtype=pl.FP32)
-                                for cb in pl.pipeline(0, band_k_chunks, stage=2):
-                                    c0 = cb * MLP_OUT_CHUNK
-                                    msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
-                                    wdi = pl.slice(
-                                        w_down,
-                                        [MLP_OUT_CHUNK, K_CHUNK],
-                                        [layer_inter_base + band_inter0 + c0, h0],
-                                    )
-                                    down_acc = pl.matmul_acc(down_acc, msi, wdi, init_cond=(cb == 0))
-                                mlp_out_acc_tile = pl.assemble(
-                                    mlp_out_acc_tile,
-                                    down_acc,
-                                    [0, h0],
-                                    atomic=pl.AtomicType.Add,
-                                )
-                        down_chain[mlp_band] = down_tid
+                    if record_mlp_graph:
+                        with pl.graph("qwen_prefill_mlp_band", deps=[post_norm_ready, seed_tid]) as band_done:
+                            graph_invalid_dependency = pl.system.task_invalid()
+                            graph_local_down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
+                            mlp_out_acc_tile = _prefill_mlp_band(
+                                post_norm_mtile, w_gate, w_up, w_down,
+                                gate_up_acc_b, mlp_silu_b, mlp_out_acc_tile,
+                                layer_hidden_base, layer_inter_base,
+                                band_ob0, band_inter0, band_core_rot,
+                                graph_invalid_dependency, graph_invalid_dependency,
+                                graph_local_down_chain, 0,
+                            )
+                        down_chain[mlp_band] = band_done
+                    else:
+                        mlp_out_acc_tile = _prefill_mlp_band(
+                            post_norm_mtile, w_gate, w_up, w_down,
+                            gate_up_acc_b, mlp_silu_b, mlp_out_acc_tile,
+                            layer_hidden_base, layer_inter_base,
+                            band_ob0, band_inter0, band_core_rot,
+                            post_norm_ready, seed_tid,
+                            down_chain, mlp_band,
+                        )
 
             valid_tt = pl.min(MLP_M_TILE, prefill_tokens - m0)
             with pl.spmd(
@@ -1467,8 +1551,295 @@ def prefill_layer(
             # while the explicit update is emitted as the same in-place C-array
             # slot write without rebinding the array value.
             pl.array.update_element(kv_tail, kv_tail_idx, cast_tid)
+            pl.array.update_element(workspace_tail, b, cast_tid)
 
     return out
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_window_body(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    final_hidden: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    kv_tail: pl.Array[NUM_LAYERS * BATCH_PAD, pl.TASK_ID],
+    p0_idx: pl.Scalar[pl.INDEX],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    retire_window: pl.Scalar[pl.BOOL],
+    record_mlp_graph: pl.constexpr = False,
+):
+    batch = pl.tensor.dim(seq_lens, 0)
+    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
+    # Retain the lifetime scope for window-local hidden buffers.
+    with pl.scope():
+        # Request-private scratch reused after each layer completion.
+        workspace_post_norm_mtile = pl.create_tensor([BATCH_PAD * (MLP_M_TILE), HIDDEN], dtype=pl.BF16, manual_dep=True)
+        workspace_resid1_mtile = pl.create_tensor([BATCH_PAD * (MLP_M_TILE), HIDDEN], dtype=pl.FP32)
+        workspace_x_gamma_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), HIDDEN], dtype=pl.BF16)
+        workspace_input_inv_rms_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), 1], dtype=pl.FP32)
+        workspace_q_proj_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), HIDDEN], dtype=pl.FP32)
+        workspace_k_proj_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), KV_HIDDEN], dtype=pl.FP32)
+        workspace_v_proj_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), KV_HIDDEN], dtype=pl.FP32)
+        workspace_attn_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), HIDDEN], dtype=pl.BF16)
+        workspace_out_proj_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE), HIDDEN], dtype=pl.FP32)
+        workspace_all_q_padded_tile = pl.create_tensor([BATCH_PAD * (TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD), HEAD_DIM], dtype=pl.BF16)
+        workspace_cur_li_phase = pl.create_tensor([BATCH_PAD * (ATTN_PHASE_ACC_STAT_ROWS), 1], dtype=pl.FP32)
+        workspace_oi_tmp_phase = pl.create_tensor([BATCH_PAD * (ATTN_PHASE_ACC_SCORE_ROWS), HEAD_DIM], dtype=pl.FP32)
+        workspace_mlp_out_acc_tile = pl.create_tensor([BATCH_PAD * (MLP_M_TILE), HIDDEN], dtype=pl.FP32, manual_dep=True)
+        workspace_gate_up_acc_b = pl.create_tensor([BATCH_PAD * MLP_PROJ_BANDS * (2 * MLP_M_TILE), MLP_BAND_WIDTH], dtype=pl.FP32)
+        workspace_mlp_silu_b = pl.create_tensor([BATCH_PAD * MLP_PROJ_BANDS * (MLP_M_TILE), MLP_BAND_WIDTH], dtype=pl.BF16)
+        workspace_cur_mi_phase = pl.create_tensor([BATCH_PAD * (ATTN_PHASE_ACC_STAT_ROWS), 1], dtype=pl.FP32)
+        workspace_qkpv_order = pl.create_tensor([BATCH_PAD * (QKPV_PLAN_WORK_ITEMS)], dtype=pl.INT32)
+        workspace_qkpv_wcur = pl.create_tensor([BATCH_PAD * 16], dtype=pl.INT32)
+        workspace_partial_mi_phase = pl.create_tensor([BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], dtype=pl.FP32)
+        workspace_partial_li_phase = pl.create_tensor([BATCH_PAD * (QKPV_PARTIAL_STAT_ROWS), 1], dtype=pl.FP32)
+        workspace_partial_oi_phase = pl.create_tensor([BATCH_PAD * (QKPV_PARTIAL_SCORE_ROWS), HEAD_DIM], dtype=pl.FP32)
+        workspace_tail = pl.array.create(BATCH_PAD, pl.TASK_ID)
+        p0 = p0_idx * MLP_M_TILE
+        if batch == 1:
+            window_hidden_pair = pl.create_tensor([2 * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+            window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
+            token_base = pl.cast(pl.tensor.read(host_chunk_offsets, [0]), pl.INDEX)
+            chunk_len_b = pl.tensor.read(host_chunk_lens, [0])
+            valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
+
+            with pl.spmd(
+                TOKEN_EMBED_SPMD_BLOCKS,
+                name_hint="token_embed_single",
+            ):
+                embed_core = pl.tile.get_block_idx()
+                for work_id in pl.range(
+                    embed_core,
+                    MLP_M_TILE * TOKEN_EMBED_HIDDEN_BLOCKS,
+                    TOKEN_EMBED_SPMD_BLOCKS,
+                ):
+                    ti = work_id // TOKEN_EMBED_HIDDEN_BLOCKS
+                    embed_hidden_block = work_id - ti * TOKEN_EMBED_HIDDEN_BLOCKS
+                    if ti < valid_tok:
+                        token_idx = token_base + p0 + ti
+                        token_id = pl.tensor.read(input_ids, [token_idx])
+                        token_row = pl.cast(token_id, target_type=pl.INDEX)
+                        k0 = embed_hidden_block * EMBED_HIDDEN_CHUNK
+                        hidden_chunk = pl.slice(
+                            embed_weight,
+                            [1, EMBED_HIDDEN_CHUNK],
+                            [token_row, k0],
+                        )
+                        window_hidden_pair = pl.assemble(
+                            window_hidden_pair,
+                            hidden_chunk,
+                            [ti, k0],
+                        )
+            for layer_idx in pl.range(num_layers_actual):
+                read_base = (layer_idx % 2) * MLP_M_TILE
+                write_base = ((layer_idx + 1) % 2) * MLP_M_TILE
+                with pl.scope():
+                    window_hidden = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [read_base, 0])
+                    window_next = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [write_base, 0])
+                    window_done_layer = pl.slice(
+                        window_done,
+                        [BATCH_PAD, 8],
+                        [layer_idx * BATCH_PAD, 0],
+                    )
+                    window_next = prefill_layer(
+                        window_hidden,
+                        seq_lens,
+                        host_chunk_lens,
+                        host_chunk_offsets,
+                        pl.cast(p0, pl.INDEX),
+                        pl.cast(MLP_M_TILE, pl.INDEX),
+                        input_rms_weight,
+                        wq,
+                        wk,
+                        wv,
+                        q_norm_weight,
+                        k_norm_weight,
+                        rope_cos,
+                        rope_sin,
+                        block_table,
+                        slot_mapping,
+                        k_cache,
+                        v_cache,
+                        wo,
+                        post_rms_weight,
+                        w_gate,
+                        w_up,
+                        w_down,
+                        window_next,
+                        window_done_layer,
+                        layer_idx,
+                        kv_tail,
+                        workspace_post_norm_mtile, workspace_resid1_mtile, workspace_x_gamma_tile,
+                        workspace_input_inv_rms_tile, workspace_q_proj_tile, workspace_k_proj_tile,
+                        workspace_v_proj_tile, workspace_attn_tile, workspace_out_proj_tile,
+                        workspace_all_q_padded_tile, workspace_cur_li_phase, workspace_oi_tmp_phase,
+                        workspace_mlp_out_acc_tile, workspace_gate_up_acc_b, workspace_mlp_silu_b,
+                        workspace_cur_mi_phase, workspace_qkpv_order, workspace_qkpv_wcur,
+                        workspace_partial_mi_phase, workspace_partial_li_phase, workspace_partial_oi_phase,
+                        workspace_tail,
+                        record_mlp_graph,
+                    )
+            if retire_window and num_layers_actual > 0:
+                window_fence_idx = (num_layers_actual - 1) * BATCH_PAD
+                window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
+            if chunk_len_b > 0:
+                last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
+                if p0_idx == last_group:
+                    local_last = valid_tok - 1
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="save_prefill_last_token_single",
+                    ):
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            final_base = (num_layers_actual % 2) * MLP_M_TILE
+                            final_hidden_chunk = pl.slice(
+                                window_hidden_pair,
+                                [1, K_CHUNK],
+                                [final_base + local_last, k0],
+                            )
+                            final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [0, k0])
+        else:
+            group_hidden_pair = pl.create_tensor(
+                [2 * BATCH_PAD * MLP_M_TILE, HIDDEN],
+                dtype=pl.BF16,
+            )
+            window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
+
+            with pl.spmd(
+                TOKEN_EMBED_SPMD_BLOCKS,
+                name_hint="token_embed_group",
+            ):
+                embed_core = pl.tile.get_block_idx()
+                for work_id in pl.range(
+                    embed_core,
+                    BATCH_PAD * MLP_M_TILE * TOKEN_EMBED_HIDDEN_BLOCKS,
+                    TOKEN_EMBED_SPMD_BLOCKS,
+                ):
+                    row_id = work_id // TOKEN_EMBED_HIDDEN_BLOCKS
+                    embed_hidden_block = work_id - row_id * TOKEN_EMBED_HIDDEN_BLOCKS
+                    embed_b = row_id // MLP_M_TILE
+                    local_ti = row_id - embed_b * MLP_M_TILE
+                    if embed_b < batch:
+                        token_base = pl.cast(pl.tensor.read(chunk_offsets, [embed_b]), pl.INDEX)
+                        chunk_len_b = pl.tensor.read(chunk_lens, [embed_b])
+                        valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
+                        if local_ti < valid_tok:
+                            token_idx = token_base + p0 + local_ti
+                            group_idx = embed_b * MLP_M_TILE + local_ti
+                            token_id = pl.tensor.read(input_ids, [token_idx])
+                            token_row = pl.cast(token_id, target_type=pl.INDEX)
+                            k0 = embed_hidden_block * EMBED_HIDDEN_CHUNK
+                            hidden_chunk = pl.slice(
+                                embed_weight,
+                                [1, EMBED_HIDDEN_CHUNK],
+                                [token_row, k0],
+                            )
+                            group_hidden_pair = pl.assemble(
+                                group_hidden_pair,
+                                hidden_chunk,
+                                [group_idx, k0],
+                            )
+            group_rows = BATCH_PAD * MLP_M_TILE
+            for layer_idx in pl.range(num_layers_actual):
+                read_base = (layer_idx % 2) * group_rows
+                write_base = ((layer_idx + 1) % 2) * group_rows
+                with pl.scope():
+                    group_hidden = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [read_base, 0])
+                    group_next = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [write_base, 0])
+                    window_done_layer = pl.slice(
+                        window_done,
+                        [BATCH_PAD, 8],
+                        [layer_idx * BATCH_PAD, 0],
+                    )
+                    group_next = prefill_layer(
+                        group_hidden,
+                        seq_lens,
+                        host_chunk_lens,
+                        host_chunk_offsets,
+                        pl.cast(p0, pl.INDEX),
+                        pl.cast(batch * MLP_M_TILE, pl.INDEX),
+                        input_rms_weight,
+                        wq,
+                        wk,
+                        wv,
+                        q_norm_weight,
+                        k_norm_weight,
+                        rope_cos,
+                        rope_sin,
+                        block_table,
+                        slot_mapping,
+                        k_cache,
+                        v_cache,
+                        wo,
+                        post_rms_weight,
+                        w_gate,
+                        w_up,
+                        w_down,
+                        group_next,
+                        window_done_layer,
+                        layer_idx,
+                        kv_tail,
+                        workspace_post_norm_mtile, workspace_resid1_mtile, workspace_x_gamma_tile,
+                        workspace_input_inv_rms_tile, workspace_q_proj_tile, workspace_k_proj_tile,
+                        workspace_v_proj_tile, workspace_attn_tile, workspace_out_proj_tile,
+                        workspace_all_q_padded_tile, workspace_cur_li_phase, workspace_oi_tmp_phase,
+                        workspace_mlp_out_acc_tile, workspace_gate_up_acc_b, workspace_mlp_silu_b,
+                        workspace_cur_mi_phase, workspace_qkpv_order, workspace_qkpv_wcur,
+                        workspace_partial_mi_phase, workspace_partial_li_phase, workspace_partial_oi_phase,
+                        workspace_tail,
+                        record_mlp_graph,
+                    )
+            if retire_window and num_layers_actual > 0:
+                window_fence_base = (num_layers_actual - 1) * BATCH_PAD
+                for fence_b in pl.range(batch):
+                    fence_chunk_len = pl.tensor.read(host_chunk_lens, [fence_b])
+                    if p0 < fence_chunk_len:
+                        window_fence_idx = window_fence_base + fence_b
+                        window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                        pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
+            for b in pl.parallel(0, batch, 1):
+                chunk_len_b = pl.tensor.read(host_chunk_lens, [b])
+                if chunk_len_b > 0:
+                    last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
+                    if p0_idx == last_group:
+                        valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
+                        local_last = b * MLP_M_TILE + valid_tok - 1
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="save_prefill_last_token_group",
+                        ):
+                            for kb in pl.range(HIDDEN_BLOCKS):
+                                k0 = kb * K_CHUNK
+                                final_base = (num_layers_actual % 2) * BATCH_PAD * MLP_M_TILE
+                                final_hidden_chunk = pl.slice(
+                                    group_hidden_pair,
+                                    [1, K_CHUNK],
+                                    [final_base + local_last, k0],
+                                )
+                                final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
+    return final_hidden
 
 
 @pl.jit(auto_scope=False)
@@ -1521,218 +1892,284 @@ def prefill_fwd(
 
     group_blocks = (max_chunk_len + MLP_M_TILE - 1) // MLP_M_TILE
     for p0_idx in pl.range(group_blocks):
-        # This runtime scope is the heap lifetime boundary for the window-local
-        # hidden buffers below; removing it keeps old windows live until function exit.
-        with pl.scope():
-            p0 = p0_idx * MLP_M_TILE
-            if batch == 1:
-                window_hidden_pair = pl.create_tensor([2 * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
-                window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
-                token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
-                chunk_len_b = pl.tensor.read(chunk_lens, [0])
-                valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
-
-                with pl.spmd(
-                    TOKEN_EMBED_SPMD_BLOCKS,
-                    name_hint="token_embed_single",
-                ):
-                    embed_core = pl.tile.get_block_idx()
-                    for work_id in pl.range(
-                        embed_core,
-                        MLP_M_TILE * TOKEN_EMBED_HIDDEN_BLOCKS,
-                        TOKEN_EMBED_SPMD_BLOCKS,
-                    ):
-                        ti = work_id // TOKEN_EMBED_HIDDEN_BLOCKS
-                        embed_hidden_block = work_id - ti * TOKEN_EMBED_HIDDEN_BLOCKS
-                        if ti < valid_tok:
-                            token_idx = token_base + p0 + ti
-                            token_id = pl.tensor.read(input_ids, [token_idx])
-                            token_row = pl.cast(token_id, target_type=pl.INDEX)
-                            k0 = embed_hidden_block * EMBED_HIDDEN_CHUNK
-                            hidden_chunk = pl.slice(
-                                embed_weight,
-                                [1, EMBED_HIDDEN_CHUNK],
-                                [token_row, k0],
-                            )
-                            window_hidden_pair = pl.assemble(
-                                window_hidden_pair,
-                                hidden_chunk,
-                                [ti, k0],
-                            )
-                for layer_idx in pl.range(num_layers_actual):
-                    read_base = (layer_idx % 2) * MLP_M_TILE
-                    write_base = ((layer_idx + 1) % 2) * MLP_M_TILE
-                    with pl.scope():
-                        window_hidden = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [read_base, 0])
-                        window_next = pl.slice(window_hidden_pair, [MLP_M_TILE, HIDDEN], [write_base, 0])
-                        window_done_layer = pl.slice(
-                            window_done,
-                            [BATCH_PAD, 8],
-                            [layer_idx * BATCH_PAD, 0],
-                        )
-                        window_next = prefill_layer(
-                            window_hidden,
-                            seq_lens,
-                            chunk_lens,
-                            chunk_offsets,
-                            pl.cast(p0, pl.INDEX),
-                            pl.cast(MLP_M_TILE, pl.INDEX),
-                            input_rms_weight,
-                            wq,
-                            wk,
-                            wv,
-                            q_norm_weight,
-                            k_norm_weight,
-                            rope_cos,
-                            rope_sin,
-                            block_table,
-                            slot_mapping,
-                            k_cache,
-                            v_cache,
-                            wo,
-                            post_rms_weight,
-                            w_gate,
-                            w_up,
-                            w_down,
-                            window_next,
-                            window_done_layer,
-                            layer_idx,
-                            kv_tail,
-                        )
-                if num_layers_actual > 0:
-                    window_fence_idx = (num_layers_actual - 1) * BATCH_PAD
-                    window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
-                    pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
-                if chunk_len_b > 0:
-                    last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
-                    if p0_idx == last_group:
-                        local_last = valid_tok - 1
-                        with pl.at(
-                            level=pl.Level.CORE_GROUP,
-                            name_hint="save_prefill_last_token_single",
-                        ):
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                final_base = (num_layers_actual % 2) * MLP_M_TILE
-                                final_hidden_chunk = pl.slice(
-                                    window_hidden_pair,
-                                    [1, K_CHUNK],
-                                    [final_base + local_last, k0],
-                                )
-                                final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [0, k0])
-            else:
-                group_hidden_pair = pl.create_tensor(
-                    [2 * BATCH_PAD * MLP_M_TILE, HIDDEN],
-                    dtype=pl.BF16,
-                )
-                window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
-
-                with pl.spmd(
-                    TOKEN_EMBED_SPMD_BLOCKS,
-                    name_hint="token_embed_group",
-                ):
-                    embed_core = pl.tile.get_block_idx()
-                    for work_id in pl.range(
-                        embed_core,
-                        BATCH_PAD * MLP_M_TILE * TOKEN_EMBED_HIDDEN_BLOCKS,
-                        TOKEN_EMBED_SPMD_BLOCKS,
-                    ):
-                        row_id = work_id // TOKEN_EMBED_HIDDEN_BLOCKS
-                        embed_hidden_block = work_id - row_id * TOKEN_EMBED_HIDDEN_BLOCKS
-                        embed_b = row_id // MLP_M_TILE
-                        local_ti = row_id - embed_b * MLP_M_TILE
-                        if embed_b < batch:
-                            token_base = pl.cast(pl.tensor.read(chunk_offsets, [embed_b]), pl.INDEX)
-                            chunk_len_b = pl.tensor.read(chunk_lens, [embed_b])
-                            valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
-                            if local_ti < valid_tok:
-                                token_idx = token_base + p0 + local_ti
-                                group_idx = embed_b * MLP_M_TILE + local_ti
-                                token_id = pl.tensor.read(input_ids, [token_idx])
-                                token_row = pl.cast(token_id, target_type=pl.INDEX)
-                                k0 = embed_hidden_block * EMBED_HIDDEN_CHUNK
-                                hidden_chunk = pl.slice(
-                                    embed_weight,
-                                    [1, EMBED_HIDDEN_CHUNK],
-                                    [token_row, k0],
-                                )
-                                group_hidden_pair = pl.assemble(
-                                    group_hidden_pair,
-                                    hidden_chunk,
-                                    [group_idx, k0],
-                                )
-                group_rows = BATCH_PAD * MLP_M_TILE
-                for layer_idx in pl.range(num_layers_actual):
-                    read_base = (layer_idx % 2) * group_rows
-                    write_base = ((layer_idx + 1) % 2) * group_rows
-                    with pl.scope():
-                        group_hidden = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [read_base, 0])
-                        group_next = pl.slice(group_hidden_pair, [BATCH_PAD * MLP_M_TILE, HIDDEN], [write_base, 0])
-                        window_done_layer = pl.slice(
-                            window_done,
-                            [BATCH_PAD, 8],
-                            [layer_idx * BATCH_PAD, 0],
-                        )
-                        group_next = prefill_layer(
-                            group_hidden,
-                            seq_lens,
-                            chunk_lens,
-                            chunk_offsets,
-                            pl.cast(p0, pl.INDEX),
-                            pl.cast(batch * MLP_M_TILE, pl.INDEX),
-                            input_rms_weight,
-                            wq,
-                            wk,
-                            wv,
-                            q_norm_weight,
-                            k_norm_weight,
-                            rope_cos,
-                            rope_sin,
-                            block_table,
-                            slot_mapping,
-                            k_cache,
-                            v_cache,
-                            wo,
-                            post_rms_weight,
-                            w_gate,
-                            w_up,
-                            w_down,
-                            group_next,
-                            window_done_layer,
-                            layer_idx,
-                            kv_tail,
-                        )
-                if num_layers_actual > 0:
-                    window_fence_base = (num_layers_actual - 1) * BATCH_PAD
-                    for fence_b in pl.range(batch):
-                        fence_chunk_len = pl.tensor.read(chunk_lens, [fence_b])
-                        if p0 < fence_chunk_len:
-                            window_fence_idx = window_fence_base + fence_b
-                            window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
-                            pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
-                for b in pl.parallel(0, batch, 1):
-                    chunk_len_b = pl.tensor.read(chunk_lens, [b])
-                    if chunk_len_b > 0:
-                        last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
-                        if p0_idx == last_group:
-                            valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
-                            local_last = b * MLP_M_TILE + valid_tok - 1
-                            with pl.at(
-                                level=pl.Level.CORE_GROUP,
-                                name_hint="save_prefill_last_token_group",
-                            ):
-                                for kb in pl.range(HIDDEN_BLOCKS):
-                                    k0 = kb * K_CHUNK
-                                    final_base = (num_layers_actual % 2) * BATCH_PAD * MLP_M_TILE
-                                    final_hidden_chunk = pl.slice(
-                                        group_hidden_pair,
-                                        [1, K_CHUNK],
-                                        [final_base + local_last, k0],
-                                    )
-                                    final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
+        final_hidden = _prefill_window_body(
+            input_ids, seq_lens, chunk_lens, chunk_offsets,
+            input_rms_weight, wq, wk, wv,
+            q_norm_weight, k_norm_weight, rope_cos, rope_sin,
+            block_table, slot_mapping, k_cache, v_cache,
+            wo, post_rms_weight, w_gate, w_up,
+            w_down, embed_weight, final_hidden, kv_tail, pl.cast(p0_idx, pl.INDEX),
+            chunk_lens, chunk_offsets, True,
+            False,
+        )
 
     out = rms_lm_head(final_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
+
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_window_fwd_body(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+    record_mlp_graph: pl.constexpr = False,
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
+    seq_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_offsets.bind_dynamic(0, BATCH_DYN)
+    out.bind_dynamic(0, BATCH_DYN)
+    block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
+    slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
+    k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+    v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+
+    batch = pl.tensor.dim(seq_lens, 0)
+    host_chunk_lens.bind_dynamic(0, BATCH_DYN)
+    host_chunk_offsets.bind_dynamic(0, BATCH_DYN)
+    p0_idx = pl.cast(pl.tensor.read(window_control, [0]), pl.INDEX)
+    is_last = pl.tensor.read(window_control, [1])
+    kv_tail = pl.array.create(NUM_LAYERS * BATCH_PAD, pl.TASK_ID)
+    final_hidden = _prefill_window_body(
+        input_ids, seq_lens, chunk_lens, chunk_offsets,
+        input_rms_weight, wq, wk, wv,
+        q_norm_weight, k_norm_weight, rope_cos, rope_sin,
+        block_table, slot_mapping, k_cache, v_cache,
+        wo, post_rms_weight, w_gate, w_up,
+        w_down, embed_weight, final_hidden, kv_tail, p0_idx,
+        host_chunk_lens, host_chunk_offsets, False,
+        record_mlp_graph,
+    )
+    if is_last != 0:
+        out = rms_lm_head(final_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
+    return out
+
+
+@pl.jit(auto_scope=False)
+def prefill_window_fwd(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    return _prefill_window_fwd_body(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+        window_control,
+        final_hidden,
+        True,
+    )
+
+
+@pl.jit(auto_scope=False)
+def prefill_window_eager_fwd(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    return _prefill_window_fwd_body(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+        window_control,
+        final_hidden,
+        False,
+    )
+
+
+@pl.jit(auto_scope=False)
+def prefill_window_graph_fwd(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    return _prefill_window_fwd_body(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+        window_control,
+        final_hidden,
+        True,
+    )
+
+
 
 
 def build_tensor_specs(
@@ -1933,13 +2370,8 @@ def build_tensor_specs(
     ]
 
 
-def golden_qwen3_14b_prefill(tensors):
-    """Reference implementation for full-layer prefill plus final logits.
-
-    Mirrors the kernel precision path through RMSNorm, Q/K/V projection, RoPE,
-    KV cache update, online-softmax attention, output projection, post RMSNorm,
-    SwiGLU MLP, final RMSNorm, and the LM head projection.
-    """
+def _golden_prefill_hidden(tensors):
+    """Return prefill hidden state and update the expected paged KV cache."""
     import math
 
     import torch
@@ -1965,8 +2397,6 @@ def golden_qwen3_14b_prefill(tensors):
     w_gate = tensors["w_gate"]
     w_up = tensors["w_up"]
     w_down = tensors["w_down"]
-    final_norm_weight = tensors["final_norm_weight"]
-    lm_head_weight = tensors["lm_head_weight"]
     embed_weight = tensors["embed_weight"]
 
     batch = seq_lens.shape[0]
@@ -1989,12 +2419,6 @@ def golden_qwen3_14b_prefill(tensors):
     k_cache_bsnd = k_cache.reshape(-1, kv_hidden)
     v_cache_bsnd = v_cache.reshape(-1, kv_hidden)
 
-    def tiled_lm_head(lhs, rhs_t, k_chunk, vocab_chunk):
-        out = torch.zeros(lhs.shape[0], rhs_t.shape[0], dtype=torch.float32)
-        for k0 in range(0, lhs.shape[1], k_chunk):
-            lhs_chunk = lhs[:, k0:k0 + k_chunk].float()
-            out += lhs_chunk @ rhs_t[:, k0:k0 + k_chunk].float().T
-        return out
 
     hidden = embed_weight.index_select(0, input_ids.long()).clone()
     for layer_idx in range(num_layers):
@@ -2186,13 +2610,238 @@ def golden_qwen3_14b_prefill(tensors):
         if chunk_len_b > 0:
             final_hidden[b, :] = hidden[token_base + chunk_len_b - 1, :]
 
+    tensors["k_cache"].copy_(k_cache)
+    tensors["v_cache"].copy_(v_cache)
+    return final_hidden
+
+
+def _golden_prefill_logits(final_hidden, final_norm_weight, lm_head_weight):
+    """Apply final RMSNorm and the tiled LM head."""
+    import torch
+
+    eps = EPS
+
+    def tiled_lm_head(lhs, rhs_t, k_chunk, vocab_chunk):
+        out = torch.zeros(lhs.shape[0], rhs_t.shape[0], dtype=torch.float32)
+        for k0 in range(0, lhs.shape[1], k_chunk):
+            lhs_chunk = lhs[:, k0:k0 + k_chunk].float()
+            out += lhs_chunk @ rhs_t[:, k0:k0 + k_chunk].float().T
+        return out
+
     variance = final_hidden.float().pow(2).mean(dim=-1, keepdim=True)
     final_normed = (
         final_hidden.float()
         * torch.rsqrt(variance + eps)
         * final_norm_weight.float()
     ).bfloat16()
-    tensors["out"][:] = tiled_lm_head(final_normed, lm_head_weight, LM_HEAD_K_CHUNK, VOCAB_CHUNK)
+    return tiled_lm_head(final_normed, lm_head_weight, LM_HEAD_K_CHUNK, VOCAB_CHUNK)
+
+
+def golden_qwen3_14b_prefill(tensors):
+    """Reference full-layer prefill with expected KV writeback and final logits."""
+    hidden = _golden_prefill_hidden(tensors)
+    tensors["out"][:] = _golden_prefill_logits(hidden, tensors["final_norm_weight"], tensors["lm_head_weight"])
+
+
+def golden_qwen3_14b_prefill_window(tensors):
+    """Reference one bounded window of a complete packed prefill request."""
+    import torch
+
+    chunk_lens = tensors["chunk_lens"]
+    chunk_offsets = tensors["chunk_offsets"]
+    if not torch.equal(chunk_lens, tensors["host_chunk_lens"]):
+        raise ValueError("Host and Device chunk lengths must match")
+    if not torch.equal(chunk_offsets, tensors["host_chunk_offsets"]):
+        raise ValueError("Host and Device chunk offsets must match")
+    window_idx, is_last = map(int, tensors["window_control"].tolist())
+    max_chunk = int(chunk_lens.max().item())
+    windows = (max_chunk + PREFILL_WINDOW_TOKENS - 1) // PREFILL_WINDOW_TOKENS
+    if window_idx < 0 or window_idx >= windows or is_last != int(window_idx == windows - 1):
+        raise ValueError("Window control does not describe this packed request")
+    p0 = window_idx * PREFILL_WINDOW_TOKENS
+    current = dict(tensors)
+    current["chunk_lens"] = torch.clamp(chunk_lens - p0, min=0, max=PREFILL_WINDOW_TOKENS)
+    current["chunk_offsets"] = chunk_offsets + torch.clamp(chunk_lens, max=p0)
+    processed = torch.clamp(chunk_lens, max=p0 + PREFILL_WINDOW_TOKENS)
+    current["seq_lens"] = tensors["seq_lens"] - chunk_lens + processed
+    hidden = _golden_prefill_hidden(current)
+    batch = chunk_lens.numel()
+    last_window = (chunk_lens + PREFILL_WINDOW_TOKENS - 1) // PREFILL_WINDOW_TOKENS - 1
+    for b in range(batch):
+        if int(chunk_lens[b].item()) > 0 and int(last_window[b].item()) == window_idx:
+            tensors["final_hidden"][b].copy_(hidden[b])
+    if is_last:
+        logits = _golden_prefill_logits(
+            tensors["final_hidden"][:batch], tensors["final_norm_weight"], tensors["lm_head_weight"],
+        )
+        tensors["out"].copy_(logits)
+
+
+
+
+
+def run_prefill_windows(specs, config, *, seed=17, repeat_requests=1, compile_only=False):
+    """Validate complete prompts through the native, resident L2 window entry.
+
+    This is a numerical test: readback after every completed window intentionally
+    serializes validation. It does not measure asynchronous throughput.
+    """
+    import json
+    from pathlib import Path
+
+    import torch
+    from golden import TensorSpec, validate_golden
+    from golden.runner import _validate_compiled_spec_abi
+    from pypto.pypto_core import passes
+    from pypto.runtime import ChipWorker
+
+    if repeat_requests < 1:
+        raise ValueError("repeat_requests must be positive")
+    if config.enable_chip_swimlane:
+        raise ValueError("window-state validation requires one physical dispatch; use L0")
+    torch.manual_seed(seed)
+    by_name = {spec.name: spec for spec in specs}
+    if len(by_name) != len(specs):
+        raise ValueError("duplicate prefill tensor specification")
+    batch = by_name["seq_lens"].shape[0]
+    if not 1 <= batch <= BATCH_PAD:
+        raise ValueError(f"window validator requires 1 <= batch <= {BATCH_PAD}")
+    chunk_lens = by_name["chunk_lens"].create_tensor()
+    chunk_offsets = by_name["chunk_offsets"].create_tensor()
+    max_chunk = int(chunk_lens.max().item())
+    windows = (max_chunk + PREFILL_WINDOW_TOKENS - 1) // PREFILL_WINDOW_TOKENS
+    if windows < 1:
+        raise ValueError("request must contain at least one active token")
+    absolute_length = int(by_name["seq_lens"].create_tensor().max().item())
+    if MAX_SEQ < absolute_length or by_name["rope_cos"].shape[0] < absolute_length:
+        raise ValueError("prefill/rope capacity is smaller than the complete prompt")
+    window_specs = [*specs,
+        TensorSpec("host_chunk_lens", [batch], torch.int32, init_value=chunk_lens),
+        TensorSpec("host_chunk_offsets", [batch], torch.int32, init_value=chunk_offsets),
+        TensorSpec("window_control", [2], torch.int32),
+        TensorSpec("final_hidden", [BATCH_PAD, HIDDEN], torch.bfloat16),
+    ]
+    # As in golden.run, compile samples carry shape/dtype only. No fixture
+    # weights or golden are materialized in the compile-only gate.
+    samples = [torch.empty(spec.shape, dtype=spec.dtype) for spec in window_specs]
+    with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+        compiled = prefill_window_fwd.compile(*samples, config=config)
+    del samples
+    metadata = compiled._get_metadata()
+    if not isinstance(metadata, tuple) or len(metadata) != 3:
+        raise ValueError("compiled window entry is missing native signature metadata")
+    _validate_compiled_spec_abi(compiled, window_specs)
+    for spec in window_specs:
+        if spec.name in {"k_cache", "v_cache", "out", "final_hidden"} and spec.direction != "inout":
+            raise ValueError(f"resident state {spec.name} must retain InOut direction")
+    root = Path(compiled.output_dir)
+    graph_files = [str(path) for path in root.rglob("*.cpp") if "rt_submit_graph(" in path.read_text()]
+    if not graph_files:
+        raise ValueError("compiled prefill window has no native Graph submission")
+    report = dict(seed=seed, batch=batch, layers=by_name["input_rms_weight"].shape[0],
+                  chunk_lens=chunk_lens.tolist(), windows=windows, capacity=MAX_SEQ,
+                  rope_capacity=by_name["rope_cos"].shape[0],
+                  absolute_length=absolute_length,
+                  pages_per_row=by_name["block_table"].shape[0] // batch,
+                  runtime="host_build_graph", entry="prefill_window_fwd",
+                  output_dir=str(root), graph_files=graph_files,
+                  rtol=5e-3, atol=5e-3, requests=[])
+    print("[window-prefill] " + json.dumps(report), flush=True)
+    if compile_only:
+        report["state"] = "compile-only passed; no device execution or numerical validation"
+        print("[window-prefill] " + report["state"], flush=True)
+        return report
+
+    torch.manual_seed(seed)
+    tensors = {spec.name: spec.create_tensor() for spec in window_specs}
+    tensors["out"].fill_(-13)
+    tensors["final_hidden"][batch:].fill_(-7)
+    host_names = {"seq_lens", "host_chunk_lens", "host_chunk_offsets", "window_control"}
+    for name in host_names:
+        tensors[name] = tensors[name].contiguous().share_memory_()
+    state_names = ("k_cache", "v_cache", "out", "final_hidden")
+    initial = {name: tensors[name].clone() for name in state_names}
+    initial_ids = tensors["input_ids"].clone()
+    layers = by_name["input_rms_weight"].shape[0]
+    rows_per_layer = tensors["k_cache"].shape[0] // layers
+    worker = ChipWorker(config=config, runtime="host_build_graph", auto_init=False)
+    handle = None
+    try:
+        worker.init()
+        resident = {name: worker.alloc_tensor(value.shape, value.dtype, init=value)
+                    for name, value in tensors.items() if name not in host_names}
+        handle = worker.register(compiled)
+        for request in range(repeat_requests):
+            # Distinct token ids expose stale input/state across repeated calls.
+            tensors["input_ids"].copy_((initial_ids + request) % VOCAB)
+            worker.copy_to(resident["input_ids"].data_ptr, tensors["input_ids"].data_ptr(),
+                           resident["input_ids"].nbytes)
+            for name in state_names:
+                tensors[name].copy_(initial[name])
+                worker.copy_to(resident[name].data_ptr, initial[name].data_ptr(), resident[name].nbytes)
+            expected = dict(tensors)
+            full_expected = dict(tensors)
+            for name in state_names:
+                expected[name] = initial[name].clone()
+                full_expected[name] = initial[name].clone()
+            expected["window_control"] = torch.zeros(2, dtype=torch.int32)
+            # Independent original whole-prompt reference; actual readbacks
+            # never become inputs to either reference state.
+            golden_qwen3_14b_prefill(full_expected)
+            readback = {name: torch.empty_like(initial[name]) for name in state_names}
+            previous_actual_hidden = initial["final_hidden"].clone()
+            for window in range(windows):
+                control = torch.tensor([window, int(window == windows - 1)], dtype=torch.int32)
+                tensors["window_control"].copy_(control)
+                expected["window_control"].copy_(control)
+                golden_qwen3_14b_prefill_window(expected)
+                args = [tensors[spec.name] if spec.name in host_names else resident[spec.name]
+                        for spec in window_specs]
+                # run() is the native completion boundary. Controls and resident
+                # allocations remain alive until it returns, including failures.
+                worker.run(compiled, *args, config=config)
+                for name in state_names:
+                    worker.copy_from(readback[name].data_ptr(), resident[name].data_ptr, resident[name].nbytes)
+                validate_golden(readback, {name: expected[name] for name in state_names}, rtol=5e-3, atol=5e-3)
+                # Exact canary check over every KV row outside this request's
+                # processed slots, independently of the approximate math check.
+                written = torch.zeros(tensors["k_cache"].shape[0], dtype=torch.bool)
+                for row in range(batch):
+                    count = min(int(chunk_lens[row]), (window + 1) * PREFILL_WINDOW_TOKENS)
+                    offset = int(chunk_offsets[row])
+                    slots = tensors["slot_mapping"][offset:offset + count].long()
+                    for layer in range(layers):
+                        indices = layer * rows_per_layer + slots[:, None] * NUM_KV_HEADS + torch.arange(NUM_KV_HEADS)
+                        written[indices.flatten()] = True
+                for name in ("k_cache", "v_cache"):
+                    if not torch.equal(readback[name][~written], initial[name][~written]):
+                        raise AssertionError(f"{name} modified rows outside completed prompt windows")
+                # A separate actual snapshot checks retention only; it is never
+                # used by either Torch reference or as a device input.
+                changed_hidden_rows = torch.zeros(BATCH_PAD, dtype=torch.bool)
+                for row in range(batch):
+                    last_window = (int(chunk_lens[row]) + PREFILL_WINDOW_TOKENS - 1) // PREFILL_WINDOW_TOKENS - 1
+                    changed_hidden_rows[row] = int(chunk_lens[row]) > 0 and last_window == window
+                if not torch.equal(readback["final_hidden"][~changed_hidden_rows],
+                                   previous_actual_hidden[~changed_hidden_rows]):
+                    raise AssertionError("final_hidden rows changed outside their completion window")
+                previous_actual_hidden.copy_(readback["final_hidden"])
+                if window < windows - 1 and not torch.equal(readback["out"], initial["out"]):
+                    raise AssertionError("non-final window changed output logits")
+                print(f"[window-prefill] request={request} window={window}/{windows} state PASS", flush=True)
+            validate_golden({name: readback[name] for name in ("out", "k_cache", "v_cache")},
+                            {name: full_expected[name] for name in ("out", "k_cache", "v_cache")},
+                            rtol=5e-3, atol=5e-3)
+            report["requests"].append(dict(request=request, state="passed", windows=windows))
+        report["state"] = "numerical validation passed"
+    finally:
+        try:
+            if handle is not None:
+                handle.unregister()
+        finally:
+            worker.close()
+    print("[window-prefill] " + json.dumps(report), flush=True)
+    return report
 
 
 if __name__ == "__main__":
@@ -2243,9 +2892,43 @@ if __name__ == "__main__":
                         help="persist inputs + golden for replay (off: large fixtures)")
     parser.add_argument("--no-golden", action="store_true", default=False,
                         help="skip host golden computation and output validation")
+    parser.add_argument("--windowed", action="store_true",
+                        help="validate the complete prompt through resident native HBG Graph windows")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="with --windowed, validate native codegen and ABI without running a device")
+    parser.add_argument("--runtime", choices=["hbg", "tmr"], default=None,
+                        help="--windowed requires hbg; legacy CLI retains its existing runtime")
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--repeat-requests", type=int, default=1)
+    parser.add_argument("--window-report", type=str, default=None)
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
+
+    if args.windowed:
+        import json
+        from pathlib import Path
+        from golden import normalize_config
+
+        if args.runtime not in (None, "hbg"):
+            parser.error("--windowed records Graph regions and requires --runtime hbg")
+        if args.no_golden:
+            parser.error("--windowed is a numerical validator and requires the original golden")
+        window_report = run_prefill_windows(
+            build_tensor_specs(batch=args.batch, max_seq=args.max_seq, num_layers=args.num_layers,
+                               use_max_seq=args.use_max_seq, chunk_start=args.chunk_start,
+                               chunk_size=args.chunk_size),
+            normalize_config(dict(backend_type=args.backend_type, execution_mode=False,
+                                  device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane,
+                                  enable_scope_stats=args.enable_scope_stats, enable_dep_gen=args.enable_dep_gen,
+                                  save_kernels=True)),
+            seed=args.seed, repeat_requests=args.repeat_requests, compile_only=args.compile_only,
+        )
+        if args.window_report:
+            Path(args.window_report).write_text(json.dumps(window_report, indent=2) + "\n")
+        raise SystemExit(0)
+    if args.compile_only or args.repeat_requests != 1 or args.window_report or args.runtime == "hbg":
+        parser.error("window compile/repeat/report and HBG selection require --windowed")
 
     result = run(
         fn=prefill_fwd,
@@ -2331,3 +3014,141 @@ def qwen3_prefill_host(  # noqa: PLR0913 — HOST entry over prefill_fwd for ser
         embed_weight,
         out,
     )
+
+
+# Legacy name retains the recorded-MLP Graph policy in this source epoch.
+@pl.jit.host
+def qwen3_prefill_window_host(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor:
+    return prefill_window_fwd(
+        input_ids, seq_lens, chunk_lens, chunk_offsets,
+        input_rms_weight, wq, wk, wv,
+        q_norm_weight, k_norm_weight, rope_cos, rope_sin,
+        block_table, slot_mapping, k_cache, v_cache,
+        wo, post_rms_weight, w_gate, w_up,
+        w_down, final_norm_weight, lm_head_weight, embed_weight,
+        out, host_chunk_lens, host_chunk_offsets, window_control,
+        final_hidden,
+    )
+
+
+@pl.jit.host
+def qwen3_prefill_window_eager_host(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor:
+    return prefill_window_eager_fwd(
+        input_ids, seq_lens, chunk_lens, chunk_offsets,
+        input_rms_weight, wq, wk, wv,
+        q_norm_weight, k_norm_weight, rope_cos, rope_sin,
+        block_table, slot_mapping, k_cache, v_cache,
+        wo, post_rms_weight, w_gate, w_up,
+        w_down, final_norm_weight, lm_head_weight, embed_weight,
+        out, host_chunk_lens, host_chunk_offsets, window_control,
+        final_hidden,
+    )
+
+
+@pl.jit.host
+def qwen3_prefill_window_graph_host(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.InOut[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    window_control: pl.Tensor[[2], pl.INT32],
+    final_hidden: pl.InOut[pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16]],
+) -> pl.Tensor:
+    return prefill_window_graph_fwd(
+        input_ids, seq_lens, chunk_lens, chunk_offsets,
+        input_rms_weight, wq, wk, wv,
+        q_norm_weight, k_norm_weight, rope_cos, rope_sin,
+        block_table, slot_mapping, k_cache, v_cache,
+        wo, post_rms_weight, w_gate, w_up,
+        w_down, final_norm_weight, lm_head_weight, embed_weight,
+        out, host_chunk_lens, host_chunk_offsets, window_control,
+        final_hidden,
+    )
+
+
+# Validation-only original TMR allocation scopes; migration remains explicit.
+import prefill_tmr_legacy as _prefill_tmr_legacy
+qwen3_prefill_legacy_host = _prefill_tmr_legacy.qwen3_prefill_host

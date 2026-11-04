@@ -218,8 +218,8 @@ assert GATE_UP_SPMD_N < MLP_ON
 def _run_paged_attention(  # noqa: PLR0913 -- paged-attention adapter ABI
     q_tnd_flat: pl.Tensor,
     attn_out: pl.Tensor,
-    key_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    value_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    key_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    value_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor,
     seq_lens: pl.Tensor,
     slot_mapping: pl.Tensor,
@@ -283,9 +283,9 @@ def _run_paged_attention(  # noqa: PLR0913 -- paged-attention adapter ABI
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@pl.jit.inline
-def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
-    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
+@pl.jit.inline(auto_scope=False)
+def _decode_layer_core(
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -297,8 +297,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     score_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.FP32],
     probability_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.BF16],
     pv_transfer: pl.Tensor[[PA_TRANSFER_ROWS, HEAD_DIM], pl.FP32],
@@ -309,64 +309,25 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     w_up: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
-    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
-    # normed_in: THIS layer's x*gamma (BF16), produced by the previous layer's fused
-    # dcr_xgamma (x_gamma_0 for layer 0). Consumed by QKV — replaces the local x_gamma.
+    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
     normed_in: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
-    # normed_out: NEXT layer's x*gamma, written by THIS layer's dcr_xgamma. Escapes via
-    # the inline alias (verified: inline out-param tensor writes are visible to caller).
     normed_out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
-    next_gamma_idx: pl.Scalar[pl.INT32],  # clamped min(layer_idx+1, N-1) for dcr_xgamma's gamma
-    # x_gamma0 / dcr_xgamma are SPMD producers, so each carry has exactly one
-    # task id.  Keep that id in a length-one Array across inline-loop boundaries:
-    # Array mutation is preserved by the inline lowering, unlike a re-bound Scalar.
+    next_gamma_idx: pl.Scalar[pl.INT32],
     prev_out_tid: pl.Array[1, pl.TASK_ID],
     prev_normed_tid: pl.Array[1, pl.TASK_ID],
-    # Public batch WINDOW this call serves. The row-indexed tensors above
-    # (hidden_states, normed_in/out, out) already hold the window's rows;
-    # seq_lens / slot_mapping / block_table are whole-batch; native PA receives
-    # runtime-shaped views of the rows starting at batch_offset.
     batch_offset: pl.Scalar[pl.INDEX],
     batch_count: pl.Scalar[pl.INT32],
+    layer_hidden_base: pl.Scalar[pl.INDEX],
+    layer_inter_base: pl.Scalar[pl.INDEX],
+    layer_cache_base_token_rows: pl.Scalar[pl.INDEX],
+    batch: pl.Scalar[pl.INT32],
+    window_seq_lens: pl.Tensor,
+    window_slot_mapping: pl.Tensor,
+    window_block_table: pl.Tensor,
+    q_norm_w: pl.Tensor,
+    k_norm_w: pl.Tensor,
 ) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
-    # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
-    # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
-    # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
-    layer_hidden_base = layer_idx * HIDDEN
-    layer_inter_base = layer_idx * INTERMEDIATE
-    # Paged KV: the public ABI is flat [head_rows, HEAD_DIM]. Native PyPTO packs
-    # all KV heads into one BSND token row through this zero-copy view.
-    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
-    cache_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
-    layer_cache_rows = cache_rows // num_layers_actual
-    layer_cache_base_token_rows = layer_idx * layer_cache_rows
-    batch = batch_count  # live rows in THIS window; pipeline rows above it are masked
-    batch_rows = pl.cast(batch_count, pl.INDEX)
-
-    # Native PyPTO PA derives its active batch and block-table row stride from
-    # the descriptors it receives. Give it a dynamic view of this public-batch
-    # window while preserving the absolute physical page / slot ids stored in
-    # the underlying tensors.
-    public_batch = pl.tensor.dim(seq_lens, 0)
-    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // public_batch
-    window_seq_lens = pl.slice(
-        seq_lens,
-        [batch_rows],
-        [batch_offset],
-    )
-    window_slot_mapping = pl.slice(
-        slot_mapping,
-        [batch_rows],
-        [batch_offset],
-    )
-    window_block_table = pl.slice(
-        block_table,
-        [batch_rows * max_blocks_per_seq],
-        [batch_offset * max_blocks_per_seq],
-    )
-    q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
-    k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
     # Scope 1
     # down_proj TaskIds — HOISTED to orchestration scope (declared before
@@ -979,6 +940,186 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
 
 @pl.jit.inline
+def _decode_layer(
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    score_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.FP32],
+    probability_transfer: pl.Tensor[[PA_TRANSFER_ROWS, PA_STACK_TOKENS], pl.BF16],
+    pv_transfer: pl.Tensor[[PA_TRANSFER_ROWS, HEAD_DIM], pl.FP32],
+    ffts_workspace: pl.Tensor[[PA_FFTS_WORKSPACE_ELEMENTS], pl.INT64],
+    scratch_ready: pl.Array[1, pl.TASK_ID],
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
+    normed_in: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    normed_out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
+    layer_idx: pl.Scalar[pl.INT32],
+    next_gamma_idx: pl.Scalar[pl.INT32],
+    prev_out_tid: pl.Array[1, pl.TASK_ID],
+    prev_normed_tid: pl.Array[1, pl.TASK_ID],
+    batch_offset: pl.Scalar[pl.INDEX],
+    batch_count: pl.Scalar[pl.INT32],
+    record_layer_graph: pl.constexpr = False,
+) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
+    # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
+    # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
+    # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
+    layer_hidden_base = layer_idx * HIDDEN
+    layer_inter_base = layer_idx * INTERMEDIATE
+    # Paged KV: the public ABI is flat [head_rows, HEAD_DIM]. Native PyPTO packs
+    # all KV heads into one BSND token row through this zero-copy view.
+    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
+    cache_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
+    layer_cache_rows = cache_rows // num_layers_actual
+    layer_cache_base_token_rows = layer_idx * layer_cache_rows
+    batch = batch_count  # live rows in THIS window; pipeline rows above it are masked
+    batch_rows = pl.cast(batch_count, pl.INDEX)
+
+    # Native PyPTO PA derives its active batch and block-table row stride from
+    # the descriptors it receives. Give it a dynamic view of this public-batch
+    # window while preserving the absolute physical page / slot ids stored in
+    # the underlying tensors.
+    public_batch = pl.tensor.dim(seq_lens, 0)
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // public_batch
+    window_seq_lens = pl.slice(
+        seq_lens,
+        [batch_rows],
+        [batch_offset],
+    )
+    window_slot_mapping = pl.slice(
+        slot_mapping,
+        [batch_rows],
+        [batch_offset],
+    )
+    window_block_table = pl.slice(
+        block_table,
+        [batch_rows * max_blocks_per_seq],
+        [batch_offset * max_blocks_per_seq],
+    )
+    q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+    k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+    if record_layer_graph:
+        with pl.graph(
+            "qwen_decode_layer",
+            deps=[prev_out_tid[0], prev_normed_tid[0], scratch_ready[0]],
+        ) as layer_done:
+            graph_out_ready = pl.array.create(1, pl.TASK_ID)
+            graph_out_ready[0] = pl.system.task_invalid()
+            graph_normed_ready = pl.array.create(1, pl.TASK_ID)
+            graph_normed_ready[0] = pl.system.task_invalid()
+            graph_scratch_ready = pl.array.create(1, pl.TASK_ID)
+            graph_scratch_ready[0] = pl.system.task_invalid()
+            out = _decode_layer_core(
+                hidden_states,
+                input_rms_weight,
+                wq,
+                wk,
+                wv,
+                q_norm_weight,
+                k_norm_weight,
+                seq_lens,
+                block_table,
+                slot_mapping,
+                rope_cos,
+                rope_sin,
+                k_cache,
+                v_cache,
+                score_transfer,
+                probability_transfer,
+                pv_transfer,
+                ffts_workspace,
+                graph_scratch_ready,
+                wo,
+                w_gate,
+                w_up,
+                w_down,
+                post_rms_weight,
+                out,
+                normed_in,
+                normed_out,
+                layer_idx,
+                next_gamma_idx,
+                graph_out_ready,
+                graph_normed_ready,
+                batch_offset,
+                batch_count,
+                layer_hidden_base,
+                layer_inter_base,
+                layer_cache_base_token_rows,
+                batch,
+                window_seq_lens,
+                window_slot_mapping,
+                window_block_table,
+                q_norm_w,
+                k_norm_w,
+            )
+        prev_out_tid[0] = layer_done
+        prev_normed_tid[0] = layer_done
+        scratch_ready[0] = layer_done
+    else:
+        out = _decode_layer_core(
+            hidden_states,
+            input_rms_weight,
+            wq,
+            wk,
+            wv,
+            q_norm_weight,
+            k_norm_weight,
+            seq_lens,
+            block_table,
+            slot_mapping,
+            rope_cos,
+            rope_sin,
+            k_cache,
+            v_cache,
+            score_transfer,
+            probability_transfer,
+            pv_transfer,
+            ffts_workspace,
+            scratch_ready,
+            wo,
+            w_gate,
+            w_up,
+            w_down,
+            post_rms_weight,
+            out,
+            normed_in,
+            normed_out,
+            layer_idx,
+            next_gamma_idx,
+            prev_out_tid,
+            prev_normed_tid,
+            batch_offset,
+            batch_count,
+            layer_hidden_base,
+            layer_inter_base,
+            layer_cache_base_token_rows,
+            batch,
+            window_seq_lens,
+            window_slot_mapping,
+            window_block_table,
+            q_norm_w,
+            k_norm_w,
+        )
+    return out
+
+
+@pl.jit.inline
 def _token_embed_inline(
     sampled_ids: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
@@ -1090,7 +1231,7 @@ _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count 
 
 
 @pl.jit.inline(auto_scope=False)
-def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
+def _decode_fwd_body(
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -1102,8 +1243,8 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1121,6 +1262,7 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
     pv_transfer: pl.Tensor[[PA_TRANSFER_ROWS, HEAD_DIM], pl.FP32],
     ffts_workspace: pl.Tensor[[PA_FFTS_WORKSPACE_ELEMENTS], pl.INT64],
     scratch_ready: pl.Array[1, pl.TASK_ID],
+    record_layer_graph: pl.constexpr = False,
 ):
     # Device-side fused decode: embed the previous sampled token id, loop the inline
     # body over all _FWD_NLAYERS layers, run the LM head, then sample the next token
@@ -1258,6 +1400,7 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
                 prev_normed_tid,
                 chunk_row0,
                 chunk_rows_i32,
+                record_layer_graph,
             )
             normed = next_normed
         out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, out, chunk_row0, chunk_rows)
@@ -1269,7 +1412,7 @@ def _decode_fwd_body(  # noqa: PLR0913 — PyPTO-state fused decode body
 
 
 @pl.jit
-def decode_fwd(  # noqa: PLR0913 -- public model ABI
+def decode_fwd(
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -1281,8 +1424,8 @@ def decode_fwd(  # noqa: PLR0913 -- public model ABI
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1335,6 +1478,151 @@ def decode_fwd(  # noqa: PLR0913 -- public model ABI
         pv_transfer,
         ffts_workspace,
         scratch_ready,
+        True,
+    )
+    return out, sampled_ids_out, next_hidden
+
+
+@pl.jit
+def decode_fwd_eager(
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    final_norm_weight: pl.Tensor,
+    lm_head_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    embed_weight: pl.Tensor,
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids_out: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+):
+    score_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.FP32)
+    probability_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.BF16)
+    pv_transfer = pl.create_tensor([PA_TRANSFER_ROWS, HEAD_DIM], dtype=pl.FP32)
+    ffts_workspace = pl.create_tensor([PA_FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64)
+    # TASK_ID arrays start invalid.  Leave the initial scratch carry invalid so
+    # the first PA has no artificial, unflagged dummy predecessor; every later
+    # carry is a real allow_early_resolve producer.
+    scratch_ready = pl.array.create(1, pl.TASK_ID)
+    out, sampled_ids_out, next_hidden = _decode_fwd_body(
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        final_norm_weight,
+        lm_head_weight,
+        out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids_out,
+        next_hidden,
+        score_transfer,
+        probability_transfer,
+        pv_transfer,
+        ffts_workspace,
+        scratch_ready,
+        False,
+    )
+    return out, sampled_ids_out, next_hidden
+
+
+@pl.jit
+def decode_fwd_graph(
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    final_norm_weight: pl.Tensor,
+    lm_head_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    embed_weight: pl.Tensor,
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids_out: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+):
+    score_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.FP32)
+    probability_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.BF16)
+    pv_transfer = pl.create_tensor([PA_TRANSFER_ROWS, HEAD_DIM], dtype=pl.FP32)
+    ffts_workspace = pl.create_tensor([PA_FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64)
+    # TASK_ID arrays start invalid.  Leave the initial scratch carry invalid so
+    # the first PA has no artificial, unflagged dummy predecessor; every later
+    # carry is a real allow_early_resolve producer.
+    scratch_ready = pl.array.create(1, pl.TASK_ID)
+    out, sampled_ids_out, next_hidden = _decode_fwd_body(
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        final_norm_weight,
+        lm_head_weight,
+        out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids_out,
+        next_hidden,
+        score_transfer,
+        probability_transfer,
+        pv_transfer,
+        ffts_workspace,
+        scratch_ready,
+        True,
     )
     return out, sampled_ids_out, next_hidden
 
@@ -1343,7 +1631,7 @@ _CHUNK_NLAYERS = 8  # layers per decode_fwd_layers dispatch (chunked fused decod
 
 
 @pl.jit.inline(auto_scope=False)
-def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
+def _decode_fwd_layers_body(
     hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
@@ -1356,8 +1644,8 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1369,6 +1657,7 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
     pv_transfer: pl.Tensor[[PA_TRANSFER_ROWS, HEAD_DIM], pl.FP32],
     ffts_workspace: pl.Tensor[[PA_FFTS_WORKSPACE_ELEMENTS], pl.INT64],
     scratch_ready: pl.Array[1, pl.TASK_ID],
+    record_layer_graph: pl.constexpr = False,
 ):
     # Fused B16 decode of _CHUNK_NLAYERS consecutive layers, output = hidden
     # (NO LM head). Dynamic public batching is provided by decode_fwd.
@@ -1461,6 +1750,7 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
             prev_normed_tid,
             0,
             batch_i32,
+            record_layer_graph,
         )
         normed = next_normed
     for ob0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
@@ -1476,7 +1766,7 @@ def _decode_fwd_layers_body(  # noqa: PLR0913 — PyPTO-state chunk body
 
 
 @pl.jit
-def decode_fwd_layers(  # noqa: PLR0913 -- public model ABI
+def decode_fwd_layers(
     hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
@@ -1489,8 +1779,8 @@ def decode_fwd_layers(  # noqa: PLR0913 -- public model ABI
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1531,6 +1821,127 @@ def decode_fwd_layers(  # noqa: PLR0913 -- public model ABI
         pv_transfer,
         ffts_workspace,
         scratch_ready,
+        True,
+    )
+
+
+@pl.jit
+def decode_fwd_layers_eager(
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    score_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.FP32)
+    probability_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.BF16)
+    pv_transfer = pl.create_tensor([PA_TRANSFER_ROWS, HEAD_DIM], dtype=pl.FP32)
+    ffts_workspace = pl.create_tensor([PA_FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64)
+    # The first PA does not reuse scratch; its invalid carry is omitted from the
+    # generated dependency list.  Subsequent carries come from flagged PA tasks.
+    scratch_ready = pl.array.create(1, pl.TASK_ID)
+    return _decode_fwd_layers_body(
+        hidden_states,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        out,
+        score_transfer,
+        probability_transfer,
+        pv_transfer,
+        ffts_workspace,
+        scratch_ready,
+        False,
+    )
+
+
+@pl.jit
+def decode_fwd_layers_graph(
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    score_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.FP32)
+    probability_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.BF16)
+    pv_transfer = pl.create_tensor([PA_TRANSFER_ROWS, HEAD_DIM], dtype=pl.FP32)
+    ffts_workspace = pl.create_tensor([PA_FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64)
+    # The first PA does not reuse scratch; its invalid carry is omitted from the
+    # generated dependency list.  Subsequent carries come from flagged PA tasks.
+    scratch_ready = pl.array.create(1, pl.TASK_ID)
+    return _decode_fwd_layers_body(
+        hidden_states,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        out,
+        score_transfer,
+        probability_transfer,
+        pv_transfer,
+        ffts_workspace,
+        scratch_ready,
+        True,
     )
 
 
@@ -1731,7 +2142,7 @@ def random_inputs(
 
 
 def golden_decode_layer(values: dict) -> None:
-    """Torch reference for ONE Qwen3 decode layer; fills ``values['out']`` in place.
+    """Torch reference for ONE Qwen3 decode layer; fills hidden output and InOut KV caches.
 
     Mirrors decode_fwd_layers (N==1) / _decode_layer at layer_idx 0: RMSNorm ->
     Q/K/V proj -> per-head QK-norm -> RoPE -> KV-cache write at pos=seq_len-1 -> GQA
@@ -1777,6 +2188,12 @@ def golden_decode_layer(values: dict) -> None:
         q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))  # [40,128] current Q (bf16)
         k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))  # [8,128] current K (bf16)
         v_cur = _bf16(v_heads[b])  # [8,128]
+        # KV is InOut: the golden harness validates the mutated cache as well as
+        # hidden output. Mirror the kernel's append at the physical slot, while
+        # retaining every untouched row from the original cache.
+        physical_slot = int(values["slot_mapping"][b].item())
+        k_cache[physical_slot] = k_cur.reshape(KV_HIDDEN)
+        v_cache[physical_slot] = v_cur.reshape(KV_HIDDEN)
         n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
         for kvh in range(NUM_KV_HEADS):
             # Each physical page is [BLOCK_SIZE, KV_HIDDEN] in BSND order.
@@ -1813,6 +2230,8 @@ def golden_decode_layer(values: dict) -> None:
     # FP32-carry residual: out = down + h1 in FP32 (no per-layer bf16(h1) rounding);
     # the single FP32->BF16 round is decode_fwd_layers' copy_out at the chunk tail.
     values["out"] = (down + h1).to(torch.bfloat16)
+    values["k_cache"] = k_cache.to(torch.bfloat16).view_as(values["k_cache"])
+    values["v_cache"] = v_cache.to(torch.bfloat16).view_as(values["v_cache"])
 
 
 def _build_specs(inputs: dict) -> list:
@@ -1912,6 +2331,10 @@ if __name__ == "__main__":
         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
         "-> logits) against a host chain reference, instead of the default "
         "single-layer golden test.",
+    )
+    parser.add_argument(
+        "--eager-reference-root", type=Path,
+        help="Use an unrecorded native decode implementation for the host-chain reference.",
     )
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
     parser.add_argument(
@@ -2237,6 +2660,21 @@ if __name__ == "__main__":
         # are windowed, and the block-table slice keeps its ABSOLUTE page ids so each
         # window addresses the same pages the fused run did.
         _CHUNK_NLAYERS = N
+        reference_layers = decode_fwd_layers
+        if args.eager_reference_root is not None:
+            import importlib.util
+
+            reference_path = args.eager_reference_root / "models/qwen3_14b/decode_fwd.py"
+            reference_spec = importlib.util.spec_from_file_location("qwen_eager_reference", reference_path)
+            if reference_spec is None or reference_spec.loader is None:
+                raise ImportError(f"Cannot load eager reference: {reference_path}")
+            reference_module = importlib.util.module_from_spec(reference_spec)
+            sys.modules[reference_spec.name] = reference_module
+            reference_spec.loader.exec_module(reference_module)
+            reference_module._CHUNK_NLAYERS = N
+            reference_module._FWD_NLAYERS = N
+            reference_layers = reference_module.decode_fwd_layers
+            print(f"[stacked-fwd reference] native eager implementation: {reference_path}")
         _BPS = DECODE_MAX_BLOCKS_PER_SEQ
 
         # `stacked` drops hidden_states, so a windowed input sits one slot before
@@ -2255,7 +2693,7 @@ if __name__ == "__main__":
             _win[_slot("block_table")] = bt[_w0 * _BPS : (_w0 + _n) * _BPS].contiguous()
             _win[_slot("slot_mapping")] = sm[_w0 : _w0 + _n].contiguous()
             _ref_w = torch.zeros(BATCH_PAD, HIDDEN, dtype=torch.bfloat16)
-            decode_fwd_layers(_hs_w, *_win, _ref_w, config=run_cfg)
+            reference_layers(_hs_w, *_win, _ref_w, config=run_cfg)
             ref_rows.append(_ref_w[:_n])
         ref_out = torch.cat(ref_rows, dim=0)
         hn = ref_out.float()
@@ -2272,7 +2710,12 @@ if __name__ == "__main__":
         amax_r = e.argmax(-1)
         sample_k = sampled_ids_out[:UB, 0].cpu()
         argmax_match = int((amax_k == amax_r).sum())
-        sample_match = int((sample_k == amax_k).sum())
+        # Match the sampler's token domain, as golden_greedy_sample already
+        # does: padded LM-head columns are storage, not vocabulary tokens.
+        valid_amax_k = a[:, :REAL_VOCAB].argmax(-1)
+        valid_amax_r = e[:, :REAL_VOCAB].argmax(-1)
+        valid_argmax_match = int((valid_amax_k == valid_amax_r).sum())
+        sample_match = int((sample_k == valid_amax_k).sum())
         close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
         _windows = (UB + BATCH_PAD - 1) // BATCH_PAD
         print(
@@ -2282,11 +2725,14 @@ if __name__ == "__main__":
             f"sample match {sample_match}/{UB} | "
             f"logits {int(close.sum()) / a.numel():.4%} within 5e-2 | "
             f"max_abs_err={(a - e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} "
-            f"sampled={sample_k.tolist()} ref_argmax={amax_r.tolist()}"
+            f"sampled={sample_k.tolist()} ref_argmax={amax_r.tolist()} "
+            f"valid_argmax match {valid_argmax_match}/{UB} | "
+            f"valid_kernel_argmax={valid_amax_k.tolist()} valid_ref_argmax={valid_amax_r.tolist()}"
         )
-        raise SystemExit(0 if argmax_match == UB and sample_match == UB else 1)
+        raise SystemExit(0 if argmax_match == UB and valid_argmax_match == UB and sample_match == UB else 1)
 
 
+# Legacy name retains the recorded-layer Graph policy in this source epoch.
 @pl.jit.host
 def qwen3_decode_host(  # noqa: PLR0913 — HOST entry over decode_fwd for serving signature-mode compile
     input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
@@ -2300,8 +2746,8 @@ def qwen3_decode_host(  # noqa: PLR0913 — HOST entry over decode_fwd for servi
     slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
     rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
     wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
     w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
     w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
@@ -2316,6 +2762,122 @@ def qwen3_decode_host(  # noqa: PLR0913 — HOST entry over decode_fwd for servi
     next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     logits, sampled_ids, next_hidden = decode_fwd(
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        final_norm_weight,
+        lm_head_weight,
+        out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids,
+        next_hidden,
+    )
+    return logits, sampled_ids, next_hidden
+
+
+@pl.jit.host
+def qwen3_decode_eager_host(
+    input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[NUM_LAYERS * INTERMEDIATE, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+    logits, sampled_ids, next_hidden = decode_fwd_eager(
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        final_norm_weight,
+        lm_head_weight,
+        out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids,
+        next_hidden,
+    )
+    return logits, sampled_ids, next_hidden
+
+
+@pl.jit.host
+def qwen3_decode_graph_host(
+    input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+    wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[NUM_LAYERS * INTERMEDIATE, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+    logits, sampled_ids, next_hidden = decode_fwd_graph(
         input_rms_weight,
         wq,
         wk,

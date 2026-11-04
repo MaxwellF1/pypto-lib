@@ -67,8 +67,8 @@ assert ROPE_ITEMS_PER_CORE == 4
 @pl.jit.inline(auto_scope=False)
 def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention API
     q_tnd_flat: pl.Tensor,
-    key_cache: pl.Tensor,
-    value_cache: pl.Tensor,
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
     block_table: pl.Tensor,
     seq_lens: pl.Tensor,
     inv_rms_states: pl.Tensor,
