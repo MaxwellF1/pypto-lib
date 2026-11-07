@@ -127,7 +127,7 @@ The delivery combination uses PyPTO `c518868152128723dda6c272fecc061fb85f191b` a
 
 On A5, C1A reuse passed all six original CI Golden comparisons in each mode. EP2 MoE passed all three in each mode. All four runs recorded AICore mode 1 and native completion. Graph emitted one submission site per case and recorded Graph definitions on each participating card. Eager had no Graph sites or definitions. The 5,032 guard entries matched before and after. See `a5hbg-lib-integration-v1/runs/public-combo-numeric-v1/receipt.json` under the evidence root.
 
-The 40-layer synthetic execution receipts above apply to the earlier frozen build. The final public combination has its own operator checks and Layer0 compile result.
+The published combination (PyPTO `c5188681`, Simpler `391b2fb`, Lib `aef9011`) also completed the original 40-layer `decode_fwd` synthetic fixture in eager and Graph on the same two A5 cards. Both ranks recorded AICore mode 1 and native completion in each run, and the CLI output checks passed. Graph generated nine submission sites and eager generated zero. The 128-expert fixture checks execution and output padding. It has no trained-weight whole-model Golden. See `core-a5hbg-integration-v1/full40-combo-c518868-v1/runs/graph/receipt.json` and the corresponding `runs/eager/receipt.json`.
 
 ## Performance evaluation
 
