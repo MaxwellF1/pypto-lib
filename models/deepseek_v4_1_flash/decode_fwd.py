@@ -654,7 +654,7 @@ def decode_decoder(
                     full_index_wq_b, full_index_wq_b_scale, full_index_weights_proj,
                     topk_indices, pool_block_ids, pool_block_counts,
                     attention_hidden, attention_pre_mix, attention_count,
-                 swa_post_mix, swa_residual_mix, hc_inv_rms, hc_partials, swa_x_norm, swa_qr, swa_q, swa_kv_projection, qkv_x_norm_payload, qkv_x_norm_scales, qb_workspace_payload, qb_workspace_scales, window_scale_scratch, c1a_projected, c1a_latent, c1a_projected_key, encoder_swa_attention_output, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_index_scores, c1a_weight_partials, score_runs, score_candidate_keys, score_candidate_indices, candidate_block_scores, candidate_arena, window_attended, window_blocks=window_blocks_per_layer, pool_capacity=physical_pool_capacity)
+                 swa_post_mix, swa_residual_mix, hc_inv_rms, hc_partials, swa_x_norm, swa_qr, swa_q, swa_kv_projection, qkv_x_norm_payload, qkv_x_norm_scales, qb_workspace_payload, qb_workspace_scales, window_scale_scratch, c1a_projected, c1a_latent, c1a_projected_key, encoder_swa_attention_output, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_index_scores, c1a_weight_partials, score_runs, score_candidate_keys, score_candidate_indices, candidate_block_scores, candidate_arena, window_attended, window_blocks=window_blocks_per_layer, pool_capacity=physical_pool_capacity, emit_scores=pl.cast(0, pl.INT32), precomputed_emit_scores=False)
             elif (layer - 20) % 4 == 0:
                 reindex_index_source_id = (layer - 24) // 4 + 4
                 reindex_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [layer_source_id * index_blocks_per_source, 0, 0, 0])
@@ -685,7 +685,7 @@ def decode_decoder(
                     reindex_index_wq_b, reindex_index_wq_b_scale, reindex_index_weights_proj,
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
-                 swa_post_mix, swa_residual_mix, swa_x_norm, swa_qr, swa_q, swa_kv_projection, qkv_x_norm_payload, qkv_x_norm_scales, qb_workspace_payload, qb_workspace_scales, window_scale_scratch, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_reindex_scores, c1a_weight_partials, encoder_swa_attention_output, window_attended, hc_inv_rms, hc_partials, reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, window_blocks=window_blocks_per_layer, pool_capacity=physical_pool_capacity)
+                 swa_post_mix, swa_residual_mix, swa_x_norm, swa_qr, swa_q, swa_kv_projection, qkv_x_norm_payload, qkv_x_norm_scales, qb_workspace_payload, qb_workspace_scales, window_scale_scratch, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_reindex_scores, c1a_weight_partials, encoder_swa_attention_output, window_attended, hc_inv_rms, hc_partials, reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, window_blocks=window_blocks_per_layer, pool_capacity=physical_pool_capacity, emit_scores=pl.cast(0, pl.INT32), precomputed_emit_scores=False)
             else:
                 decode_c1a_reuse(
                     x_hc, pre_mix,

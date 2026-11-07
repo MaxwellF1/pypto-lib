@@ -462,6 +462,8 @@ def score_select_reindex(
     pool_runs: pl.Tensor,
     pool_candidate_keys: pl.Tensor,
     pool_candidate_indices: pl.Tensor, pool_capacity: pl.Scalar[pl.INDEX],
+    emit_scores: pl.Scalar[pl.INT32],
+    precomputed_emit_scores: pl.constexpr,
 ):
     """Route identity candidate pools to paged MIX and sparse pools to gathered MIX."""
     # PureOut buffers have no Host initializer on device; publish cold padding.
@@ -530,7 +532,7 @@ def score_select_reindex(
         query, query_scale, weights, index_cache, index_cache_scale,
         block_table, request_ids, lengths, paged_scores, output,
         num_tokens, route_tid, query_ready, weights_ready, capacity, False, route, True,
-     score_runs, score_candidate_keys, score_candidate_indices)
+     score_runs, score_candidate_keys, score_candidate_indices, emit_scores=emit_scores, precomputed_emit_scores=precomputed_emit_scores)
     pooled = _score_select_pool(
         query, query_scale, weights, index_cache, index_cache_scale,
         block_table, request_ids, lengths, pool_block_ids, pool_block_counts, scores, output,
@@ -657,6 +659,16 @@ def _score_select_pool(
 
 
 @pl.jit.inline(auto_scope=False)
+def paged_score_output_flag(width: pl.Scalar[pl.INDEX], pool_capacity: pl.Scalar[pl.INDEX]):
+    """Return whether the paged score kernel must publish scores for pool selection."""
+    block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    emit_scores = pl.cast(0, pl.INT32)
+    if block_count > pl.min(pool_capacity, CANDIDATE_TOPK_BLOCKS):
+        emit_scores = pl.cast(1, pl.INT32)
+    return emit_scores
+
+
+@pl.jit.inline(auto_scope=False)
 def score_select_paged(
     query: pl.Tensor,
     query_scale: pl.Tensor,
@@ -679,6 +691,8 @@ def score_select_paged(
     runs: pl.Tensor,
     candidate_keys: pl.Tensor,
     candidate_indices: pl.Tensor,
+    emit_scores: pl.Scalar[pl.INT32],
+    precomputed_emit_scores: pl.constexpr,
 ):
     """Score history shards and merge their TopK within one MIX."""
     width = pl.tensor.dim(scores, 1)
@@ -689,11 +703,10 @@ def score_select_paged(
     shards = workers
     if panels > 100:
         shards = pl.max(workers, (capacity * panels + 99) // 100)
-    block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-    emit_scores = pl.cast(0, pl.INT32)
-    if not c2a:
-        if block_count > pl.min(pool_capacity, CANDIDATE_TOPK_BLOCKS):
-            emit_scores = pl.cast(1, pl.INT32)
+    if not precomputed_emit_scores:
+        emit_scores = pl.cast(0, pl.INT32)
+        if not c2a:
+            emit_scores = paged_score_output_flag(width, pool_capacity)
     run_stride = pl.tensor.dim(runs, 1)
     table_width = pl.tensor.dim(block_table, 1)
     active_tokens = pl.cast(num_tokens, pl.INT32)
@@ -890,7 +903,7 @@ def decode_c2a_indexer(
         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
         num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True,
         token_to_req_indices, False,
-     score_runs, c2a_candidate_keys, c2a_candidate_indices)
+     score_runs, c2a_candidate_keys, c2a_candidate_indices, emit_scores=pl.cast(0, pl.INT32), precomputed_emit_scores=False)
     return selected_tid
 
 

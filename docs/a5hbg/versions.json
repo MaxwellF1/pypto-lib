@@ -6,15 +6,15 @@
     "model_source_sha256": {
       "compressor.py": "ad6dbecc07605df9d14ae2c0314b48efa6943fb2365dfbc15835cddd86d0e376",
       "config.py": "a10e26ab43953cac842dac60ef8fbb03d568378548f63d332237990f4087f8dc",
-      "decode_c1a_full.py": "443263f40cf62baa716f0403cd71571f8094ab4a05d0b31b105df01f8d861fb4",
-      "decode_c1a_reindex.py": "06f5968e5dc2672ffc7459ed8cc5f7ccc7f5c0cca434a587c0df721e9c632359",
+      "decode_c1a_full.py": "39338f9c540bced644c9c072d59fdd6a2930ec1483dbdfcbdc07165fd7e1083c",
+      "decode_c1a_reindex.py": "8fd90902d14241abdd765d813f7d62da16b51ffe151e77b3a5646a83d572c3db",
       "decode_c1a_reuse.py": "cfaa57d6d85d5e71eaf9352f5ce8f82e9603b2a80f52498c178e00fa943721f7",
       "decode_c2a_full.py": "86779648643255f7e19d0ae6d0d7d7e40bd8e86e679ea57162c8eef90fb530c3",
       "decode_c2a_reuse.py": "a6d414d2ad6ec3f49828a5489df4023bd3b1fd5e31fc9b48cf46bc1d5895bc24",
-      "decode_fwd.py": "737cb14a9ea08349ef42e3a95b609b4c979387d83a7ab0964ace991c91500d93",
+      "decode_fwd.py": "7a4fd5056fe6300945c1bea2f5dc85876fd969e2be6e5d789785d4813de7deab",
       "decode_fwd_dspark.py": "915b30492f90677a4ff2b9e40ede2446e263992e021496c7856e77b29732baab",
-      "decode_indexer.py": "78f26062dd0c717afa13ed5a1e0be5a5c3d2331a3978bba26b98d8ba231a361e",
-      "decode_layer.py": "74af60e6c31aef5342d97ab894057d28efa3b218885cf6954ebb2b43736c8a82",
+      "decode_indexer.py": "fa40e488c8762c40da570a296163bf6809b94326432a0e8171666052d4ded95c",
+      "decode_layer.py": "2324b61682fb0436986d704baa74ced7527c12f9abfa373e94ec86bd035bf4af",
       "decode_moe.py": "62217316010f46979af8d31507f1502fd4642eae6ca00277954e231bfadad97e",
       "decode_swa.py": "b2d1fb7640b2c3d677a66911e51769d897b464b66575ade203056fa8d6dc8163",
       "dspark_attention.py": "a86179fb2b8cc41543e072baa4bab78e2f6c6298e4d6980c41f342c13b09f4b7",
@@ -272,6 +272,17 @@
           }
         }
       }
+    },
+    "c1a_replay_scalar_followup": {
+      "final_codegen_equivalence_relative_to_evidence_root": "a5hbg-reindex-fix-v1/cpu-v3-c1-codegen-equivalence.json",
+      "final_codegen_equivalence_sha256": "db91fd286f30b47b4f605a5e49017931ca2138bad37b72cbc68b44ec02aaab41",
+      "final_full40_layer0_compile_relative_to_evidence_root": "core-a5hbg-integration-v1/full40-caller-slot-compile-v2/full40-cpu-receipt.json",
+      "final_full40_layer0_compile_sha256": "f72e251517750129763e77faf93ef7baba99748c2dcc3eb1ad4588167dbff71c",
+      "final_matching_artifacts": 140,
+      "numeric_receipt_relative_to_evidence_root": "a5hbg-reindex-fix-v1/numeric-v2/paired-receipt.json",
+      "numeric_receipt_sha256": "1ee1576b89493132047050ca996c7e7f4977ead0f26af7179a0ea20aec68c1b7",
+      "numeric_task": "task_20261107_191113_338502919526",
+      "patch_sha256": "352ecaff44969ae97701335736c1c4c04534ce88a4661e858b4b6d4a5505d892"
     }
   },
   "validated_toolchain": {

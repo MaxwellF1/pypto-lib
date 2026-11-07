@@ -9,6 +9,7 @@
 """C1A reindex decode attention with mHC."""
 
 import pypto.language as pl
+from decode_indexer import paged_score_output_flag
 from decode_indexer import CANDIDATE_BLOCK_SIZE
 from decode_indexer import INDEX_WEIGHT_K_SPLIT_TILE as IDX_WEIGHT_SPLITS
 from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
@@ -119,6 +120,8 @@ def decode_c1a_reindex(
     pool_candidate_keys: pl.Tensor,
     pool_candidate_indices: pl.Tensor,
     window_blocks: pl.Scalar[pl.INDEX], pool_capacity: pl.Scalar[pl.INDEX],
+    emit_scores: pl.Scalar[pl.INT32],
+    precomputed_emit_scores: pl.constexpr,
 ):
     x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
     qkv_x_norm_rows = ((pl.tensor.dim(x_norm, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
@@ -148,7 +151,7 @@ def decode_c1a_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
         scores, topk_indices, num_tokens, x_ready, query_tid, weights_tid, x_ready,
-     reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, pool_capacity=pool_capacity)
+     reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, pool_capacity=pool_capacity, emit_scores=emit_scores, precomputed_emit_scores=precomputed_emit_scores)
     _attend_project(
         query, window_indices, window_cache, window_cache_scale, topk_indices,
         compressed_cache, compressed_cache_scale, attn_sink,
@@ -260,6 +263,8 @@ def l2_decode_c1a_reindex(
     pool_runs = pl.create_tensor([4, DECODE_GRAPH_CAPACITY + 1], dtype=pl.INT32)
     pool_candidate_keys = pl.create_tensor([DECODE_GRAPH_CAPACITY, pool_workers * INDEX_TOPK], dtype=pl.UINT16)
     pool_candidate_indices = pl.create_tensor([DECODE_GRAPH_CAPACITY, pool_workers * INDEX_TOPK], dtype=pl.INT32)
+    # Bind the descriptor-derived flag as a Graph argument for each dispatch.
+    emit_scores = paged_score_output_flag(pl.tensor.dim(reindex_paged_scores, 1), pl.tensor.dim(pool_block_ids, 1))
     with pl.graph("c1a_reindex"):
         result = decode_c1a_reindex(
             x_hc, pre_mix,
@@ -280,7 +285,7 @@ def l2_decode_c1a_reindex(
             topk_indices,
             output, next_pre_mix,
             num_tokens,
-         reindex_post_mix, reindex_residual_mix, reindex_x_norm, reindex_qr, reindex_query, reindex_kv_projection, reindex_qkv_x_norm_payload, reindex_qkv_x_norm_scales, reindex_qb_workspace_payload, reindex_qb_workspace_scales, reindex_window_scale_scratch, reindex_c1a_index_query, reindex_c1a_index_query_scale, reindex_c1a_index_weights, reindex_c1a_index_scores, reindex_c1a_weight_partials, reindex_attn_out, reindex_project_attended, reindex_hc_inv_rms, reindex_hc_partials, reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=pl.tensor.dim(pool_block_ids, 1))
+         reindex_post_mix, reindex_residual_mix, reindex_x_norm, reindex_qr, reindex_query, reindex_kv_projection, reindex_qkv_x_norm_payload, reindex_qkv_x_norm_scales, reindex_qb_workspace_payload, reindex_qb_workspace_scales, reindex_window_scale_scratch, reindex_c1a_index_query, reindex_c1a_index_query_scale, reindex_c1a_index_weights, reindex_c1a_index_scores, reindex_c1a_weight_partials, reindex_attn_out, reindex_project_attended, reindex_hc_inv_rms, reindex_hc_partials, reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=pl.tensor.dim(pool_block_ids, 1), emit_scores=emit_scores, precomputed_emit_scores=True)
     return result
 
 

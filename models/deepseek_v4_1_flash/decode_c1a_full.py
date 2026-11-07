@@ -10,6 +10,7 @@
 
 
 import pypto.language as pl
+from decode_indexer import paged_score_output_flag
 from decode_indexer import CANDIDATE_BLOCK_SIZE, CANDIDATE_LEAF_TILE, CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH
 from decode_indexer import INDEX_WEIGHT_K_SPLIT_TILE as IDX_WEIGHT_SPLITS
 from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
@@ -128,6 +129,8 @@ def decode_c1a_full(
     project_attended: pl.Tensor,
     window_blocks: pl.Scalar[pl.INDEX],
     pool_capacity: pl.Scalar[pl.INDEX],
+    emit_scores: pl.Scalar[pl.INT32],
+    precomputed_emit_scores: pl.constexpr,
 ):
     hc_workspace_rows = ((pl.tensor.dim(x_hc, 0) + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True, inv_rms=hc_inv_rms, mixes_partials=hc_partials)
@@ -180,7 +183,7 @@ def decode_c1a_full(
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
         pool_capacity, False, request_ids, False,
-     score_runs, score_candidate_keys, score_candidate_indices)
+     score_runs, score_candidate_keys, score_candidate_indices, emit_scores=emit_scores, precomputed_emit_scores=precomputed_emit_scores)
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
      candidate_block_scores, candidate_arena, pool_capacity=pool_capacity)
@@ -294,6 +297,8 @@ def l2_decode_c1a_full(
     candidate_block_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, candidate_padded_blocks], dtype=pl.FP32)
     candidate_arena = pl.create_tensor([DECODE_GRAPH_CAPACITY * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
     project_attended = pl.create_tensor([pl.tensor.dim(x_hc, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    # Bind the descriptor-derived flag as a Graph argument for each dispatch.
+    emit_scores = paged_score_output_flag(pl.tensor.dim(c1a_index_scores, 1), pl.tensor.dim(pool_block_ids, 1))
     with pl.graph("c1a_full"):
         result = decode_c1a_full(
             x_hc, pre_mix,
@@ -316,7 +321,7 @@ def l2_decode_c1a_full(
             topk_indices, pool_block_ids, pool_block_counts,
             output, next_pre_mix,
             num_tokens,
-         c1a_full_post_mix, c1a_full_residual_mix, c1a_full_hc_inv_rms, c1a_full_hc_partials, c1a_full_x_norm, c1a_full_qr, c1a_full_query, c1a_full_kv_projection, c1a_full_qkv_x_norm_payload, c1a_full_qkv_x_norm_scales, c1a_full_qb_workspace_payload, c1a_full_qb_workspace_scales, c1a_full_window_scale_scratch, c1a_full_projected, c1a_full_latent, c1a_full_projected_key, c1a_full_attn_out, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_index_scores, c1a_weight_partials, score_runs, score_candidate_keys, score_candidate_indices, candidate_block_scores, candidate_arena, project_attended, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=pl.tensor.dim(pool_block_ids, 1))
+         c1a_full_post_mix, c1a_full_residual_mix, c1a_full_hc_inv_rms, c1a_full_hc_partials, c1a_full_x_norm, c1a_full_qr, c1a_full_query, c1a_full_kv_projection, c1a_full_qkv_x_norm_payload, c1a_full_qkv_x_norm_scales, c1a_full_qb_workspace_payload, c1a_full_qb_workspace_scales, c1a_full_window_scale_scratch, c1a_full_projected, c1a_full_latent, c1a_full_projected_key, c1a_full_attn_out, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_index_scores, c1a_weight_partials, score_runs, score_candidate_keys, score_candidate_indices, candidate_block_scores, candidate_arena, project_attended, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=pl.tensor.dim(pool_block_ids, 1), emit_scores=emit_scores, precomputed_emit_scores=True)
     return result
 
 
