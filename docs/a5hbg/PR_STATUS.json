@@ -3,6 +3,18 @@
   "pull_requests": [
     {
       "baseRefName": "main",
+      "headRefName": "fix/a5-graph-boundary",
+      "headRefOid": "53a4bac788ff8e2d37d1b4ebce860e6c188ef01c",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3326,
+      "state": "OPEN",
+      "title": "Fix: compile replay-safe Graph metadata",
+      "updatedAt": "2026-11-07T11:09:52Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3326"
+    },
+    {
+      "baseRefName": "main",
       "headRefName": "codex/deferred-completion-v2",
       "headRefOid": "f0b40e9571ce15fec9c39cc0316827d0ce813edd",
       "mergeCommit": null,

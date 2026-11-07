@@ -57,6 +57,7 @@ Required means the equivalent capability is needed by the indicated path. The pi
 
 | PR and snapshot state | Functional purpose | Resulting behavior | Current role |
 | --- | --- | --- | --- |
+| [#3326](https://github.com/hw-native-sys/pypto/pull/3326) — OPEN at `53a4bac7` | Replay-safe Graph metadata and output liveness | Preserve physical extents, caller-owned `InOut` outputs, and allocation ordering. | Required equivalent fix for compiling the shared A5 Graph decode source. Local verification: 68 focused and 24482 full unit tests passed (95 skipped, 3 expected failures). |
 | [#3323](https://github.com/hw-native-sys/pypto/pull/3323) — OPEN at `e29ae8bb` | Graph cache read/write dependencies | Propagate backing-storage reads and writes through views, calls and loop carries. | Required equivalent fix for Graph cache correctness; reuse existing PR. |
 | [#3322](https://github.com/hw-native-sys/pypto/pull/3322) — OPEN at `ffe7c0c2` | Distributed Graph communication | Preserve CommCtx boundary representation and its replay-linked scalar origin. | Required equivalent fix for multi-card Graph MoE; reuse existing PR. |
 | [#3321](https://github.com/hw-native-sys/pypto/pull/3321) — OPEN at `6ce74c84` | JIT Submit and Graph identities | Specialize submitted callees and retain tensor metadata, constexpr and unique Graph symbols. | For these JIT Submit/SPMD Submit forms; the currently qualified decode source bundle did not include this PR. |
@@ -71,7 +72,7 @@ Required means the equivalent capability is needed by the indicated path. The pi
 
 The new compiler PR is prepared separately for review of fixed Graph metadata, terminal Graph output liveness and nested `tensor.dim` code generation with allocation ordering. Publication requires its own successful build and regression checks.
 
-The standalone compiler commit `44b61bf52d5a2cb6b4809cc6a8d8c9b8f5757ca6` is included in the delivery combination. It passed 68 focused tests. Its upstream PR has a separate publication check.
+The public PyPTO combination includes the same production changes from `44b61bf`. The standalone PR uses revised typing in four regression fixtures.
 
 ### Follow-up on existing PyPTO PRs
 
@@ -128,6 +129,8 @@ The delivery combination uses PyPTO `c518868152128723dda6c272fecc061fb85f191b` a
 On A5, C1A reuse passed all six original CI Golden comparisons in each mode. EP2 MoE passed all three in each mode. All four runs recorded AICore mode 1 and native completion. Graph emitted one submission site per case and recorded Graph definitions on each participating card. Eager had no Graph sites or definitions. The 5,032 guard entries matched before and after. See `a5hbg-lib-integration-v1/runs/public-combo-numeric-v1/receipt.json` under the evidence root.
 
 The published combination (PyPTO `c5188681`, Simpler `391b2fb`, Lib `aef9011`) also completed the original 40-layer `decode_fwd` synthetic fixture in eager and Graph on the same two A5 cards. Both ranks recorded AICore mode 1 and native completion in each run, and the CLI output checks passed. Graph generated nine submission sites and eager generated zero. The 128-expert fixture checks execution and output padding. It has no trained-weight whole-model Golden. See `core-a5hbg-integration-v1/full40-combo-c518868-v1/runs/graph/receipt.json` and the corresponding `runs/eager/receipt.json`.
+
+The same published model source passed the original 8K Golden for C1A reindex and C1A full in eager, and for SWA, C2A full, and C2A reuse in both modes. The eight passes recorded AICore mode 1 and native completion. The two standalone C1A Graph entries failed during compilation because `emit_scores` had no replay argument slot. See `core-a5hbg-integration-v1/decode-attention-combo-v1/paired-receipt.json`.
 
 ## Performance evaluation
 
