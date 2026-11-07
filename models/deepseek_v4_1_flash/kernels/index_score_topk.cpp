@@ -42,6 +42,16 @@ __aicore__ inline int read(__gm__ int32_t* ptr) {
 
 __aicore__ inline int minimum(int a, int b) { return a < b ? a : b; }
 
+__aicore__ inline int active_shards(__gm__ int64_t* args, int groups, int panels, int workers) {
+    if (args[20]) return int(args[22]);
+    int count = workers;
+    if (panels > 100) {
+        int needed = (groups * panels + 99) / 100;
+        if (needed > count) count = needed;
+    }
+    return minimum(int(args[22]), count);
+}
+
 #if defined(__DAV_VEC__)
 __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
     if (get_subblockid() == 0) {
@@ -367,7 +377,7 @@ namespace {
             }
         }
         __aicore__ inline void local_topk(__gm__ int64_t* args, int begin, int count, int logical, int width, int shard) {
-            int shards = args[21];
+            int shards = args[22];
             for (int row = 0;row<3;++row) {
                 int group_offset = get_subblockid()*3+row;
                 if (group_offset >= count)continue;
@@ -436,7 +446,7 @@ namespace {
         }
         __aicore__ inline void store_scores(__gm__ int64_t* args, int begin, int count,
                                             int logical, int cached_width) {
-            int width = args[15];
+            int width = args[16];
             Vec<bfloat16_t, 1, 256> rounded;
             Vec<float, 1, 256> values;
             TASSIGN(rounded, 0);
@@ -479,7 +489,7 @@ namespace {
 
         __aicore__ inline void write_short_topk(__gm__ int64_t* args, int token,
                                                int length, CandidateIndices& indices) {
-            int table_width = args[17];
+            int table_width = args[18];
             int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
             int request = read(data<int32_t>(args, 6) + token);
             for (int block = 0; block < 4; ++block) {
@@ -502,16 +512,16 @@ namespace {
         }
 
         __aicore__ inline void merge(__gm__ int64_t* args) {
-            int width = args[15], stride = args[16], table_width = args[17], tokens = args[18];
+            int width = args[16], stride = args[17], table_width = args[18], tokens = args[19];
             int workers = get_block_num(args), worker = get_block_idx(args) * 2 + get_subblockid();
-            int gathered_rows = args[19], shards = args[21];
+            int gathered_rows = args[20], shards = args[22];
             int panels = (width + 255) / 256, total = read(data<int32_t>(args, 9) + 3 * stride) * panels;
             CandidateKeys selected_keys;
             CandidateIndices selected_indices;
             TASSIGN(selected_keys, 131584);
             TASSIGN(selected_indices, 132608);
             for (int token = worker; token < tokens; token += workers * 2) {
-                if (args[22]) {
+                if (args[23]) {
                     int length = read(data<int32_t>(args, 7) + token);
                     if (length <= 512) {
                         write_short_topk(args, token, length, selected_indices);
@@ -528,7 +538,7 @@ namespace {
                     continue;
                 }
                 int group = read(data<int32_t>(args, 9) + 3 * stride + token + 1);
-                int owners = minimum(shards, total);
+                int owners = minimum(active_shards(args, total / panels, panels, workers), total);
                 int first = ((group * panels + 1) * owners - 1) / total;
                 int last = (((group + 1) * panels) * owners - 1) / total;
                 int carry = 0;
@@ -594,13 +604,13 @@ namespace {
 #endif
         __aicore__ inline void run(__gm__ int64_t* args) {
             QueryPipe query_pipe(nullptr, 0, 0);
-            int width = args[15], stride = args[16], table_width = args[17];
-            int gathered_rows = args[19];
+            int width = args[16], stride = args[17], table_width = args[18];
+            int gathered_rows = args[20];
             int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
             int groups = read(data<int32_t>(args, 9) + 3 * stride);
             int panels = (width + 255) / 256;
             int block = get_block_idx(args), workers = get_block_num(args);
-            int owners = minimum(int(args[21]), groups * panels);
+            int owners = minimum(active_shards(args, groups, panels, workers), groups * panels);
             int transferred = 0;
             for (int shard = block; shard < owners; shard += workers) {
                 int first = groups * panels * shard / owners;
@@ -754,7 +764,7 @@ namespace {
 #else
                     int cached_width = minimum(panel_count * 256, width - first_panel * 256);
                     local_topk(args, begin, count, first_panel * 256, cached_width, shard);
-                    if (args[20]) store_scores(args, begin, count, first_panel * 256, cached_width);
+                    if (args[21]) store_scores(args, begin, count, first_panel * 256, cached_width);
                     set_intra_block(PIPE_MTE3, 6);
 #endif
                     cursor = finish;
@@ -772,6 +782,12 @@ namespace {
 }
 // namespace
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    // mode 0 is unconditional, mode 1 selects dense, mode 2 selects sparse.
+    const int route_mode = int(args[24]);
+    if (route_mode != 0) {
+        const int route = read(data<int32_t>(args, 15));
+        if ((route_mode == 1 && route == 0) || (route_mode == 2 && route != 0)) return;
+    }
     set_atomic_none();
 #if defined(__DAV_VEC__)
     set_mask_norm();

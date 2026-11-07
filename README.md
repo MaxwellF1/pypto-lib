@@ -41,6 +41,8 @@ script-specific platform and device arguments; inspect `--help` and the
 [compile and runtime workflow](docs/run-and-validate/compile-runtime-workflow.md) for the full
 flow (compile → input generation → golden → runtime → validation).
 
+For the A5 HBG eager and Graph profiles, see the [V4.1 run guide](docs/a5hbg/README.md).
+
 ## Writing a kernel
 
 Read [docs/pypto-coding/](docs/pypto-coding/index.md) — the coding style split

@@ -11,6 +11,7 @@
 
 import math
 import pypto.language as pl
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
 import pypto.language.distributed as pld
 import torch
 from utils import token_shards
@@ -97,13 +98,17 @@ def prefill_swa_attention(
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    kv_input_payload, kv_input_scales = quantize_projection_input(x, num_tokens)
+    qkv_x_rows = ((pl.tensor.dim(x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qkv_x_payload = pl.create_tensor([qkv_x_rows, D], dtype=pl.FP8E4M3FN)
+    qkv_x_scales = pl.create_tensor([1, qkv_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+    kv_input_payload, kv_input_scales = quantize_projection_input(x, num_tokens, qkv_x_payload, qkv_x_scales)
     kv_projection = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
     chunk_done = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
         num_tokens, cache_ready,
-    )
+     window_scale_scratch)
     chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
     chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -124,20 +129,27 @@ def prefill_swa_attention(
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
-        q_proj_rope(
+        qkv_chunk_x_rows = ((pl.tensor.dim(chunk_x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qkv_chunk_x_payload = pl.create_tensor([qkv_chunk_x_rows, D], dtype=pl.FP8E4M3FN)
+        qkv_chunk_x_scales = pl.create_tensor([1, qkv_chunk_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+        q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active, qkv_chunk_x_payload, qkv_chunk_x_scales)
+        qb_rows = pl.tensor.dim(q_input_payload, 0)
+        qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        q_proj_result = q_proj_rope(
             q_input_payload, q_input_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
             qr, q,
             active,
-        )
+         qb_workspace_payload, qb_workspace_scales)
+        window_attended = pl.create_tensor([pl.tensor.dim(chunk_partial, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         _attend_window_project(
             q, chunk_indices, window_cache, window_cache_scale, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial,
             active, stage_tid,
-        )
+         window_attended, physical_capacity=0)
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):

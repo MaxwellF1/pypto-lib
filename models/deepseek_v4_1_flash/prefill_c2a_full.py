@@ -21,9 +21,11 @@ with it.
 """
 
 import argparse
+import functools
 import math
 import os
 import pypto.language as pl
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
 import pypto.language.distributed as pld
 import torch
 
@@ -139,31 +141,42 @@ def prefill_c2a_full_attention(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    qkv_x_rows = ((pl.tensor.dim(x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qkv_x_payload = pl.create_tensor([qkv_x_rows, D], dtype=pl.FP8E4M3FN)
+    qkv_x_scales = pl.create_tensor([1, qkv_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+    proj_payload, proj_scales = quantize_projection_input(x, num_tokens, qkv_x_payload, qkv_x_scales)
+    qb_rows = pl.tensor.dim(proj_payload, 0)
+    qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
         num_tokens,
-    )
+     qb_workspace_payload, qb_workspace_scales)
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
     window_publish_tid = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
         num_tokens, cache_ready,
-    )
+     window_scale_scratch)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    map_groups = (tokens + 3) // 4 + pl.tensor.dim(state_block_table, 0)
+    mapped_starts = pl.create_tensor([map_groups + 1], dtype=pl.INT32)
+    mapped_requests = pl.create_tensor([tokens], dtype=pl.INT32)
+    mapped_blocks = pl.create_tensor([map_groups, 1], dtype=pl.INT32)
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
         compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
-    )
+     mapped_starts, mapped_requests, mapped_blocks)
 
     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
     index_publish_tid = publish_c2a_index_key(
@@ -178,12 +191,13 @@ def prefill_c2a_full_attention(
     )
 
     source_ready = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
+    project_attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     _attend_project(
         query, window_indices, window_cache, window_cache_scale,
         topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
         num_tokens, source_ready, compressed_keys=INDEX_TOPK,
-    )
+     attended=project_attended, physical_capacity=0)
     return partial
 
 
@@ -929,25 +943,30 @@ class StagedAttentionReference:
         return staged
 
 
-def make_compare(mode, world_size, tokens):
-    """Compare the final outputs and published state with the default comparators."""
+def make_compare(mode, world_size, tokens, initial_state, *, reference=golden_reference_c2a):
+    """Check window publication on the device input and other outputs end to end."""
+    attention = StagedAttentionReference(
+        mode, initial_state,
+        attention_reference=functools.partial(reference_attention, reference=reference),
+        state_names=("window_cache", "window_cache_scale"),
+    )
     compare = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "attn_output": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "x_hc_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-        "window_cache": mapped_pool_ratio_allclose(
+        "window_cache": attention.compare("window_cache", mapped_pool_ratio_allclose(
             "window_slots", pool_name="window_cache",
             mapping_shape=(world_size, tokens),
             block_size=BLOCK_SIZE, leading_rank_axis=True,
             atol=0.0, rtol=0.0, max_error_ratio=0.01,
-        ),
-        "window_cache_scale": mapped_pool_ratio_allclose(
+        )),
+        "window_cache_scale": attention.compare("window_cache_scale", mapped_pool_ratio_allclose(
             "window_slots", pool_name="window_cache_scale",
             mapping_shape=(world_size, tokens),
             block_size=BLOCK_SIZE, leading_rank_axis=True,
             atol=0.0, rtol=0.0, max_error_ratio=0.0,
-        ),
+        )),
     }
     if mode == "full":
         compare["topk_indices"] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02)
@@ -1283,7 +1302,7 @@ def build_specs(args, mode, initial_state, *, make_inputs=None):
         TensorSpec("attn_output", [world_size, local, D], torch.bfloat16, resident="stacked"),
         TensorSpec("next_pre_mix", [world_size, local, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("x_hc_out", [world_size, local, HC_MULT, D], torch.float32, resident="stacked"),
-        TensorSpec("num_tokens", [world_size, 1], torch.int32, resident="stacked",
+        TensorSpec("num_tokens", [world_size, 1], torch.int32,
                    init_value=torch.tensor(counts, dtype=torch.int32).repeat_interleave(TP_SIZE).reshape(-1, 1)),
         ScalarSpec(
             "attention_epoch",
@@ -1348,7 +1367,7 @@ if __name__ == "__main__":
             # Full retains the K-chunk products for both compressor projections.
             ring_heap=PREFILL_C2A_FULL_RING_HEAP,
         ),
-        compare_fn=make_compare("full", len(devices), args.tokens),
+        compare_fn=make_compare("full", len(devices), args.tokens, initial_state),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")

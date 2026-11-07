@@ -43,7 +43,7 @@ from pypto.ir import DistributedConfig
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
-from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
+from config import DP_SIZE as CONFIG_DP_SIZE, FLASH as M, TP_SIZE as CONFIG_TP_SIZE
 from hc import hc_head, golden_hc_collapse
 from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
@@ -74,7 +74,7 @@ def _parse_int_argv(name, default=None):
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 # DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or 1
+DP_SIZE: int = _parse_int_argv("--dp") or (1 if __name__ == "__main__" else CONFIG_DP_SIZE)
 WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
@@ -129,7 +129,7 @@ def lm_head(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -138,7 +138,7 @@ def lm_head(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
     completed_epochs: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+) -> tuple[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32], pl.Scalar[pl.TASK_ID]]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
     selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -324,13 +324,13 @@ def lm_head(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_readback_wait") as _readback_wait_tid:
         for peer in pl.range(TP_SIZE):
             if peer != tp_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     logits_done, offsets=[peer, 0], expected=done_epoch * (LOGITS_COMM_BLOCKS + 1), cmp=pld.WaitCmp.Ge,
                 )
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_retire",
         deps=[_readback_notify_tid, _readback_wait_tid], allow_early_resolve=False,
-    ):
+    ) as _retire_tid:
         anchor = pl.read(logits, [0, 0])
         if done_epoch == completed_epochs:
             for peer in pl.range(TP_SIZE):
@@ -344,7 +344,7 @@ def lm_head(
                         value=0, op=pld.NotifyOp.Set,
                     )
         pl.write(logits, [0, 0], anchor)
-    return logits
+    return logits, _retire_tid
 
 
 @pl.jit.inline
@@ -421,7 +421,7 @@ def greedy_sample(
 
 @pl.jit.inline(auto_scope=False)
 def lm_head_with_sampling(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_states: pl.Tensor[None, pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
@@ -456,7 +456,7 @@ def lm_head_with_sampling(
 
 @pl.jit
 def l2_lm_head(
-    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_states: pl.Tensor[None, pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
@@ -490,8 +490,8 @@ def l2_lm_head(
 
 @pl.jit.host
 def l3_final_output(
-    x_hc: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[WORLD_SIZE, T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[None, pl.FP32],
+    pre_mix: pl.Tensor[None, pl.FP32],
     final_norm_weight: pl.Tensor[[WORLD_SIZE, D], pl.BF16],
     lm_head_weight: pl.Tensor[[WORLD_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[WORLD_SIZE, MAX_LOGIT_ROWS], pl.INT32],
@@ -528,8 +528,8 @@ def l3_final_output(
 
 
 def _final_output(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[None, pl.FP32],
+    pre_mix: pl.Tensor[None, pl.FP32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -557,6 +557,44 @@ def _final_output(
         hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
     )
     return logits, sampled_ids
+
+
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+from hc import hc_head_decode
+
+
+def _final_output_decode(
+    x_hc: pl.Tensor[None, pl.FP32],
+    pre_mix: pl.Tensor[None, pl.FP32],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+    completed_epochs: pl.Scalar[pl.INT32],
+):
+    """Compose final HC, Norm and LM head from the current layer state."""
+    rows = DECODE_GRAPH_CAPACITY
+    collapsed = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+    hc_head_decode(x_hc, pre_mix, collapsed)
+    normalized = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+    for norm_block in pl.spmd((DECODE_GRAPH_CAPACITY + 7) // 8, name_hint="final_rms_norm"):
+        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+    lm_head_with_sampling(
+        normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
+    )
+    return logits, sampled_ids
+
+
+final_output_decode = pl.jit.inline(_final_output_decode)
 
 
 final_output = pl.jit.inline(_final_output)

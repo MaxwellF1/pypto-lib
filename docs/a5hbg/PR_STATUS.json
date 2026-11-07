@@ -1,0 +1,458 @@
+{
+  "checks_snapshot_date": "2026-11-07",
+  "pull_requests": [
+    {
+      "baseRefName": "main",
+      "headRefName": "codex/deferred-completion-v2",
+      "headRefOid": "f0b40e9571ce15fec9c39cc0316827d0ce813edd",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2368,
+      "state": "CLOSED",
+      "title": "feat(distributed): add deferred task completion waits",
+      "updatedAt": "2026-08-13T16:42:02Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/2368"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "feat/deferred-completion",
+      "headRefOid": "165a8a7dc4faa8ecdfd16434902cd2353967a8a6",
+      "mergeCommit": {
+        "oid": "8f412c76acee10b29458e3bc9603dad38d06e928"
+      },
+      "mergedAt": "2026-08-18T07:49:45Z",
+      "number": 2369,
+      "state": "MERGED",
+      "title": "feat(distributed): add deferred task completion waits",
+      "updatedAt": "2026-08-18T07:49:46Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/2369"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "resolve-nested-host-control-yield-owners",
+      "headRefOid": "1a067a8264d757f345b81c6fe28081aee7039252",
+      "mergeCommit": {
+        "oid": "6307a2e2c9e53d61141ce1bd9c9d29e6b7418482"
+      },
+      "mergedAt": "2026-10-27T13:04:56Z",
+      "number": 3188,
+      "state": "MERGED",
+      "title": "fix(codegen): resolve nested host-control yield owners",
+      "updatedAt": "2026-10-27T13:04:56Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3188"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "preserve-caller-storage-for-graph-scope-captures",
+      "headRefOid": "c132be69b5a4a3cf4f7a978c0f4842dc421ccbdf",
+      "mergeCommit": {
+        "oid": "362013dfdd2c768666bfc493886883422c8b22cc"
+      },
+      "mergedAt": "2026-10-28T02:12:27Z",
+      "number": 3189,
+      "state": "MERGED",
+      "title": "fix(passes): allow existing write-only Graph boundary tensors",
+      "updatedAt": "2026-10-28T02:12:27Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3189"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "accept-existing-host-tensors-for-host-control",
+      "headRefOid": "a4a4f633ad85cb9f51994a34fe5aff863345a603",
+      "mergeCommit": {
+        "oid": "1b56170aa4b839b871cbef9799989a15f048fbd8"
+      },
+      "mergedAt": "2026-10-28T06:01:43Z",
+      "number": 3190,
+      "state": "MERGED",
+      "title": "fix(runtime): accept existing HOST tensors for host control",
+      "updatedAt": "2026-10-28T06:01:43Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3190"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/graph-gm-pipe-capacity-20261104",
+      "headRefOid": "970fa6b16ae58418e93a0066f17c78923066b47e",
+      "mergeCommit": {
+        "oid": "b1054e0dc9abd52473a4f2eeca029c07e3739306"
+      },
+      "mergedAt": "2026-11-06T09:25:28Z",
+      "number": 3275,
+      "state": "MERGED",
+      "title": "Fix: derive Graph GM pipe capacity from concrete launches",
+      "updatedAt": "2026-11-06T09:25:28Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3275"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "SKIPPED": 12,
+          "SUCCESS": 23
+        },
+        "head": "fd4e3d46563d507b03ff6f13ac8fcd61cf25cb8d",
+        "merge_state": "CLEAN",
+        "nonpassing_checks": [],
+        "review_decision": "APPROVED"
+      },
+      "headRefName": "fix/host-chip-return-20261104",
+      "headRefOid": "fd4e3d46563d507b03ff6f13ac8fcd61cf25cb8d",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3276,
+      "state": "OPEN",
+      "title": "Fix: bind HOST results to declared CHIP returned parameters",
+      "updatedAt": "2026-11-07T00:49:48Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3276"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "IN_PROGRESS": 8,
+          "SKIPPED": 12,
+          "SUCCESS": 15
+        },
+        "head": "fc39d42c75dddacfaaf72ae3ba656f9753d3753d",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [
+          {
+            "name": "system-tests",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300036915"
+          },
+          {
+            "name": "system-tests-direct",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300036839"
+          },
+          {
+            "name": "dist-system-tests",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300036911"
+          },
+          {
+            "name": "pypto-lib-compile (a2a3, npu, true)",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300037010"
+          },
+          {
+            "name": "pypto-lib-model",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300036834"
+          },
+          {
+            "name": "onboard-tests-a5",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300036858"
+          },
+          {
+            "name": "unit-tests (ubuntu-latest, 3.10)",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300820704"
+          },
+          {
+            "name": "system-tests-a5sim",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42337865057/job/128300820683"
+          }
+        ],
+        "review_decision": "APPROVED"
+      },
+      "headRefName": "feat/graph-deps-20261104",
+      "headRefOid": "fc39d42c75dddacfaaf72ae3ba656f9753d3753d",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3277,
+      "previous_snapshot_head": "3b1211cd8f23db2d441021dce8d17fc2965d6745",
+      "state": "OPEN",
+      "title": "Add: expose Graph dependencies and outer completion",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3277"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "IN_PROGRESS": 3,
+          "SKIPPED": 5,
+          "SUCCESS": 4
+        },
+        "head": "6ce74c847146932262015b088e4719a4fc1d419e",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [
+          {
+            "name": "pre-commit",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42338485752/job/128300689975"
+          },
+          {
+            "name": "clang-tidy",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42338485752/job/128300714521"
+          },
+          {
+            "name": "review",
+            "state": "IN_PROGRESS",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42338483610/job/128300762950"
+          }
+        ],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/submitted-graph-jit-binding-20261106",
+      "headRefOid": "6ce74c847146932262015b088e4719a4fc1d419e",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3321,
+      "previous_snapshot_head": "cd26c14b5b1166d6e99c664e13b2e444c02c4954",
+      "state": "OPEN",
+      "title": "Fix: specialize JIT submissions and preserve Graph identities",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3321"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "FAILURE": 1,
+          "SKIPPED": 6,
+          "SUCCESS": 22
+        },
+        "head": "ffe7c0c2b0188c0efad9dad44bcc40b2da8e3ab1",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [
+          {
+            "name": "review",
+            "state": "FAILURE",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42234124899/job/127947327733"
+          }
+        ],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/graph-communication-context-replay-20261106",
+      "headRefOid": "ffe7c0c2b0188c0efad9dad44bcc40b2da8e3ab1",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3322,
+      "state": "OPEN",
+      "title": "Fix: preserve communication context origins in Graph replay",
+      "updatedAt": "2026-11-06T14:36:32Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3322"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "FAILURE": 2,
+          "SKIPPED": 18,
+          "SUCCESS": 21
+        },
+        "head": "e29ae8bb73337064595fa3223efdf8bff70a7788",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [
+          {
+            "name": "pypto-lib-model",
+            "state": "FAILURE",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42256798187/job/128027859383"
+          },
+          {
+            "name": "onboard-tests-a5",
+            "state": "FAILURE",
+            "url": "https://github.com/hw-native-sys/pypto/actions/runs/42256798187/job/128027859287"
+          }
+        ],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/backing-storage-parameter-directions-20261106",
+      "headRefOid": "e29ae8bb73337064595fa3223efdf8bff70a7788",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 3323,
+      "state": "OPEN",
+      "title": "Fix: preserve backing storage reads in parameter directions",
+      "updatedAt": "2026-11-06T18:06:07Z",
+      "url": "https://github.com/hw-native-sys/pypto/pull/3323"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "SUCCESS": 1
+        },
+        "head": "247689f4e3ba10adc1f6faff75181cdc33194614",
+        "merge_state": "DIRTY",
+        "nonpassing_checks": [],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/singleton-stride-contiguity",
+      "headRefOid": "247689f4e3ba10adc1f6faff75181cdc33194614",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2146,
+      "state": "OPEN",
+      "title": "Fix: \u4fee\u6b63\u5355\u5143\u7d20\u7ef4 stride \u7684\u8fde\u7eed\u6027\u5224\u5b9a",
+      "updatedAt": "2026-09-07T13:34:37Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2146"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/preserve-run-activation-on-submission-close",
+      "headRefOid": "777c4b6b9e4efead3d632135036044ee357fef7b",
+      "mergeCommit": {
+        "oid": "531765c210813b019e9d6a491e3ace92d357fb26"
+      },
+      "mergedAt": "2026-10-27T06:13:30Z",
+      "number": 2736,
+      "state": "MERGED",
+      "title": "Fix: preserve run activation when closing submission",
+      "updatedAt": "2026-10-27T06:13:30Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2736"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/keep-routine-a3-queue-telemetry-at-debug-level",
+      "headRefOid": "62c70ecac4d1290e2ebe5756794900044801deda",
+      "mergeCommit": {
+        "oid": "ebcf40433700c07169a24ab2c7ca98677f840f27"
+      },
+      "mergedAt": "2026-10-27T09:22:17Z",
+      "number": 2742,
+      "state": "MERGED",
+      "title": "Fix: keep routine A3 queue telemetry at debug level",
+      "updatedAt": "2026-10-27T09:22:17Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2742"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/order-reused-softmax-ub-buffers-across-dma-pip",
+      "headRefOid": "1153b449f487c106dc7830ca686d1c6dd1cbd1c0",
+      "mergeCommit": {
+        "oid": "5e59ec5a081176d83fab67a3955be97a0e84c8ab"
+      },
+      "mergedAt": "2026-10-28T00:56:51Z",
+      "number": 2743,
+      "state": "MERGED",
+      "title": "Fix: order Softmax input buffer reuse across DMA pipes",
+      "updatedAt": "2026-10-28T01:46:00Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2743"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "fix/hbg-dma-workspace-r1",
+      "headRefOid": "a206b57e43e18176462de5203f0e076931feae77",
+      "mergeCommit": {
+        "oid": "349125e00592162b72dd3aff80301593ec99be2e"
+      },
+      "mergedAt": "2026-11-04T01:55:20Z",
+      "number": 2828,
+      "state": "MERGED",
+      "title": "Fix: expose SDMA workspace to A2/A3 HBG kernels",
+      "updatedAt": "2026-11-04T01:55:20Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2828"
+    },
+    {
+      "baseRefName": "main",
+      "headRefName": "feat/hbg-graph-deps-20261104",
+      "headRefOid": "9643297d717bba73af6cccc0d618191301974495",
+      "mergeCommit": {
+        "oid": "355ce3015e3e344d1fc3a61c206ee01823ce292c"
+      },
+      "mergedAt": "2026-11-05T08:28:10Z",
+      "number": 2869,
+      "state": "MERGED",
+      "title": "Add: support explicit predecessors on HBG Graph invocations",
+      "updatedAt": "2026-11-05T08:28:10Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2869"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "SKIPPED": 2,
+          "SUCCESS": 13
+        },
+        "head": "6ae66d52050f721d3c76f9eaadaf7a048a7e4ed7",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/hbg-distinct-definition-claims-20261106",
+      "headRefOid": "6ae66d52050f721d3c76f9eaadaf7a048a7e4ed7",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2930,
+      "state": "OPEN",
+      "title": "Fix: count admitted HBG Graph definition keys once",
+      "updatedAt": "2026-11-06T13:41:25Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2930"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "SKIPPED": 2,
+          "SUCCESS": 13
+        },
+        "head": "e1c801ae6d70d8aa7258d696879bd14f6c3dfa9c",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/hbg-tensormap-growth-20261106",
+      "headRefOid": "e1c801ae6d70d8aa7258d696879bd14f6c3dfa9c",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2931,
+      "state": "OPEN",
+      "title": "Fix: grow HBG hazard maps without moving producer entries",
+      "updatedAt": "2026-11-07T02:29:25Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2931"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "NEUTRAL": 1,
+          "SKIPPED": 1,
+          "SUCCESS": 13
+        },
+        "head": "1a9082541c65bf87950866e4f1fc7aa8ce363cfb",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/hbg-ready-queue-task-window-20261106",
+      "headRefOid": "1a9082541c65bf87950866e4f1fc7aa8ce363cfb",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2932,
+      "state": "OPEN",
+      "title": "Fix: size HBG ready queues for the configured task window",
+      "updatedAt": "2026-11-07T02:29:27Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2932"
+    },
+    {
+      "baseRefName": "main",
+      "check_snapshot": {
+        "counts": {
+          "SKIPPED": 2,
+          "SUCCESS": 13
+        },
+        "head": "a8198c5dd39a07af8e64307c0398c1153bd1b239",
+        "merge_state": "BLOCKED",
+        "nonpassing_checks": [],
+        "review_decision": "REVIEW_REQUIRED"
+      },
+      "headRefName": "fix/retained-native-domain-ownership-20261106",
+      "headRefOid": "a8198c5dd39a07af8e64307c0398c1153bd1b239",
+      "mergeCommit": null,
+      "mergedAt": null,
+      "number": 2934,
+      "state": "OPEN",
+      "title": "Fix: retain native communication domains across async consumers",
+      "updatedAt": "2026-11-06T15:35:19Z",
+      "url": "https://github.com/hw-native-sys/simpler/pull/2934"
+    }
+  ],
+  "scope": "MaxwellF1 PyPTO/Simpler delivery PRs plus third-party singleton fix 2146",
+  "snapshot_date": "2026-11-07",
+  "timezone": "Asia/Shanghai"
+}

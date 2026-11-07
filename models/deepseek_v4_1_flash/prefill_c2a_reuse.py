@@ -10,6 +10,7 @@
 
 
 import pypto.language as pl
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
 import pypto.language.distributed as pld
 import functools
 import torch
@@ -98,29 +99,37 @@ def prefill_c2a_reuse_attention(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    qkv_x_rows = ((pl.tensor.dim(x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qkv_x_payload = pl.create_tensor([qkv_x_rows, D], dtype=pl.FP8E4M3FN)
+    qkv_x_scales = pl.create_tensor([1, qkv_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+    proj_payload, proj_scales = quantize_projection_input(x, num_tokens, qkv_x_payload, qkv_x_scales)
+    qb_rows = pl.tensor.dim(proj_payload, 0)
+    qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
         num_tokens,
-    )
+     qb_workspace_payload, qb_workspace_scales)
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
     window_publish_tid = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
         num_tokens, cache_ready,
-    )
+     window_scale_scratch)
 
     source_ready = pl.system.task_dummy(deps=[window_publish_tid, cache_ready])
+    project_attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     _attend_project(
         query, window_indices, window_cache, window_cache_scale,
         compressed_indices, compressed_cache, compressed_cache_scale, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
         num_tokens, source_ready, compressed_keys=INDEX_TOPK,
-    )
+     attended=project_attended, physical_capacity=0)
     return partial
 
 
@@ -588,7 +597,9 @@ if __name__ == "__main__":
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_compare("reuse", len(devices), args.tokens),
+        compare_fn=make_compare(
+            "reuse", len(devices), args.tokens, initial_state, reference=golden_reference_c2a_reuse,
+        ),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")

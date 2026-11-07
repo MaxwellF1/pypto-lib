@@ -32,6 +32,29 @@ DEFAULT_TOKENS = 8
 assert D % HIDDEN_TILE == 0
 
 
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+
+
+@pl.jit.inline(auto_scope=False)
+def prepare_compressed_lens_decode(
+    position_ids: pl.Tensor[None, pl.INT32],
+    lengths: pl.Tensor[None, pl.INT32],
+    compression_shift: pl.constexpr,
+):
+    """Derive visible C1A (shift 0) or C2A (shift 1) lengths; position -1 gives zero."""
+    rows = DECODE_GRAPH_CAPACITY
+    positions_row = pl.reshape(position_ids, [1, rows])
+    lengths_row = pl.reshape(lengths, [1, rows])
+    for row in pl.parallel(0, DECODE_GRAPH_CAPACITY, LENGTH_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prepare_compressed_lens"):
+            active = pl.min(LENGTH_TILE, rows - row)
+            positions = pl.load(positions_row, [0, row], [1, LENGTH_TILE], valid_shape=[1, active])
+            visible = pl.add(positions, 1)
+            compressed = pl.shrs(visible, compression_shift)
+            pl.store(compressed, [0, row], lengths_row)
+    return lengths
+
+
 @pl.jit.inline(auto_scope=False)
 def prepare_compressed_lens(
     position_ids: pl.Tensor[[TOKEN_DYN], pl.INT32],

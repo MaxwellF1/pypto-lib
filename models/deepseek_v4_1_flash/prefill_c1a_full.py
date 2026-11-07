@@ -16,6 +16,7 @@ import inspect
 import math
 import os
 import pypto.language as pl
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
 import pypto.language.distributed as pld
 import torch
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run, mapped_pool_ratio_allclose
@@ -154,7 +155,10 @@ def prefill_c1a_full_attention(
     partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    qkv_x_rows = ((pl.tensor.dim(x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qkv_x_payload = pl.create_tensor([qkv_x_rows, D], dtype=pl.FP8E4M3FN)
+    qkv_x_scales = pl.create_tensor([1, qkv_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+    proj_payload, proj_scales = quantize_projection_input(x, num_tokens, qkv_x_payload, qkv_x_scales)
     publication = pl.array.create(1, pl.TASK_ID)
     publication[0] = pl.system.task_dummy(deps=[])
     if num_tokens > 0:
@@ -163,14 +167,17 @@ def prefill_c1a_full_attention(
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
         )
-        q_proj_rope(
+        qb_rows = pl.tensor.dim(proj_payload, 0)
+        qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        q_proj_result = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
             num_tokens,
-        )
+         qb_workspace_payload, qb_workspace_scales)
         publication[0] = published
     publication_ready = publication[0]
     indexer_completion = prefill_indexer(
@@ -182,18 +189,20 @@ def prefill_c1a_full_attention(
         source_ready = pl.system.task_dummy(deps=[publication_ready, indexer_completion])
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
         window_ready = window_publish(
             kv_projection, kv_norm_weight, rope_cos, rope_sin,
             window_slots, window_cache, window_cache_scale,
             num_tokens, source_ready,
-        )
+         window_scale_scratch)
 
+        project_attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         _attend_project(
             query, window_indices, window_cache, window_cache_scale,
             topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
             num_tokens, window_ready, compressed_keys=INDEX_TOPK,
-        )
+         attended=project_attended, physical_capacity=0)
     if scatter_output:
         prefill_sp_output_reduce_scatter(
             partial, output_window, output_arrived, output,
@@ -1418,6 +1427,55 @@ def golden_prefill_c1a_full_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
+def _staged_compressed_cache_compare(world_size, tokens):
+    """Check C1A publication on the device input while retaining exact pool guards."""
+    from compressor import golden_c1a_compressor
+    from qkv_proj_rope import golden_rope_interleave
+    from quant import quantize_mxfp4_cache
+    from utils import _publish_quantized_cache
+
+    names = ("compressed_cache", "compressed_cache_scale")
+    outputs = {}
+    checks = {
+        name: mapped_pool_ratio_allclose(
+            "compressed_slots", pool_name=name, mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        ) for name in names
+    }
+    quantize = functools.partial(
+        quantize_mxfp4_cache, group_size=COMPRESSED_CACHE_GROUP, scale_format="bf16", round_to_even=True,
+    )
+
+    def compare(name, actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        if not outputs:
+            active = int(inputs["num_tokens"])
+            ranks = []
+            for rank in range(world_size):
+                latent = golden_c1a_compressor(
+                    actual_outputs["attn_input"][rank, :active],
+                    inputs["compressor_wkv"][rank], inputs["compressor_norm_weight"][rank],
+                )
+                cosine = inputs["compressed_rope_cos"][rank, :active]
+                sine = inputs["compressed_rope_sin"][rank, :active]
+                width = cosine.shape[-1] * 2
+                tail = golden_rope_interleave(latent[..., -width:], cosine, sine)
+                rotated = torch.cat((latent[..., :-width], tail), dim=-1)
+                # Publication only overwrites active slots; preserve the original golden elsewhere.
+                ranks.append(_publish_quantized_cache(
+                    expected_outputs[names[0]][rank], expected_outputs[names[1]][rank],
+                    rotated, inputs["compressed_slots"][rank, :active], quantize,
+                ))
+            outputs.update({name: torch.stack([result[index] for result in ranks])
+                            for index, name in enumerate(names)})
+        return checks[name](
+            actual, outputs[name], inputs=inputs, actual_outputs=actual_outputs,
+            expected_outputs=outputs, **kwargs,
+        )
+
+    return {name: functools.partial(compare, name) for name in names}
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1493,18 +1551,7 @@ if __name__ == "__main__":
                 block_size=BLOCK_SIZE, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
-            "compressed_cache": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
+            **_staged_compressed_cache_compare(len(devices), fixture_token_count(args.tokens, args.case)),
             "index_cache": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="index_cache",
                 mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),

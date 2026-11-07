@@ -63,11 +63,29 @@ ROWS_PER_RANK = NUM_EMBEDDINGS // TP_SIZE
 TP_MAX_TOKENS = 256
 
 
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+
+
 @pl.jit.inline
 def engram_cast_to_fp32(source: pl.Tensor, output: pl.Tensor):
     """Widen a BF16 matrix into FP32 tiles."""
     rows = pl.tensor.dim(source, 0)
     width = pl.tensor.dim(source, 1)
+    for block in pl.spmd(((rows + T_TILE - 1) // T_TILE) * (width // N_TILE), name_hint="engram_widen"):
+        t0 = block // (width // N_TILE) * T_TILE
+        n0 = block % (width // N_TILE) * N_TILE
+        valid_rows = pl.min(T_TILE, rows - t0)
+        value = pl.slice(source, [T_TILE, N_TILE], [t0, n0], valid_shape=[valid_rows, N_TILE])
+        widened = pl.cast(value, pl.FP32)
+        output[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(widened, valid_rows, N_TILE)
+    return output
+
+
+@pl.jit.inline
+def engram_cast_to_fp32_decode(source: pl.Tensor, output: pl.Tensor):
+    """Widen a BF16 matrix into FP32 tiles."""
+    rows = DECODE_GRAPH_CAPACITY
+    width = KV_OUT
     for block in pl.spmd(((rows + T_TILE - 1) // T_TILE) * (width // N_TILE), name_hint="engram_widen"):
         t0 = block // (width // N_TILE) * T_TILE
         n0 = block % (width // N_TILE) * N_TILE
@@ -131,6 +149,59 @@ def engram_gate(
     return out
 
 
+@pl.jit.inline
+def engram_gate_decode(
+    kv: pl.Tensor,
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor,
+    out: pl.Tensor,
+    output_fp32: pl.constexpr,
+):
+    """Gate projected keys and values into each residual stream copy."""
+    t_dim = DECODE_GRAPH_CAPACITY
+    x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
+    out_flat = pl.reshape(out, [t_dim, HC_MULT * D])
+    t_blocks = (t_dim + T_TILE - 1) // T_TILE
+    for block in pl.spmd(t_blocks * HC_MULT, name_hint="engram_gate"):
+        t0 = (block // HC_MULT) * T_TILE
+        c = block % HC_MULT
+        valid_rows = pl.min(T_TILE, t_dim - t0)
+        reduction_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32)
+        # Reduction accumulators have 32-byte aligned rows.
+        sq_x = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        sq_k = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        dot = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for d0 in pl.range(0, D, D_TILE):
+            x_raw = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            key_raw = pl.load(kv, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            key_d = pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
+            x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
+            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, T_TILE]))
+            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d), reduction_tmp), [1, T_TILE]))
+            w_d = pl.load(weight, [c, d0], [1, D_TILE])
+            xw_d = pl.col_expand_mul(x_d, w_d)
+            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d), reduction_tmp), [1, T_TILE]))
+        inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
+        inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
+        dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
+        root = pl.sqrt(pl.maximum(pl.abs(dot), CLAMP))
+        nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
+        signed = pl.tile.select(nonnegative, root, pl.neg(root))
+        gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1])
+        for d0 in pl.range(0, D, D_TILE):
+            output_source = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            output_value = pl.load(kv, [t0, HC_MULT * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            gated = pl.row_expand_mul(output_value, gate)
+            y = pl.add(output_source, gated)
+            y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
+            if output_fp32:
+                y_rounded = pl.cast(y_bf16, pl.FP32)
+                pl.store(pl.set_validshape(y_rounded, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
+            else:
+                pl.store(pl.set_validshape(y_bf16, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
+    return out
+
+
 @pl.jit.inline(auto_scope=False)
 def engram_from_rows(
     lookup: pl.Tensor,
@@ -139,28 +210,50 @@ def engram_from_rows(
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor,
     out: pl.Tensor,
+    kv: pl.Tensor,
+    kv_fp32: pl.Tensor,
 ):
     """Project host-gathered BF16 rows and gate the FP32 residual stream."""
     tokens = pl.tensor.dim(x, 0)
-    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     gemm_bf16_via_mxfp8_to_bf16_staged(
         lookup, wkv_weight, wkv_scale, kv, tokens,
         ENGRAM_K, KV_OUT, "engram_projection", "engram_quant", N_TILE, 256, 1, 2147483647,
     )
-    kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
     engram_cast_to_fp32(kv, kv_fp32)
     engram_gate(kv_fp32, weight, x, out, output_fp32=True)
     return out
 
 
+@pl.jit.inline(auto_scope=False)
+def engram_from_rows_decode(
+    lookup: pl.Tensor,
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor,
+    out: pl.Tensor,
+    kv: pl.Tensor,
+    kv_fp32: pl.Tensor,
+):
+    """Project host-gathered BF16 rows and gate the FP32 residual stream."""
+    tokens = DECODE_GRAPH_CAPACITY
+    gemm_bf16_via_mxfp8_to_bf16_staged(
+        lookup, wkv_weight, wkv_scale, kv, tokens,
+        ENGRAM_K, KV_OUT, "engram_projection", "engram_quant", N_TILE, 256, 1, 2147483647,
+    )
+    engram_cast_to_fp32_decode(kv, kv_fp32)
+    engram_gate_decode(kv_fp32, weight, x, out, output_fp32=True)
+    return out
+
+
 @pl.jit.inline
 def engram(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
+    hash_ids: pl.Tensor[None, pl.INT32],
     engram_table: pl.Tensor[[NUM_EMBEDDINGS, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[None, pl.BF16],
+    out: pl.Tensor[None, pl.BF16],
 ):
     t_dim = pl.tensor.dim(hash_ids, 0)
     t_blocks = (t_dim + T_TILE - 1) // T_TILE
@@ -234,12 +327,12 @@ def golden_engram(
 
 @pl.jit
 def l2_engram(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
+    hash_ids: pl.Tensor[None, pl.INT32],
     engram_table: pl.Tensor[[NUM_EMBEDDINGS, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor[None, pl.BF16],
+    out: pl.Out[pl.Tensor[None, pl.BF16]],
 ):
     """Run the Engram block for standalone validation."""
     hash_ids.bind_dynamic(0, T_DYN)
@@ -251,12 +344,12 @@ def l2_engram(
 
 @pl.jit.inline
 def engram_tp(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
+    hash_ids: pl.Tensor[None, pl.INT32],
     engram_table: pl.Tensor[[ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[None, pl.BF16],
+    out: pl.Tensor[None, pl.BF16],
     lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
     signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -395,7 +488,7 @@ def engram_tp(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed_wait") as consumed_wait_tid:
         for peer in pl.range(TP_SIZE):
             if peer != my_rank:
-                pld.system.defer_wait(signal, offsets=[peer, 0], expected=2, cmp=pld.WaitCmp.Ge)
+                pld.system.wait(signal, offsets=[peer, 0], expected=2, cmp=pld.WaitCmp.Ge)
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="engram_tp_signal_retire",
         deps=[consumed_tid, consumed_wait_tid], allow_early_resolve=False,
@@ -417,12 +510,12 @@ def engram_tp(
 
 @pl.jit
 def l2_engram_tp(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
+    hash_ids: pl.Tensor[None, pl.INT32],
     engram_table: pl.Tensor[[ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor[None, pl.BF16],
+    out: pl.Out[pl.Tensor[None, pl.BF16]],
     lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
     signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -440,12 +533,12 @@ def l2_engram_tp(
 
 @pl.jit.host
 def l3_engram(
-    hash_ids: pl.Tensor[[TP_SIZE, T_DYN, N_HASH_COLS], pl.INT32],
+    hash_ids: pl.Tensor[None, pl.INT32],
     engram_table: pl.Tensor[[TP_SIZE, ROWS_PER_RANK, HEAD_DIM], pl.BF16],
     wkv_weight: pl.Tensor[[TP_SIZE, ENGRAM_K, KV_OUT], pl.BF16],
     weight: pl.Tensor[[TP_SIZE, HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor[None, pl.BF16],
+    out: pl.Out[pl.Tensor[None, pl.BF16]],
 ):
     """Launch one Engram TP group, every rank sharing the window buffers."""
     hash_ids.bind_dynamic(1, T_DYN)

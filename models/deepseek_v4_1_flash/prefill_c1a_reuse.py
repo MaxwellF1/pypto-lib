@@ -10,6 +10,7 @@
 
 import math
 import pypto.language as pl
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
 import pypto.language.distributed as pld
 import torch
 from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
@@ -97,30 +98,38 @@ def prefill_c1a_reuse_attention(
     if num_tokens > 0:
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-        q_proj_rope(
+        qkv_x_rows = ((pl.tensor.dim(x, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qkv_x_payload = pl.create_tensor([qkv_x_rows, D], dtype=pl.FP8E4M3FN)
+        qkv_x_scales = pl.create_tensor([1, qkv_x_rows * (D // 32)], dtype=pl.FP8E8M0)
+        proj_payload, proj_scales = quantize_projection_input(x, num_tokens, qkv_x_payload, qkv_x_scales)
+        qb_rows = pl.tensor.dim(proj_payload, 0)
+        qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        q_proj_result = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
             num_tokens,
-        )
+         qb_workspace_payload, qb_workspace_scales)
         source_ready = pl.system.task_dummy(deps=[])
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
         window_ready = window_publish(
             kv_projection, kv_norm_weight, rope_cos, rope_sin,
             window_slots, window_cache, window_cache_scale,
             num_tokens, source_ready,
-        )
+         window_scale_scratch)
 
+        project_attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         _attend_project(
             query, window_indices, window_cache, window_cache_scale,
             compressed_indices, compressed_cache, compressed_cache_scale, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
             num_tokens, window_ready, compressed_keys=INDEX_TOPK,
-        )
+         attended=project_attended, physical_capacity=0)
     if scatter_output:
         prefill_sp_output_reduce_scatter(
             partial, output_window, output_arrived, output,

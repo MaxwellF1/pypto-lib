@@ -12,9 +12,13 @@
 
 
 import pypto.language as pl
+from decode_indexer import CANDIDATE_BLOCK_SIZE, CANDIDATE_LEAF_TILE, CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH
+from decode_indexer import INDEX_WEIGHT_K_SPLIT_TILE as IDX_WEIGHT_SPLITS
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
+from hc import LINEAR_T_TILE as HC_LINEAR_T_TILE, LINEAR_OK as HC_LINEAR_OK, MIX_PAD as HC_MIX_PAD
 import pypto.language.distributed as pld
 from config import (
-    FLASH as M, MOE_TOKENS, B_DYN, T_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
+    FLASH as M, MOE_TOKENS, B_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
     INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
 )
@@ -25,9 +29,10 @@ from decode_c1a_reuse import decode_c1a_reuse
 from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
+from expert_routed import create_moe_workspace
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
-    moe, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals,
+    moe_workspace, N_EXPERTS, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals,
 )
 
 
@@ -47,16 +52,18 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
-N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
 
 
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+
+
 @pl.jit
 def l2_decode_layer(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -74,23 +81,23 @@ def l2_decode_layer(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    rope_cos: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    request_ids: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT32],
+    token_to_req_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT32],
+    position_ids: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT32],
+    compressed_lens: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_cos: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
     compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
@@ -98,19 +105,19 @@ def l2_decode_layer(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    compressed_slots: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
-    topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
-    pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    topk_indices: pl.InOut[pl.Tensor[[DECODE_GRAPH_CAPACITY, INDEX_TOPK], pl.INT32]],
+    pool_block_ids: pl.InOut[pl.Tensor[[DECODE_GRAPH_CAPACITY, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.InOut[pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT32]],
+    compressed_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY, INDEX_TOPK], pl.INT32],
+    attention_output: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -129,9 +136,9 @@ def l2_decode_layer(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -147,36 +154,68 @@ def l2_decode_layer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one scheduled Attention sublayer followed by the EP MoE sublayer."""
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    incoming_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_block_table.bind_dynamic(0, B_DYN)
     index_block_table.bind_dynamic(1, TABLE_DYN)
     pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
-    next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    x_mixed.bind_dynamic(0, LOCAL_T_DYN)
-    x_next.bind_dynamic(0, LOCAL_T_DYN)
+    physical_pool_capacity = pl.tensor.dim(pool_block_ids, 1)
 
+    local_moe_tokens = pl.read(moe_num_tokens, [rank])
     if layer_id < 2:
-        decode_swa(
-            x_hc, incoming_pre_mix,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_weight,
-            wq_a, wq_a_scale, q_norm_weight,
-            wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight,
-            attn_sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale,
-            rope_cos, rope_sin,
-            window_slots, window_indices,
-            window_cache, window_cache_scale,
-            attention_output, attention_hidden, attention_pre_mix,
-            attention_num_tokens,
-        )
+        tokens = DECODE_GRAPH_CAPACITY
+        swa_post_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT], dtype=pl.FP32)
+        swa_residual_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+        swa_x_norm = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+        swa_qr = pl.create_tensor([DECODE_GRAPH_CAPACITY, Q_LORA], dtype=pl.BF16)
+        swa_q = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        swa_kv_projection = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        qkv_rows = ((pl.tensor.dim(x_hc, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qkv_x_norm_payload = pl.create_tensor([qkv_rows, D], dtype=pl.FP8E4M3FN)
+        qkv_x_norm_scales = pl.create_tensor([1, qkv_rows * (D // 32)], dtype=pl.FP8E8M0)
+        qb_rows = ((pl.tensor.dim(x_hc, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+        window_attended = pl.create_tensor([pl.tensor.dim(x_hc, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        hc_workspace_rows = ((pl.tensor.dim(x_hc, 0) + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+        hc_inv_rms = pl.create_tensor([hc_workspace_rows, 1], dtype=pl.FP32)
+        hc_partials = pl.create_tensor([HC_LINEAR_OK * hc_workspace_rows, HC_MIX_PAD], dtype=pl.FP32)
+        with pl.graph("lib_decode_layer_swa"):
+            decode_swa(
+                x_hc, incoming_pre_mix,
+                hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_weight,
+                wq_a, wq_a_scale, q_norm_weight,
+                wq_b, wq_b_scale,
+                wkv, wkv_scale, kv_norm_weight,
+                attn_sink,
+                wo_a, wo_a_scale, wo_b, wo_b_scale,
+                rope_cos, rope_sin,
+                window_slots, window_indices,
+                window_cache, window_cache_scale,
+                attention_output, attention_hidden, attention_pre_mix,
+                attention_num_tokens,
+                swa_post_mix, swa_residual_mix, swa_x_norm, swa_qr, swa_q, swa_kv_projection,
+                qkv_x_norm_payload, qkv_x_norm_scales,
+             qb_workspace_payload, qb_workspace_scales, window_scale_scratch, window_attended, hc_inv_rms, hc_partials, window_blocks=pl.tensor.dim(window_cache_scale, 0))
     elif layer_id < 20:
         if (layer_id - 2) % 6 == 0:
+            window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+            map_tokens = pl.tensor.dim(x_hc, 0)
+            map_groups = (map_tokens + 3) // 4 + pl.tensor.dim(state_block_table, 0)
+            mapped_starts = pl.create_tensor([map_groups + 1], dtype=pl.INT32)
+            mapped_requests = pl.create_tensor([map_tokens], dtype=pl.INT32)
+            mapped_blocks = pl.create_tensor([map_groups, 1], dtype=pl.INT32)
+            c2a_width = pl.tensor.dim(index_block_table, 1) * 128
+            c2a_panels = (c2a_width + 255) // 256
+            c2a_shards = 32
+            if c2a_panels > 100:
+                c2a_shards = pl.max(32, (DECODE_GRAPH_CAPACITY * c2a_panels + 99) // 100)
+            c2a_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, c2a_width], dtype=pl.FP32)
+            c2a_candidate_keys = pl.create_tensor([DECODE_GRAPH_CAPACITY, c2a_shards * INDEX_TOPK], dtype=pl.UINT16)
+            c2a_candidate_indices = pl.create_tensor([DECODE_GRAPH_CAPACITY, c2a_shards * INDEX_TOPK], dtype=pl.INT32)
             decode_c2a_full(
                 x_hc, incoming_pre_mix,
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -203,8 +242,9 @@ def l2_decode_layer(
                 topk_indices,
                 attention_hidden, attention_pre_mix,
                 attention_num_tokens,
-            )
+             window_scale_scratch, mapped_starts, mapped_requests, mapped_blocks, c2a_scores, c2a_candidate_keys, c2a_candidate_indices, window_blocks=pl.tensor.dim(window_cache_scale, 0))
         else:
+            window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
             decode_c2a_reuse(
                 x_hc, incoming_pre_mix,
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -220,8 +260,52 @@ def l2_decode_layer(
                 topk_indices,
                 attention_hidden, attention_pre_mix,
                 attention_num_tokens,
-            )
+             window_scale_scratch, window_blocks=pl.tensor.dim(window_cache_scale, 0))
     elif layer_id == 20:
+        tokens = DECODE_GRAPH_CAPACITY
+        hc_workspace_rows = ((DECODE_GRAPH_CAPACITY + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+        qkv_x_norm_rows = ((DECODE_GRAPH_CAPACITY + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qb_rows = qkv_x_norm_rows
+        c1a_full_post_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT], dtype=pl.FP32)
+        c1a_full_residual_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+        c1a_full_hc_inv_rms = pl.create_tensor([hc_workspace_rows, 1], dtype=pl.FP32)
+        c1a_full_hc_partials = pl.create_tensor([HC_LINEAR_OK * hc_workspace_rows, HC_MIX_PAD], dtype=pl.FP32)
+        c1a_full_x_norm = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+        c1a_full_qr = pl.create_tensor([DECODE_GRAPH_CAPACITY, Q_LORA], dtype=pl.BF16)
+        c1a_full_query = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        c1a_full_kv_projection = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        c1a_full_qkv_x_norm_payload = pl.create_tensor([qkv_x_norm_rows, D], dtype=pl.FP8E4M3FN)
+        c1a_full_qkv_x_norm_scales = pl.create_tensor([1, qkv_x_norm_rows * (D // 32)], dtype=pl.FP8E8M0)
+        c1a_full_qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        c1a_full_qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        c1a_full_window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+        c1a_full_projected = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        c1a_full_latent = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        c1a_full_projected_key = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_DIM], dtype=pl.BF16)
+        c1a_full_attn_out = attention_output
+        tokens = DECODE_GRAPH_CAPACITY
+        score_width = pl.tensor.dim(index_block_table, 1) * 128
+        c1a_index_query = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
+        c1a_index_query_scale = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0)
+        c1a_index_weights = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H], dtype=pl.BF16)
+        c1a_index_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, score_width], dtype=pl.FP32)
+        c1a_weight_partials = pl.create_tensor([IDX_WEIGHT_SPLITS * pl.tensor.dim(x_hc, 0), INDEX_H], dtype=pl.FP32)
+        tokens = DECODE_GRAPH_CAPACITY
+        score_width = pl.tensor.dim(index_block_table, 1) * 128
+        score_capacity = DECODE_GRAPH_CAPACITY
+        score_panels = (score_width + 255) // 256
+        score_workers = 32
+        score_shards = score_workers
+        if score_panels > 100:
+            score_shards = pl.max(score_workers, (score_capacity * score_panels + 99) // 100)
+        score_runs = pl.create_tensor([4, score_capacity + 1], dtype=pl.INT32)
+        score_candidate_keys = pl.create_tensor([score_capacity, score_shards * INDEX_TOPK], dtype=pl.UINT16)
+        score_candidate_indices = pl.create_tensor([score_capacity, score_shards * INDEX_TOPK], dtype=pl.INT32)
+        candidate_blocks = (score_width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+        candidate_padded_blocks = (candidate_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
+        candidate_block_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, candidate_padded_blocks], dtype=pl.FP32)
+        candidate_arena = pl.create_tensor([DECODE_GRAPH_CAPACITY * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
+        project_attended = pl.create_tensor([pl.tensor.dim(x_hc, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         decode_c1a_full(
             x_hc, incoming_pre_mix,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -245,8 +329,56 @@ def l2_decode_layer(
             topk_indices, pool_block_ids, pool_block_counts,
             attention_hidden, attention_pre_mix,
             attention_num_tokens,
-        )
+         c1a_full_post_mix, c1a_full_residual_mix, c1a_full_hc_inv_rms, c1a_full_hc_partials, c1a_full_x_norm, c1a_full_qr, c1a_full_query, c1a_full_kv_projection, c1a_full_qkv_x_norm_payload, c1a_full_qkv_x_norm_scales, c1a_full_qb_workspace_payload, c1a_full_qb_workspace_scales, c1a_full_window_scale_scratch, c1a_full_projected, c1a_full_latent, c1a_full_projected_key, c1a_full_attn_out, c1a_index_query, c1a_index_query_scale, c1a_index_weights, c1a_index_scores, c1a_weight_partials, score_runs, score_candidate_keys, score_candidate_indices, candidate_block_scores, candidate_arena, project_attended, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=physical_pool_capacity)
     elif layer_id % 4 == 0:
+        tokens = DECODE_GRAPH_CAPACITY
+        qkv_x_norm_rows = ((DECODE_GRAPH_CAPACITY + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qb_rows = qkv_x_norm_rows
+        hc_workspace_rows = ((DECODE_GRAPH_CAPACITY + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+        score_width = physical_pool_capacity * CANDIDATE_BLOCK_SIZE
+        reindex_post_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT], dtype=pl.FP32)
+        reindex_residual_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+        reindex_x_norm = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+        reindex_qr = pl.create_tensor([DECODE_GRAPH_CAPACITY, Q_LORA], dtype=pl.BF16)
+        reindex_query = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        reindex_kv_projection = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        reindex_qkv_x_norm_payload = pl.create_tensor([qkv_x_norm_rows, D], dtype=pl.FP8E4M3FN)
+        reindex_qkv_x_norm_scales = pl.create_tensor([1, qkv_x_norm_rows * (D // 32)], dtype=pl.FP8E8M0)
+        reindex_qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        reindex_qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        reindex_window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+        reindex_c1a_index_query = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H * INDEX_DIM // 2], dtype=pl.UINT8)
+        reindex_c1a_index_query_scale = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0)
+        reindex_c1a_index_weights = pl.create_tensor([DECODE_GRAPH_CAPACITY, INDEX_H], dtype=pl.BF16)
+        reindex_c1a_index_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, score_width], dtype=pl.FP32)
+        reindex_c1a_weight_partials = pl.create_tensor([IDX_WEIGHT_SPLITS * DECODE_GRAPH_CAPACITY, INDEX_H], dtype=pl.FP32)
+        reindex_attn_out = attention_output
+        reindex_project_attended = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        reindex_hc_inv_rms = pl.create_tensor([hc_workspace_rows, 1], dtype=pl.FP32)
+        reindex_hc_partials = pl.create_tensor([HC_LINEAR_OK * hc_workspace_rows, HC_MIX_PAD], dtype=pl.FP32)
+        reindex_score_width = score_width
+        reindex_table_width = pl.tensor.dim(index_block_table, 1)
+        reindex_dense_width = pl.min(reindex_score_width, reindex_table_width * 128)
+        reindex_panels = (reindex_dense_width + 255) // 256
+        reindex_workers = 32
+        reindex_shards = reindex_workers
+        if reindex_panels > 100:
+            reindex_shards = pl.max(reindex_workers, (DECODE_GRAPH_CAPACITY * reindex_panels + 99) // 100)
+        reindex_paged_scores = pl.create_tensor([DECODE_GRAPH_CAPACITY, reindex_dense_width], dtype=pl.FP32)
+        reindex_score_runs = pl.create_tensor([4, DECODE_GRAPH_CAPACITY + 1], dtype=pl.INT32)
+        reindex_candidate_keys = pl.create_tensor([DECODE_GRAPH_CAPACITY, reindex_shards * INDEX_TOPK], dtype=pl.UINT16)
+        reindex_candidate_indices = pl.create_tensor([DECODE_GRAPH_CAPACITY, reindex_shards * INDEX_TOPK], dtype=pl.INT32)
+        pool_width = score_width
+        pool_panels = (pool_width + 255) // 256
+        pool_total_rows = DECODE_GRAPH_CAPACITY * pool_panels * 256
+        pool_workers = 32
+        pool_payloads = pl.create_tensor([pool_total_rows, INDEX_DIM // 2], dtype=pl.UINT8)
+        pool_scales = pl.create_tensor([1, pool_total_rows * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.UINT8)
+        pool_valid = pl.create_tensor([1, pool_total_rows], dtype=pl.INT32)
+        pool_physical = pl.create_tensor([1, pool_total_rows], dtype=pl.INT32)
+        pool_runs = pl.create_tensor([4, DECODE_GRAPH_CAPACITY + 1], dtype=pl.INT32)
+        pool_candidate_keys = pl.create_tensor([DECODE_GRAPH_CAPACITY, pool_workers * INDEX_TOPK], dtype=pl.UINT16)
+        pool_candidate_indices = pl.create_tensor([DECODE_GRAPH_CAPACITY, pool_workers * INDEX_TOPK], dtype=pl.INT32)
         decode_c1a_reindex(
             x_hc, incoming_pre_mix,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -266,8 +398,27 @@ def l2_decode_layer(
             topk_indices,
             attention_hidden, attention_pre_mix,
             attention_num_tokens,
-        )
+         reindex_post_mix, reindex_residual_mix, reindex_x_norm, reindex_qr, reindex_query, reindex_kv_projection, reindex_qkv_x_norm_payload, reindex_qkv_x_norm_scales, reindex_qb_workspace_payload, reindex_qb_workspace_scales, reindex_window_scale_scratch, reindex_c1a_index_query, reindex_c1a_index_query_scale, reindex_c1a_index_weights, reindex_c1a_index_scores, reindex_c1a_weight_partials, reindex_attn_out, reindex_project_attended, reindex_hc_inv_rms, reindex_hc_partials, reindex_paged_scores, reindex_score_runs, reindex_candidate_keys, reindex_candidate_indices, pool_payloads, pool_scales, pool_valid, pool_physical, pool_runs, pool_candidate_keys, pool_candidate_indices, window_blocks=pl.tensor.dim(window_cache_scale, 0), pool_capacity=physical_pool_capacity)
     else:
+        tokens = DECODE_GRAPH_CAPACITY
+        qkv_x_norm_rows = ((DECODE_GRAPH_CAPACITY + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+        qb_rows = qkv_x_norm_rows
+        hc_workspace_rows = ((DECODE_GRAPH_CAPACITY + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+        reuse_post_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT], dtype=pl.FP32)
+        reuse_residual_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+        reuse_x_norm = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+        reuse_qr = pl.create_tensor([DECODE_GRAPH_CAPACITY, Q_LORA], dtype=pl.BF16)
+        reuse_query = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        reuse_kv_projection = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+        reuse_qkv_x_norm_payload = pl.create_tensor([qkv_x_norm_rows, D], dtype=pl.FP8E4M3FN)
+        reuse_qkv_x_norm_scales = pl.create_tensor([1, qkv_x_norm_rows * (D // 32)], dtype=pl.FP8E8M0)
+        reuse_qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        reuse_qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        reuse_window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+        reuse_attn_out = attention_output
+        reuse_project_attended = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        reuse_hc_inv_rms = pl.create_tensor([hc_workspace_rows, 1], dtype=pl.FP32)
+        reuse_hc_partials = pl.create_tensor([HC_LINEAR_OK * hc_workspace_rows, HC_MIX_PAD], dtype=pl.FP32)
         decode_c1a_reuse(
             x_hc, incoming_pre_mix,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -283,35 +434,39 @@ def l2_decode_layer(
             compressed_indices,
             attention_hidden, attention_pre_mix,
             attention_num_tokens,
-        )
+         reuse_post_mix, reuse_residual_mix, reuse_x_norm, reuse_qr, reuse_query, reuse_kv_projection, reuse_qkv_x_norm_payload, reuse_qkv_x_norm_scales, reuse_qb_workspace_payload, reuse_qb_workspace_scales, reuse_window_scale_scratch, reuse_attn_out, reuse_project_attended, reuse_hc_inv_rms, reuse_hc_partials, window_blocks=pl.tensor.dim(window_cache_scale, 0))
 
-    local_moe_tokens = pl.read(moe_num_tokens, [rank])
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
-    moe(
-        attention_hidden, attention_pre_mix,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_norm_weight,
-        gate_weight,
-        correction_bias,
-        routed_w1, routed_w1_scale,
-        routed_w2, routed_w2_scale,
-        routed_w3, routed_w3_scale,
-        shared_w1, shared_w1_scale,
-        shared_w2, shared_w2_scale,
-        shared_w3, shared_w3_scale,
-        next_pre_mix, x_mixed, x_next,
-        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-        data_arrived, routed_output, combine_arrived,
-        local_moe_tokens, rank, moe_epoch,
-        force_topk,
-    )
-    clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    recv_x_local, routed_pair, routed_partial = create_moe_workspace(N_LOCAL_EXPERTS, TOPK)
+    layer_moe_hc_rows = ((pl.tensor.dim(attention_hidden, 0) + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+    layer_moe_hc_inv_rms = pl.create_tensor([layer_moe_hc_rows, 1], dtype=pl.FP32)
+    layer_moe_hc_partials = pl.create_tensor([HC_LINEAR_OK * layer_moe_hc_rows, HC_MIX_PAD], dtype=pl.FP32)
+    with pl.graph("lib_decode_layer_moe"):
+        moe_workspace(
+            attention_hidden, attention_pre_mix,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            ffn_norm_weight,
+            gate_weight,
+            correction_bias,
+            routed_w1, routed_w1_scale,
+            routed_w2, routed_w2_scale,
+            routed_w3, routed_w3_scale,
+            shared_w1, shared_w1_scale,
+            shared_w2, shared_w2_scale,
+            shared_w3, shared_w3_scale,
+            next_pre_mix, x_mixed, x_next,
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            data_arrived, routed_output, combine_arrived,
+            local_moe_tokens, rank, moe_epoch,
+            force_topk, recv_x_local, routed_pair, routed_partial, layer_moe_hc_inv_rms, layer_moe_hc_partials, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+        )
+        clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
 
 @pl.jit.host
 def l3_decode_layer(
-    x_hc: pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
@@ -329,23 +484,23 @@ def l3_decode_layer(
     wo_a_scale: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[EP_SIZE, T_DYN, 128], pl.INT32],
+    rope_cos: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
+    request_ids: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT32],
+    token_to_req_indices: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT32],
+    position_ids: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT32],
+    compressed_lens: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[EP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_cos: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
     compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     compressor_wgate: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -353,19 +508,19 @@ def l3_decode_layer(
     state_block_table: pl.Tensor[[EP_SIZE, B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[EP_SIZE, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[EP_SIZE, HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
+    compressed_slots: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT64],
     index_wk: pl.Tensor[[EP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[EP_SIZE, INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[EP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[EP_SIZE, Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[EP_SIZE, D, INDEX_H], pl.BF16],
-    topk_indices: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    pool_block_ids: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
-    pool_block_counts: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN], pl.INT32]],
-    compressed_indices: pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    topk_indices: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, INDEX_TOPK], pl.INT32]],
+    pool_block_ids: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY], pl.INT32]],
+    compressed_indices: pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, INDEX_TOPK], pl.INT32],
+    attention_output: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
@@ -384,9 +539,9 @@ def l3_decode_layer(
     shared_w2_scale: pl.Tensor[[EP_SIZE, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
     shared_w3: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
-    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[EP_SIZE, DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
@@ -1037,7 +1192,7 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
     routed_w3, routed_w3_scale = quantize_mxfp4_weight(torch.randn(8, 64, 64))
     shared_scale = pack_mx_b_scale(torch.full((2, 64), 127, dtype=torch.uint8))
     moe = {
-        "gate_weight": torch.randn(8, 64),
+        "gate_weight": torch.randn(8, 64).to(torch.bfloat16),
         "correction_bias": torch.randn(8),
         "routed_w1": routed_w1,
         "routed_w1_scale": routed_w1_scale,
@@ -1151,12 +1306,12 @@ if __name__ == "__main__":
         compare_fn={
             # Window-cache payload and scale tolerances on mapped attention rows.
             "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache", mapping_shape=(EP_SIZE, DECODE_MAX_TOKENS),
+                "window_slots", pool_name="window cache", mapping_shape=(EP_SIZE, DECODE_GRAPH_CAPACITY),
                 block_size=128, leading_rank_axis=True,
                 atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
             ),
             "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache scale", mapping_shape=(EP_SIZE, DECODE_MAX_TOKENS),
+                "window_slots", pool_name="window cache scale", mapping_shape=(EP_SIZE, DECODE_GRAPH_CAPACITY),
                 block_size=128, leading_rank_axis=True,
                 atol=0.0, rtol=0.02, max_error_ratio=0.01,
             ),
@@ -1170,11 +1325,11 @@ if __name__ == "__main__":
             "pool_block_counts": exact,
             # Attention output budget includes FP8 cache rounding boundaries.
             "attention_output": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.025),
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.02),
                 counts,
             ),
             "attention_hidden": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.02),
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.015),
                 counts,
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),

@@ -10,10 +10,12 @@
 
 
 import pypto.language as pl
-from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
+from qkv_proj_rope import PROJ_M_TILE as QKV_PROJ_M_TILE
+from hc import LINEAR_T_TILE as HC_LINEAR_T_TILE, LINEAR_OK as HC_LINEAR_OK, MIX_PAD as HC_MIX_PAD
+from config import FLASH as M, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from sparse_attention import _attend_window_project
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
+from qkv_proj_rope import quantize_projection_input_decode as quantize_projection_input, q_proj_rope_decode as q_proj_rope, kv_proj_decode as kv_proj, window_publish_decode as window_publish
+from hc import hc_head_norm_decode as hc_head_norm, hc_project_decode as hc_project, hc_sinkhorn_decode as hc_sinkhorn, zero_bf16_padding_decode as zero_bf16_padding, hc_post_decode as hc_post
 
 
 # model config
@@ -34,10 +36,13 @@ MX_GROUP = M.weight_block_size[0]
 # tiling
 
 
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+
+
 @pl.jit.inline(auto_scope=False)
 def decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -55,49 +60,57 @@ def decode_swa(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    rope_cos: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
-    attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    attention_output: pl.Tensor[[DECODE_GRAPH_CAPACITY, D], pl.BF16],
+    attention_hidden: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    attention_pre_mix: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    x_norm: pl.Tensor,
+    qr: pl.Tensor,
+    q: pl.Tensor,
+    kv_projection: pl.Tensor,
+    qkv_x_norm_payload: pl.Tensor,
+    qkv_x_norm_scales: pl.Tensor,
+    qb_workspace_payload: pl.Tensor,
+    qb_workspace_scales: pl.Tensor,
+    window_scale_scratch: pl.Tensor,
+    window_attended: pl.Tensor,
+    hc_inv_rms: pl.Tensor,
+    hc_partials: pl.Tensor,
+    window_blocks: pl.Scalar[pl.INDEX],
 ):
     """Run one SWA attention sublayer and emit the staggered mix for the next sublayer."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     x_ready = hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
-    qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    q_proj_rope(
+    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens, qkv_x_norm_payload, qkv_x_norm_scales)
+    qr, q, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, q,
         num_tokens,
-    )
+     qb_workspace_payload, qb_workspace_scales)
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
     cache_ready = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
         num_tokens, x_ready,
-    )
+     window_scale_scratch, cache_blocks=window_blocks)
     _attend_window_project(
         q, window_indices, window_cache, window_cache_scale, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attention_output,
         num_tokens, cache_ready,
-    )
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
+     window_attended, physical_capacity=DECODE_GRAPH_CAPACITY)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True, inv_rms=hc_inv_rms, mixes_partials=hc_partials)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
@@ -106,8 +119,8 @@ def decode_swa(
 
 @pl.jit
 def l2_decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -125,38 +138,59 @@ def l2_decode_swa(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    rope_cos: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    attention_output: pl.InOut[pl.Tensor[[DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Dispatch one production SWA composition to a device-selected JIT entry."""
-    return decode_swa(
-        x_hc, incoming_pre_mix,
-        hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_weight,
-        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight,
-        attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin,
-        window_slots, window_indices,
-        window_cache, window_cache_scale,
-        attention_output, attention_hidden, attention_pre_mix,
-        num_tokens,
-    )
+    swa_post_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT], dtype=pl.FP32)
+    swa_residual_mix = pl.create_tensor([DECODE_GRAPH_CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
+    swa_x_norm = pl.create_tensor([DECODE_GRAPH_CAPACITY, D], dtype=pl.BF16)
+    swa_qr = pl.create_tensor([DECODE_GRAPH_CAPACITY, Q_LORA], dtype=pl.BF16)
+    swa_q = pl.create_tensor([DECODE_GRAPH_CAPACITY, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    swa_kv_projection = pl.create_tensor([DECODE_GRAPH_CAPACITY, HEAD_DIM], dtype=pl.BF16)
+    qkv_rows = ((pl.tensor.dim(x_hc, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qkv_x_norm_payload = pl.create_tensor([qkv_rows, D], dtype=pl.FP8E4M3FN)
+    qkv_x_norm_scales = pl.create_tensor([1, qkv_rows * (D // 32)], dtype=pl.FP8E8M0)
+    qb_rows = ((pl.tensor.dim(x_hc, 0) + QKV_PROJ_M_TILE - 1) // QKV_PROJ_M_TILE) * QKV_PROJ_M_TILE
+    qb_workspace_payload = pl.create_tensor([qb_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_workspace_scales = pl.create_tensor([1, qb_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    window_scale_scratch = pl.create_tensor([pl.tensor.dim(window_cache_scale, 0), 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
+    window_attended = pl.create_tensor([pl.tensor.dim(x_hc, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    hc_workspace_rows = ((pl.tensor.dim(x_hc, 0) + HC_LINEAR_T_TILE - 1) // HC_LINEAR_T_TILE) * HC_LINEAR_T_TILE
+    hc_inv_rms = pl.create_tensor([hc_workspace_rows, 1], dtype=pl.FP32)
+    hc_partials = pl.create_tensor([HC_LINEAR_OK * hc_workspace_rows, HC_MIX_PAD], dtype=pl.FP32)
+    with pl.graph("lib_decode_swa"):
+        decode_swa(
+            x_hc, incoming_pre_mix,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight,
+            wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight,
+            attn_sink,
+            wo_a, wo_a_scale, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices,
+            window_cache, window_cache_scale,
+            attention_output, attention_hidden, attention_pre_mix,
+            num_tokens,
+            swa_post_mix, swa_residual_mix, swa_x_norm, swa_qr, swa_q, swa_kv_projection,
+            qkv_x_norm_payload, qkv_x_norm_scales,
+         qb_workspace_payload, qb_workspace_scales, window_scale_scratch, window_attended, hc_inv_rms, hc_partials, window_blocks=pl.tensor.dim(window_cache_scale, 0))
+    return attention_hidden, attention_pre_mix
 
 
 @pl.jit.host
 def l3_decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -174,19 +208,17 @@ def l3_decode_swa(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    rope_cos: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[DECODE_GRAPH_CAPACITY, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[DECODE_GRAPH_CAPACITY], pl.INT64],
+    window_indices: pl.Tensor[[DECODE_GRAPH_CAPACITY, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    attention_output: pl.InOut[pl.Tensor[[DECODE_GRAPH_CAPACITY, D], pl.BF16]],
+    attention_hidden: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[DECODE_GRAPH_CAPACITY, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     # MX_B_NN weight-scale views.
     wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale
@@ -207,6 +239,16 @@ def l3_decode_swa(
         attention_output, attention_hidden, attention_pre_mix,
         num_tokens, device=0,
     )
+
+
+def _padded_swa_initial(spec, fill):
+    """Keep the original active fixture and allocate a neutral physical tail."""
+    import torch
+
+    original = spec.create_tensor()
+    padded = torch.full((DECODE_GRAPH_CAPACITY, *original.shape[1:]), fill, dtype=original.dtype)
+    padded[:original.shape[0]].copy_(original)
+    return padded
 
 
 def build_swa_specs(args):
@@ -305,6 +347,17 @@ def build_swa_specs(args):
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
     specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
     by_name = {spec.name: spec for spec in specs}
+    from dataclasses import replace
+
+    padding = {"x_hc": 0, "incoming_pre_mix": 0, "rope_cos": 1, "rope_sin": 0,
+               "window_slots": -1, "window_indices": -1, "attention_output": 13.0,
+               "attention_hidden": 0.0, "attention_pre_mix": 0.0}
+    for name, fill in padding.items():
+        spec = by_name[name]
+        if not 0 <= spec.shape[0] <= DECODE_GRAPH_CAPACITY:
+            raise ValueError(f"{name} exceeds physical SWA decode capacity")
+        by_name[name] = replace(spec, shape=[DECODE_GRAPH_CAPACITY, *spec.shape[1:]],
+                                init_value=partial(_padded_swa_initial, spec, fill))
     return [by_name[name] for name in l3_decode_swa.param_names]
 
 
@@ -325,6 +378,8 @@ def golden_swa(tensors, *, reference=None):
     normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"])
     if reference is None:
         inputs = {name: normalized if name == "x" else tensors[name] for name in SWA_INPUT_NAMES}
+        for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):
+            inputs[name] = inputs[name][:active]
         cache_rows = tensors["window_cache"].shape[0] * 128
         shared_cache = tensors["attn_sink"].numel() != 64 and active >= 32 and cache_rows <= active * 128
         partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
@@ -336,6 +391,9 @@ def golden_swa(tensors, *, reference=None):
 
         parameters = inspect.signature(reference).parameters
         inputs = {name: normalized if name == "x" else tensors[name] for name in parameters}
+        for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):
+            if name in inputs:
+                inputs[name] = inputs[name][:active]
         computed = reference(**inputs)
         tensors["attention_output"][:active].copy_(computed["output"])
         for name in ("window_cache", "window_cache_scale"):
@@ -394,12 +452,12 @@ if __name__ == "__main__":
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
             "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
+                "window_slots", pool_name="window cache", mapping_shape=(DECODE_GRAPH_CAPACITY,),
                 block_size=128, leading_rank_axis=False,
                 atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
             ),
             "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
+                "window_slots", pool_name="window cache scale", mapping_shape=(DECODE_GRAPH_CAPACITY,),
                 block_size=128, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),

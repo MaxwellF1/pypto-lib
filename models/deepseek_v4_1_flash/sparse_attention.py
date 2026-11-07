@@ -30,6 +30,7 @@ from utils import packed_query_lengths, window_metadata
 
 from pathlib import Path
 
+from o_proj import o_proj_decode
 import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
 
@@ -102,8 +103,8 @@ SWA_RUN_DESCRIPTOR_WIDTH = 8
 def gather_window_batched(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[None, pl.INT32],
+    selected: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -186,8 +187,8 @@ def gather_window_batched(
 @pl.jit.inline(auto_scope=False)
 def gather_window_packed544(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[None, pl.INT32],
+    selected: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     rows = pl.tensor.dim(cache, 0) * 128
@@ -269,11 +270,11 @@ def gather_window_packed544(
 
 @pl.jit.inline(auto_scope=False)
 def attend_window_tiled(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    selected: pl.Tensor[None, pl.BF16],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -434,8 +435,8 @@ def decode_shared_cache_packed(
 
 @pl.jit.inline(auto_scope=False)
 def analyze_index_runs(
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    descriptors: pl.Tensor[[T_DYN, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
+    descriptors: pl.Tensor[None, pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cache_rows: pl.Scalar[pl.INDEX],
 ):
@@ -484,13 +485,13 @@ def analyze_index_runs(
 
 @pl.jit.inline(auto_scope=False)
 def attend_shared_cache(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     decoded_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.BF16],
     zero_row: pl.Tensor[[32, HEAD_DIM], pl.BF16],
-    descriptors: pl.Tensor[[T_DYN, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], pl.INT32],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    descriptors: pl.Tensor[None, pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
     index_ready: pl.Scalar[pl.TASK_ID],
@@ -606,12 +607,12 @@ def attend_shared_cache(
 
 @pl.jit.inline(auto_scope=False)
 def attend_shared_cache_plain(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     decoded_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.BF16],
     zero_row: pl.Tensor[[32, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -708,21 +709,22 @@ def attend_shared_cache_plain(
 
 @pl.jit.inline(auto_scope=False)
 def swa_attention_partial(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
+    physical_capacity: pl.constexpr = 0,
 ):
     """Return conservative attention completion for subsequent cache-update ordering."""
     if LOCAL_H == 64:
         cache_consumed = gather_sparse_attention(
             query, indices, cache, scales, indices, cache, scales,
             sink, output, num_tokens, source_ready, compressed_keys=0,
-        )
+         physical_capacity=physical_capacity)
     else:
         # Conservatively keep later cache updates after full mixed attention while
         # investigating PyPTO #2829. This boundary is not a confirmed causal fix.
@@ -760,27 +762,27 @@ def swa_attention_partial(
 
 @pl.jit.inline(auto_scope=False)
 def swa_attention(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Attend the active query prefix; leave caller-owned inactive rows untouched."""
     source_ready = pl.system.task_dummy(deps=[])
-    swa_attention_partial(query, cache, scales, indices, sink, output, num_tokens, source_ready)
+    swa_attention_partial(query, cache, scales, indices, sink, output, num_tokens, source_ready, physical_capacity=0)
     return output
 
 
 @pl.jit.inline(auto_scope=False)
 def _swa_attention_packed_partial(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Return conservative attention completion for subsequent cache-update ordering."""
@@ -820,11 +822,11 @@ def _swa_attention_packed_partial(
 
 @pl.jit.inline(auto_scope=False)
 def swa_attention_packed(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Attend the active query prefix; leave caller-owned inactive rows untouched."""
@@ -834,12 +836,12 @@ def swa_attention_packed(
 
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_swa(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    output: pl.InOut[pl.Tensor[None, pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     output = swa_attention(query, cache, scales, indices, sink, output, num_tokens)
@@ -848,11 +850,11 @@ def l2_sparse_attention_swa(
 
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_swa_packed(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    output: pl.InOut[pl.Tensor[None, pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     output = swa_attention_packed(query, cache, indices, sink, output, num_tokens)
@@ -1208,20 +1210,20 @@ def gather_sparse_attention(
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
+    physical_capacity: pl.constexpr = 0,
 ):
     """Attend H=64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
-    query = query[:num_tokens, :]
-    output = output[:num_tokens, :]
-    window_indices = window_indices[:num_tokens, :]
-    compressed_indices = compressed_indices[:num_tokens, :]
-    if compressed_keys == 0:
-        # Use fewer workers without increasing the maximum queries per worker.
-        query_waves = pl.max(1, (num_tokens + WORKERS - 1) // WORKERS)
-        workers = pl.max(1, pl.min(WORKERS, (num_tokens + query_waves - 1) // query_waves))
+    if physical_capacity > 0:
+        workers = pl.min(physical_capacity, WORKERS)
     else:
-        workers = pl.max(1, pl.min(num_tokens, WORKERS))
+        if compressed_keys == 0:
+            # Use fewer workers without increasing the maximum queries per worker.
+            query_waves = pl.max(1, (num_tokens + WORKERS - 1) // WORKERS)
+            workers = pl.max(1, pl.min(WORKERS, (num_tokens + query_waves - 1) // query_waves))
+        else:
+            workers = pl.max(1, pl.min(num_tokens, WORKERS))
     with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
-        output = _gather_sparse_vf_rows(
+        _gather_sparse_vf_rows(
             output, query, sink, window, window_scale, compressed, compressed_scale,
             window_indices, compressed_indices, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
             cache_mode=compressed_keys,
@@ -1237,21 +1239,25 @@ def _attend_project(
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor, rope_sin: pl.Tensor, output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32], source_ready: pl.Scalar[pl.TASK_ID], compressed_keys: pl.constexpr,
+    attended: pl.Tensor,
+    physical_capacity: pl.constexpr = 0,
 ):
     """Project BF16 attention through separate inverse RoPE and quantization tasks."""
     total_rows = pl.tensor.dim(output, 0)
-    attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     if LOCAL_H == 64:
         gather_sparse_attention(
             query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
-            sink, attended, num_tokens, source_ready, compressed_keys=compressed_keys,
+            sink, attended, num_tokens, source_ready, compressed_keys=compressed_keys, physical_capacity=physical_capacity,
         )
     else:
-        attend_packed(
+        attended = attend_packed(
             query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
             sink, attended, num_tokens, source_ready,
         )
-    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    if physical_capacity > 0:
+        o_proj_decode(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    else:
+        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return output
 
 
@@ -1271,12 +1277,16 @@ def _attend_window_project(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
+    attended: pl.Tensor,
+    physical_capacity: pl.constexpr = 0,
 ):
     """Attend a published window cache and project its active query prefix."""
     total_rows = pl.tensor.dim(output, 0)
-    attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    swa_attention_partial(query, window, window_scale, window_indices, sink, attended, num_tokens, source_ready)
-    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    swa_attention_partial(query, window, window_scale, window_indices, sink, attended, num_tokens, source_ready, physical_capacity=physical_capacity)
+    if physical_capacity > 0:
+        o_proj_decode(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    else:
+        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return output
 
 
@@ -1303,8 +1313,8 @@ def gather_packed(
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    wi: pl.Tensor[None, pl.INT32],
+    ci: pl.Tensor[None, pl.INT32],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1327,11 +1337,11 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
 
     @pl.jit.inline
     def attend_selected_chunk(
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        query: pl.Tensor[None, pl.BF16],
         selected: pl.Tensor[[selected_rows, SELECTED_KEYS, HEAD_DIM], pl.BF16],
         combined: pl.Tensor[[selected_rows, SELECTED_KEYS], pl.INT32],
         sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        output: pl.Tensor[None, pl.BF16],
         chunk_start: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
         gather_ready: pl.Scalar[pl.TASK_ID],
@@ -1404,11 +1414,11 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
 
 @pl.jit.inline(auto_scope=False)
 def _attend_cube(
-    query: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
     sink: pl.Tensor[[CUBE_HEADS], pl.FP32],
-    output: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -1475,11 +1485,11 @@ def _attend_cube(
 
 @pl.jit.inline(auto_scope=False)
 def _attend_padded(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    query: pl.Tensor[None, pl.BF16],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -1527,14 +1537,14 @@ attend_c2a_chunk = make_attend_selected_chunk(vector_query=TP_SIZE != 1)
 
 @pl.jit.inline(auto_scope=False)
 def _attend_bf16_block(
-    query: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    query: pl.Tensor[None, pl.FP32],
     window: pl.Tensor[[BF16_PAGES_W, 128, HEAD_DIM], pl.FP32],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    wi: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[BF16_PAGES_C, 128, HEAD_DIM], pl.FP32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    ci: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[BF16_HEADS], pl.FP32],
-    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
-    output: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    extents: pl.Tensor[None, pl.INT32],
+    output: pl.Tensor[None, pl.FP32],
     previous: pl.Scalar[pl.TASK_ID],
 ):
     rows = pl.tensor.dim(query, 0)
@@ -1655,8 +1665,8 @@ def decode_packed_caches(
 def gather_decoded_caches(
     decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    wi: pl.Tensor[None, pl.INT32],
+    ci: pl.Tensor[None, pl.INT32],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1703,15 +1713,15 @@ def gather_decoded_caches(
 
 @pl.jit.inline(auto_scope=False)
 def _attend_cache_shared(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     query_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -1743,15 +1753,15 @@ def _attend_cache_shared(
 
 @pl.jit.inline(auto_scope=False)
 def _attend_packed_block(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
     indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1768,15 +1778,15 @@ def _attend_packed_block(
 
 @pl.jit.inline(auto_scope=False)
 def attend_packed(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
@@ -1784,7 +1794,7 @@ def attend_packed(
         attended = gather_sparse_attention(
             query, window_indices, window, window_scale, compressed_indices,
             compressed, compressed_scale, sink, output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
-        )
+         physical_capacity=0)
     else:
         marker = pl.create_tensor([1, 16], dtype=pl.FP32)
         with pl.spmd(1, name_hint="sparse_query_ready", deps=[source_ready]) as ready:
@@ -1828,14 +1838,14 @@ def attend_packed(
 
 @pl.jit.inline(auto_scope=False)
 def attend_bf16(
-    query: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    query: pl.Tensor[None, pl.FP32],
     window: pl.Tensor[[BF16_PAGES_W, 128, HEAD_DIM], pl.FP32],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    wi: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[BF16_PAGES_C, 128, HEAD_DIM], pl.FP32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    ci: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[BF16_HEADS], pl.FP32],
-    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
-    output: pl.Tensor[[T_DYN, BF16_HEADS, HEAD_DIM], pl.FP32],
+    extents: pl.Tensor[None, pl.INT32],
+    output: pl.Tensor[None, pl.FP32],
 ):
     rows = pl.tensor.dim(query, 0)
     heads = pl.tensor.dim(query, 1)
@@ -1858,15 +1868,15 @@ def attend_bf16(
 
 @pl.jit(auto_scope=False)
 def l2_sparse_attention(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    output: pl.Out[pl.Tensor[None, pl.BF16]],
 ):
     rows = pl.tensor.dim(query, 0)
     source_ready = pl.system.task_dummy(deps=[])
@@ -1884,15 +1894,15 @@ _attend_cohort = make_attend_selected_chunk(
 
 @pl.jit.inline(auto_scope=False)
 def attend_packed_cohorts(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     rows: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
     gather_name: pl.constexpr,
@@ -1937,15 +1947,15 @@ def attend_packed_cohorts(
 
 @pl.jit(auto_scope=False)
 def l2_c2a_attention(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    output: pl.Out[pl.Tensor[None, pl.BF16]],
 ):
     query.bind_dynamic(0, T_DYN)
     window.bind_dynamic(0, ORI_BLOCKS_DYN)
@@ -1965,10 +1975,10 @@ def l2_gather_packed(
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    wi: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    selected: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS, HEAD_DIM], pl.BF16]],
-    indices: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS], pl.INT32]],
+    wi: pl.Tensor[None, pl.INT32],
+    ci: pl.Tensor[None, pl.INT32],
+    selected: pl.InOut[pl.Tensor[None, pl.BF16]],
+    indices: pl.InOut[pl.Tensor[None, pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
     start: pl.Scalar[pl.INT32],
 ):
@@ -1984,14 +1994,14 @@ def l2_gather_packed(
 
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_bf16(
-    query: pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32],
+    query: pl.Tensor[None, pl.FP32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    extents: pl.Tensor[[T_DYN, 2], pl.INT32],
-    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32]],
+    extents: pl.Tensor[None, pl.INT32],
+    output: pl.Out[pl.Tensor[None, pl.FP32]],
 ):
     output = attend_bf16(query, window, window_indices, compressed, compressed_indices, sink, extents, output)
     return output
@@ -2482,11 +2492,11 @@ def golden_compressed_attention(
 
 @pl.jit(auto_scope=False)
 def l2_attend_project(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed_indices: pl.Tensor[None, pl.INT32],
     compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
@@ -2494,25 +2504,26 @@ def l2_attend_project(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
+    output: pl.InOut[pl.Tensor[None, pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     source_ready = pl.system.task_dummy(deps=[])
+    project_attended = pl.create_tensor([pl.tensor.dim(output, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     output = _attend_project(
         query, window_indices, window, window_scale,
         compressed_indices, compressed, compressed_scale, sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
-    )
+     attended=project_attended, physical_capacity=0)
     return output
 
 
 @pl.jit(auto_scope=False)
 def l2_attend_window_project(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    query: pl.Tensor[None, pl.BF16],
+    window_indices: pl.Tensor[None, pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
@@ -2520,17 +2531,18 @@ def l2_attend_window_project(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
+    output: pl.InOut[pl.Tensor[None, pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     source_ready = pl.system.task_dummy(deps=[])
+    window_attended = pl.create_tensor([pl.tensor.dim(output, 0), LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     output = _attend_window_project(
         query, window_indices, window, window_scale, sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         output, num_tokens, source_ready,
-    )
+     window_attended, physical_capacity=0)
     return output
 
 

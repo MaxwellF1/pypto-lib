@@ -13,7 +13,7 @@ import math
 import torch
 import pypto.language as pl
 
-from config import FLASH as M, DeepSeekV41Config, T_DYN
+from config import FLASH as M, DeepSeekV41Config
 
 
 # model config
@@ -78,10 +78,10 @@ ROPE_ROWS_DYN = pl.dynamic("V41_ROPE_ROWS_DYN")
 def materialize_rope_rows(
     freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[None, pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
     pair_start: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Gather active token rows from serving-owned full tables inside the graph.

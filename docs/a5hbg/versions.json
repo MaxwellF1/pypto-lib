@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "lib": {
+    "base_commit": "d9a04f8b1d4cb62220e0f9b0b31d971dad9b0746",
+    "model_donor_base": "740bc389b753ff9c0522c479390a6e00aa52c52f",
+    "model_source_sha256": {
+      "compressor.py": "ad6dbecc07605df9d14ae2c0314b48efa6943fb2365dfbc15835cddd86d0e376",
+      "config.py": "a10e26ab43953cac842dac60ef8fbb03d568378548f63d332237990f4087f8dc",
+      "decode_c1a_full.py": "443263f40cf62baa716f0403cd71571f8094ab4a05d0b31b105df01f8d861fb4",
+      "decode_c1a_reindex.py": "06f5968e5dc2672ffc7459ed8cc5f7ccc7f5c0cca434a587c0df721e9c632359",
+      "decode_c1a_reuse.py": "cfaa57d6d85d5e71eaf9352f5ce8f82e9603b2a80f52498c178e00fa943721f7",
+      "decode_c2a_full.py": "86779648643255f7e19d0ae6d0d7d7e40bd8e86e679ea57162c8eef90fb530c3",
+      "decode_c2a_reuse.py": "a6d414d2ad6ec3f49828a5489df4023bd3b1fd5e31fc9b48cf46bc1d5895bc24",
+      "decode_fwd.py": "737cb14a9ea08349ef42e3a95b609b4c979387d83a7ab0964ace991c91500d93",
+      "decode_fwd_dspark.py": "915b30492f90677a4ff2b9e40ede2446e263992e021496c7856e77b29732baab",
+      "decode_indexer.py": "78f26062dd0c717afa13ed5a1e0be5a5c3d2331a3978bba26b98d8ba231a361e",
+      "decode_layer.py": "74af60e6c31aef5342d97ab894057d28efa3b218885cf6954ebb2b43736c8a82",
+      "decode_moe.py": "62217316010f46979af8d31507f1502fd4642eae6ca00277954e231bfadad97e",
+      "decode_swa.py": "b2d1fb7640b2c3d677a66911e51769d897b464b66575ade203056fa8d6dc8163",
+      "dspark_attention.py": "a86179fb2b8cc41543e072baa4bab78e2f6c6298e4d6980c41f342c13b09f4b7",
+      "dspark_context_kv.py": "f192fbab3a4a083c9b2bd4fe3c19bcc62dc3880b2d6e069e8401cbcee61fbc3f",
+      "dspark_drafter.py": "b2c71882d064f3874c64f9ceb78ea59ff1687f8d33dd3efbd31196f8eddec68a",
+      "dspark_markov.py": "68ddaf0c8048cfc9231a15f483acc17b21305350e1bd178cfbc501fe16b102a9",
+      "dspark_state.py": "6a72e5cfc41f19b1c6e2cd105cb3da2e889f255ffe0e6347bd9e3fd253cf8582",
+      "dspark_target_sample.py": "a19720bd6bec1411ce8be00b23ac592f688370c362c13feed702e28b6b379da4",
+      "engram.py": "752ac27bce7340e93c0de23df7b4f5eaff03d4508423a5dc4ba60a370e0409eb",
+      "expert_routed.py": "fdc6a84d0969bc2cb48513cd3032296d8bada521974e7ca215301f1d6a258d61",
+      "expert_shared.py": "9ac607dca6cf2d31c13fdb756a0c2f8caca70eb2ca49ef74bcbabc4b408ab46d",
+      "gate.py": "d3a7221454632130dafe4f2e73259712d53c407becaf7cc0148b9e5d51998af7",
+      "gemm.py": "86ff3883df4af567108889db474b3adfc1aebc976bb54d7d1399ebfd9b15867a",
+      "hc.py": "ca2d57d3e6727b6a905fab4aa840886af07e5d77c83b3f9f89a3dc8b3039d68d",
+      "input_pack.py": "f2f284742faef5112163c418cf3155989977b4b11b9760c00f791fba9e8805c0",
+      "kernels/compressor_pool.cpp": "f17a5eeb150b7df44a052f62687888ac526ec7b982409f1f118ed973f21ed42d",
+      "kernels/compressor_publish.cpp": "bf6ca011e89950f3533afb3beaf383ff34d11686c7422184296459d9deefdca4",
+      "kernels/compressor_publish.h": "c8d6d4c85eef97af7f38d66b344b43fada0e51f4227be9f2219047d77f7ce1f6",
+      "kernels/expert_routed_mxfp4.hpp": "53c994ceb2d4dd5cbdc47472321169f57be38dc0d9f5d5dfa748d388dd639c27",
+      "kernels/expert_routed_swiglu.cpp": "c6aecc274e982c7a628426166deaaa9f017f914ab51eeb38a80ed8ad8a0de0dd",
+      "kernels/expert_routed_w13.cpp": "546435d5f7db2bdc904605f2caf934a960ef12a46c4d2416b675d7af41f91cff",
+      "kernels/expert_routed_w2.cpp": "893ebb13177c7581c6597a7bdf35ce47859acb95545720ad5d9567ad4642584c",
+      "kernels/expert_shared_mxfp8.hpp": "ab8c492e6e3b58e03f84f6f6e58780515d741a94324ad407b42ad2ca4b9158a5",
+      "kernels/expert_shared_swiglu.cpp": "cc96a77fda7026eb098d6ed22701c15d7ce438457c0cb201b96c73b1259619cb",
+      "kernels/expert_shared_w13.cpp": "f5af8aa731d95114707f98025008c1ac79644a13b343089f20229c9c7dfc3e28",
+      "kernels/gate_pre_route_vf.cpp": "2152658c289bff2220a5aa2d63c39bbef0e230f8a23219c81558611b598cf256",
+      "kernels/gate_quant_vf.cpp": "1ae191575700829be6d27f74d146c327478a6f7421973c5b6ef509ea67bd43b9",
+      "kernels/gate_route_sort_vf.cpp": "ea048a4e9993e0f476ca305a359ddee260d2fe79c2416106d859ff3810533a49",
+      "kernels/gate_scores_vf.cpp": "b30818ba4c1543d7e73e118a2883fac30a2c86067871b5c37557f0cffea2105d",
+      "kernels/gather_packed.cpp": "3f0189bf1e553e20bbd190581b7935e4f528ed3b8f74407fdfa5723235b39ba6",
+      "kernels/hc_collapse_norm.cpp": "41c2f0065436de6e6edf061cabfad81b4921bbae9fdfa82700c7adb54a125f99",
+      "kernels/hc_linear.cpp": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568",
+      "kernels/hc_post.cpp": "7a411307ec9c7e0b40eabb0cb254c83f96a2f34586a2e60c8a1be75f4cc811ce",
+      "kernels/hc_sinkhorn.cpp": "3f667a3e7f6a80ba44ecd9f12ae6fb30f9dbb66a84b14d2da4f1008fbf07a06a",
+      "kernels/idx_k_norm_rope_publish.cpp": "7b8f6fd70f69032462f26267cc0bb9da9cfad564336a39c616f61ca6ea8c5a43",
+      "kernels/idx_q.cpp": "f8ab5221389ea96da71fa5a60345deb6640dfc9f34fc10fc84dcb81d6dcfe766",
+      "kernels/index_score_topk.cpp": "38c7c3333eaec0858ba1f38cac29f3ebcf8025f7845a713b13fdfeadce080212",
+      "kernels/mx_quant.hpp": "f4716ba10f20243689f6bd0d76a0c60f07c603881caa9ba5d1af755e8178c21f",
+      "kernels/mxfp8_projection.hpp": "5436a3488b5c77b21c2eb47a6b9791168c0c5513bf06991de59b9205b9bec279",
+      "kernels/norm_rope_publish.cpp": "b7ba69bd00e39413b58bb78aa4b8ec58692ef711da7adc7ca94d8199040d7692",
+      "kernels/o_proj_a.cpp": "8d3a1dc0ad255ef037f44c36623cd917f37b78eb302cb3e4c529a3e994aa053b",
+      "kernels/o_proj_b.cpp": "a552f3446e03e093b7c3d525af8eeb9a5c67eadf6bac548c493465ca3050407e",
+      "kernels/o_quant_vf.cpp": "5cb7b7db7d77258da4aaec588bd20e93e784826d49ff6bfa3afc569121b69511",
+      "kernels/o_quant_vf.hpp": "ee805d208019e3bc8307c1a7369dc33620ef3c9f413119a0b43be37130449b67",
+      "kernels/o_rope_vf.cpp": "61624743c2a1e9b5a64e90568e411b999436106b950c80ea414d6f8b23344955",
+      "kernels/proj_kv.cpp": "349d1a12c319e6a5f322ad8414dcca8cb08adbe22782135bb8cd00690a612d01",
+      "kernels/proj_q_a.cpp": "e8a38325abecb1c5a712f6b5df5e4189a38048c54901c049d82cd4979be2355e",
+      "kernels/proj_q_b.cpp": "0f885bca87634c844880a76451e1b7890733a304d2a5bed337e99de8cee40173",
+      "kernels/q_lora_projection.hpp": "197f7b524f79124a99b250bf74df2a0ae3fbba2b3fb0e8fce3c88fbddf5a1349",
+      "kernels/q_norm_quant.cpp": "e2b774e6a473f688a421149c637e3d6cdde75ed42a362e894e509c555f9cf969",
+      "kernels/q_norm_quant_decode.cpp": "acde40b1a25566cce781c804bfd7f122fca707095a547e34b1dfcb9d3db2574d",
+      "kernels/qkv_quant.cpp": "8b9c3abd0861b1f26a0a20c7f24659d424715b6f13c06cdc2cd76fc164c22d58",
+      "kernels/rms_norm_bf16.cpp": "ff250e1a0bbde4d6f6bdf393f2125a7ca0b9204fa8305e1ad6b6f306cbabcc2b",
+      "kernels/sparse_dequant_vf.hpp": "cec0a3d5adf3e9dd54ab05ecf0409f5ff8b356a13d3fcae0b7ffe58931762a57",
+      "kernels/sparse_gather_vf.cpp": "1dab41c8e64dc89f821ed08cd03254eca52f4ec6605161e21565aa20715280c3",
+      "kernels/sparse_softmax_vf.hpp": "9393b73bdfa3fe3baff4e7544f5a757a76d71c4ac6450d4feebee3950f90ecdf",
+      "lm_head.py": "33edd3d9e3344444a377e34dd90e0a31b8cec9307c47e1712a197a57eccf39ee",
+      "o_proj.py": "c92dafe8394c1fead891efc987967aed30cc16f1e6c66728ca2fe765c1304d4f",
+      "padding_reset.py": "4ec31fad676ac7638152d1541aba88430947a851d9926352a330e0a3cc5cc908",
+      "prefill_c1a_full.py": "24289571d243ca766f54e0ef9c700b355fb1204781b6e827b18829e45969ff46",
+      "prefill_c1a_reindex.py": "deda0c0bacd4c066cc574057f7e9eeb894f94f21a0e0da2467191a74979be9ca",
+      "prefill_c1a_reuse.py": "f7e5567ff40c09e582ebf0dbe56e7bc68351b2cafc11b625f340fa2017b82503",
+      "prefill_c2a_full.py": "8cd6c0d7c110103ca52397a18a0dc6b512b827c2445e7947dad313769a208e54",
+      "prefill_c2a_reuse.py": "a8a25d9b00a03ba201539c82192ff5c47d6b8e9b1f688ceebb6fbf88f5857299",
+      "prefill_cp_allgather.py": "ef009005d7357b4c133218a7c7d5c558e782e33e371f4c2166e6841616cd36f5",
+      "prefill_fwd.py": "c766adeceacb9847b36482dfedb1c87ddb7ec66dc4ed19c66880fa658f57e006",
+      "prefill_indexer.py": "1966b046b969059e4f2cf36de017a4f559aa0c72c49ef8bd7a2210f5f5882f46",
+      "prefill_layer.py": "0aeaa30496294edf97f33f6ce3a8457dc9c70641c96b747024cb8d0456ec0276",
+      "prefill_moe.py": "2fcbb4abbff3f279035fde3ab144eaf8184ed65dce06528a9e3622b021f5c556",
+      "prefill_swa.py": "0530d390286f0beb7dc4bd3243c021c6e9f6fc7c607d3654aa7b8e5ee76ba113",
+      "qkv_proj_rope.py": "5bc36f31fe97140b8a82d7ad8614b70b739cfa6806c87030a8d3f857d92340e7",
+      "quant.py": "b79da69b51c2be802518c8dd84c6ebc9583da07e58ae686ce08010b5c5351cc3",
+      "rmsnorm.py": "bc99b11bb414994e717cf975ef68bb763dccd9736cd1b35e4f655884cb326bc2",
+      "rope_tables.py": "d62f304729ad0761f437fd1647b662fd87c452441c452b4d8fc1caef758272fd",
+      "sparse_attention.py": "7aab52763784ca556adc44b8134129ef60af86faf6d7253bbf84eeb2ecf8133d",
+      "utils.py": "5f728f01806e2e2e838d4817c6372ba3417f5f859427363041d0d09c06a3e5ac",
+      "vision.py": "42033a46ced0f363d22dd07eeac264028167f89d0cc701dd5ec5915cd4534aa2"
+    },
+    "delta_categories": {
+      "decode_closure": [
+        "compressor.py",
+        "config.py",
+        "decode_c1a_full.py",
+        "decode_c1a_reindex.py",
+        "decode_c1a_reuse.py",
+        "decode_c2a_full.py",
+        "decode_c2a_reuse.py",
+        "decode_fwd.py",
+        "decode_indexer.py",
+        "decode_layer.py",
+        "decode_moe.py",
+        "decode_swa.py",
+        "engram.py",
+        "expert_routed.py",
+        "gate.py",
+        "gemm.py",
+        "hc.py",
+        "input_pack.py",
+        "kernels/expert_routed_mxfp4.hpp",
+        "kernels/index_score_topk.cpp",
+        "kernels/q_lora_projection.hpp",
+        "kernels/q_norm_quant_decode.cpp",
+        "lm_head.py",
+        "o_proj.py",
+        "padding_reset.py",
+        "qkv_proj_rope.py",
+        "rmsnorm.py",
+        "rope_tables.py",
+        "sparse_attention.py"
+      ],
+      "compatibility_callers_inherited": [
+        "decode_fwd_dspark.py",
+        "dspark_attention.py",
+        "dspark_context_kv.py",
+        "dspark_drafter.py",
+        "dspark_markov.py",
+        "dspark_state.py",
+        "dspark_target_sample.py",
+        "prefill_c1a_full.py",
+        "prefill_c1a_reindex.py",
+        "prefill_c1a_reuse.py",
+        "prefill_c2a_full.py",
+        "prefill_c2a_reuse.py",
+        "prefill_fwd.py",
+        "prefill_indexer.py",
+        "prefill_layer.py",
+        "prefill_moe.py",
+        "prefill_swa.py"
+      ],
+      "upstream_cpu_sim_retained": [
+        "kernels/hc_collapse_norm.cpp",
+        "kernels/idx_k_norm_rope_publish.cpp",
+        "kernels/o_proj_a.cpp",
+        "kernels/o_quant_vf.cpp"
+      ],
+      "inherited_device_packing_and_pipe": [
+        "kernels/expert_routed_mxfp4.hpp",
+        "kernels/q_lora_projection.hpp"
+      ]
+    }
+  },
+  "core": {
+    "integration_commit": "c518868152128723dda6c272fecc061fb85f191b",
+    "integration_status": "A5 original CI C1A reuse and EP2 MoE validated in eager and Graph",
+    "historical_qualified_source_base": "6433e15fff9eee223984f207f76cfe84193a38fb",
+    "historical_qualified_extension_sha256": "a3725667f9f69bd2aab12fd2bcae879026b5d8b8712b5e6dfa9bf986912736b4",
+    "integration_repository": "https://github.com/MaxwellF1/pypto.git",
+    "integration_branch": "a5hbg",
+    "integration_prs": [
+      {
+        "url": "https://github.com/hw-native-sys/pypto/pull/3322",
+        "head": "ffe7c0c2b0188c0efad9dad44bcc40b2da8e3ab1"
+      },
+      {
+        "url": "https://github.com/hw-native-sys/pypto/pull/3323",
+        "head": "e29ae8bb73337064595fa3223efdf8bff70a7788"
+      }
+    ],
+    "integration_extension_sha256": "30a1e2dbe0a822f4070e37de91646b199cb78a2c4cb57e1cdb76a283dcadcfe9"
+  },
+  "simpler": {
+    "commit": "391b2fbcd4dd053204a677662c39b6b7636e8043",
+    "validated_extension_sha256": "f5ddb33a27dca6ddbad3196762922fc3cb8e39f5661f92ef1b93803d152c5b3f"
+  },
+  "historical_toolchain": {
+    "ptoas_version": "v0.72",
+    "pto_isa_commit": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7"
+  },
+  "profiles": {
+    "eager": "host_build_graph with 18 Graph scopes removed before import",
+    "graph": "host_build_graph with canonical Graph scopes",
+    "gate_geometry": "fixed in both profiles"
+  },
+  "qualification": {
+    "unified_source": "A5 original CI C1A reuse and EP2 MoE passed in eager and Graph on the exact Core integration commit.",
+    "historical_results": "See TRACKING.md for source-specific receipts",
+    "historical_unified_cpu": {
+      "task": "task_20261107_143927_20848024664",
+      "receipt_relative_to_evidence_root": "a5hbg-lib-integration-v1/runs/cpu-v1/receipt.json",
+      "receipt_sha256": "842fa9cae980a17cca82a43469549c7c3365123237def5bb41634c9cc6730d23",
+      "runtime": "host_build_graph",
+      "cases": [
+        "C1A reuse B12x8K eager and Graph",
+        "MoE EP2 72 rows 12 experts per rank eager and Graph"
+      ],
+      "graph_submit_sites_per_entry": {
+        "eager": 0,
+        "graph": 1
+      }
+    },
+    "public_combo_numeric": {
+      "task": "task_20261107_164305_9542152836",
+      "receipt_relative_to_evidence_root": "a5hbg-lib-integration-v1/runs/public-combo-numeric-v1/receipt.json",
+      "receipt_sha256": "bce4f9783e1d7d33cf60d5e24314e439bcf4df79ceacf3c8988c8bfb844eb415",
+      "source_guard_paths": 5032,
+      "modes": {
+        "decode_c1a_reuse": {
+          "graph": {
+            "devices": [
+              0
+            ],
+            "scheduler_mode": 1,
+            "graph_submit_sites": 1,
+            "original_golden_outputs": [
+              "window_cache",
+              "window_cache_scale",
+              "compressed_cache",
+              "compressed_cache_scale",
+              "output",
+              "next_pre_mix"
+            ]
+          },
+          "eager": {
+            "devices": [
+              0
+            ],
+            "scheduler_mode": 1,
+            "graph_submit_sites": 0,
+            "original_golden_outputs": [
+              "window_cache",
+              "window_cache_scale",
+              "compressed_cache",
+              "compressed_cache_scale",
+              "output",
+              "next_pre_mix"
+            ]
+          }
+        },
+        "decode_moe": {
+          "graph": {
+            "devices": [
+              0,
+              7
+            ],
+            "scheduler_mode": 1,
+            "graph_submit_sites": 1,
+            "original_golden_outputs": [
+              "next_pre_mix",
+              "x_mixed",
+              "x_next"
+            ]
+          },
+          "eager": {
+            "devices": [
+              0,
+              7
+            ],
+            "scheduler_mode": 1,
+            "graph_submit_sites": 0,
+            "original_golden_outputs": [
+              "next_pre_mix",
+              "x_mixed",
+              "x_next"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "validated_toolchain": {
+    "ptoas_version": "v0.72",
+    "pto_isa_commit": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7"
+  }
+}

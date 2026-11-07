@@ -53,9 +53,9 @@ D_TILE = 512
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _rope_o_vf(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    attended: pl.Tensor[None, pl.BF16],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
     rotated: pl.Out[pl.Tensor[[80, LOCAL_H * ROPE_DIM], pl.BF16]],
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
@@ -67,7 +67,7 @@ def _rope_o_vf(
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _quant_o_vf(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor[None, pl.BF16],
     rotated: pl.Tensor[[80, LOCAL_H * ROPE_DIM], pl.BF16],
     payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
     scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
@@ -103,7 +103,7 @@ def _o_proj_b(
     weight: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     activation_scale: pl.Tensor[[1, 80 * (LOCAL_O_WIDTH // 32)], pl.FP8E8M0],
     weight_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor],
     rows: pl.Scalar[pl.INDEX], reduction: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project an 80-row group; scales contain MX_A_ZZ and MX_B_NN bytes."""
@@ -118,13 +118,14 @@ def _o_proj_quantized(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    output_group: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_group: pl.Tensor,
+    capacity: pl.Scalar[pl.INDEX],
     active_rows: pl.Scalar[pl.INT32],
 ):
     """Project one padded 80-row group from packed MXFP8 activations."""
     payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale_backing = pl.create_tensor([1, 80 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
+    oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), 32)
     oa_workers = pl.max(1, oa_workers)
     with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
         payload, activation_scale_backing = _o_proj_a(
@@ -132,24 +133,69 @@ def _o_proj_quantized(
             LOCAL_O_WIDTH, active_rows,
         )
     # O-B projection.
-    capacity = pl.tensor.dim(output_group, 0)
     with pl.spmd(D // O_B_N_TILE, name_hint="proj_o_b"):
-        output_group = _o_proj_b(
+        output_group_result = _o_proj_b(
             payload, wo_b, activation_scale_backing, wo_b_scale, output_group, capacity, LOCAL_O_WIDTH,
         )
-    return output_group
+    return output_group_result
+
+
+
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
 
 
 @pl.jit.inline(auto_scope=False)
-def o_proj(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+def o_proj_decode(
+    attended: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
+    total_rows = DECODE_GRAPH_CAPACITY
+    # This decode specialization has one physical 80-row group.
+    active_rows = pl.max(pl.min(DECODE_GRAPH_CAPACITY, num_tokens), 0)
+    for group_start in pl.parallel(0, DECODE_GRAPH_CAPACITY, 80):
+        group_rows = pl.min(80, total_rows - group_start)
+        attended_group = pl.tensor.slice(attended, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
+        cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
+        # Inverse RoPE.
+        rotated = pl.create_tensor([80, LOCAL_H * ROPE_DIM], dtype=pl.BF16)
+        vector_workers = 64
+        rope_waves = pl.max(1, (active_rows + vector_workers - 1) // vector_workers)
+        rope_workers = 64
+        with pl.spmd(rope_workers, name_hint="rope_o_vf"):
+            rotated = _rope_o_vf(
+                attended_group, cosine_group, sine_group, rotated, active_rows, LOCAL_O_GROUPS,
+            )
+        # Input quantization.
+        payload_all = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
+        scales_all = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
+        with pl.spmd(vector_workers, name_hint="quant_o_vf"):
+            payload_all, scales_all = _quant_o_vf(attended_group, rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
+        output_group = _o_proj_quantized(
+            payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, group_rows, active_rows,
+        )
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def o_proj(
+    attended: pl.Tensor,
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
@@ -163,9 +209,9 @@ def o_proj(
         output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
         # Inverse RoPE.
         rotated = pl.create_tensor([80, LOCAL_H * ROPE_DIM], dtype=pl.BF16)
-        vector_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
+        vector_workers = 64
         rope_waves = pl.max(1, (active_rows + vector_workers - 1) // vector_workers)
-        rope_workers = pl.max(1, (active_rows + rope_waves - 1) // rope_waves)
+        rope_workers = 64
         with pl.spmd(rope_workers, name_hint="rope_o_vf"):
             rotated = _rope_o_vf(
                 attended_group, cosine_group, sine_group, rotated, active_rows, LOCAL_O_GROUPS,
@@ -176,7 +222,7 @@ def o_proj(
         with pl.spmd(vector_workers, name_hint="quant_o_vf"):
             payload_all, scales_all = _quant_o_vf(attended_group, rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
         output_group = _o_proj_quantized(
-            payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, active_rows,
+            payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, group_rows, active_rows,
         )
     return output
 
@@ -255,7 +301,7 @@ def retire_prefill_signals(
 
 @pl.jit.inline(auto_scope=False)
 def prefill_sp_output_reduce_scatter(
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    partial: pl.Tensor[None, pl.BF16],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -321,10 +367,10 @@ def prefill_sp_output_reduce_scatter(
 
 @pl.jit.inline(auto_scope=False)
 def prefill_tp_output_all_reduce(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_partial: pl.Tensor[None, pl.BF16],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor[None, pl.BF16],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -382,14 +428,14 @@ def prefill_tp_output_all_reduce(
 
 @pl.jit
 def o_proj_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor[None, pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
+    output: pl.InOut[pl.Tensor[None, pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     attended.bind_dynamic(0, T_DYN)
@@ -404,18 +450,18 @@ def o_proj_validation(
 
 @pl.jit
 def o_proj_with_hc_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor[None, pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    sublayer: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    rope_cos: pl.Tensor[None, pl.FP32],
+    rope_sin: pl.Tensor[None, pl.FP32],
+    sublayer: pl.Out[pl.Tensor[None, pl.BF16]],
+    residual: pl.Tensor[None, pl.FP32],
+    post_mix: pl.Tensor[None, pl.FP32],
+    residual_mix: pl.Tensor[None, pl.FP32],
+    output: pl.Out[pl.Tensor[None, pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     attended.bind_dynamic(0, T_DYN)

@@ -112,18 +112,53 @@ def q_norm_quant(
     ...
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "q_norm_quant_decode.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def q_norm_quant_decode(
+    projected: pl.Tensor,
+    weight: pl.Tensor,
+    latent: pl.Out[pl.Tensor],
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INT32],
+    tile_offset: pl.Scalar[pl.INT32],
+):
+    """Normalize complete latent rows and quantize them with packed E8M0 scales."""
+    ...
+
+
+from config import MOE_TOKENS as DECODE_GRAPH_CAPACITY
+
+
 @pl.jit.inline(auto_scope=False)
 def quantize_projection_input(
     x: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    payload: pl.Tensor,
+    scales: pl.Tensor,
 ):
     """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
     padded_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
-    payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
-    workers = pl.min(pl.min(quant_blocks, 32), 2 * pl.system.available_cluster_count())
+    workers = 32
+    with pl.spmd(workers, name_hint="qkv_quant"):
+        qkv_quant(x, payload, scales, num_tokens, padded_rows)
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def quantize_projection_input_decode(
+    x: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+):
+    """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
+    capacity = DECODE_GRAPH_CAPACITY
+    padded_rows = ((DECODE_GRAPH_CAPACITY + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
+    workers = 32
     with pl.spmd(workers, name_hint="qkv_quant"):
         qkv_quant(x, payload, scales, num_tokens, padded_rows)
     return payload, scales
@@ -143,11 +178,11 @@ def q_proj_rope(
     query_latent: pl.Tensor,
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    qb_payload: pl.Tensor,
+    qb_scales: pl.Tensor,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
     payload_rows = pl.tensor.dim(payload, 0)
-    qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
-    qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
@@ -179,7 +214,6 @@ def q_proj_rope(
                     qb_payload_tile, qb_scales_tile, q_rows,
                 )
         qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
-        qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
         qb_workers = pl.max(1, qb_workers)
         with pl.spmd(qb_workers, name_hint="proj_q_b"):
             query = _proj_q_b(
@@ -187,6 +221,65 @@ def q_proj_rope(
                 query, rope_cos, rope_sin, group_rows, LOCAL_H * HEAD_DIM, group_start,
             )
     return query_latent, query, qb_payload, qb_scales
+
+
+@pl.jit.inline(auto_scope=False)
+def q_proj_rope_decode(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wq_a: pl.Tensor,
+    wq_a_scale: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    wq_b: pl.Tensor,
+    wq_b_scale: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query_latent: pl.Tensor,
+    query: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    qb_payload: pl.Tensor,
+    qb_scales: pl.Tensor,
+):
+    """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
+    payload_rows = pl.tensor.dim(payload, 0)
+    for group_start in pl.parallel(0, DECODE_GRAPH_CAPACITY, PROJ_M_TILE):
+        group_rows = pl.min(PROJ_M_TILE, num_tokens)
+        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
+        scale_start = group_start * (D // 32)
+        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
+        projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
+        # Projection blocks own disjoint columns; no simultaneous start is required.
+        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
+            projected = _proj_q_a(group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows)
+        qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
+        qb_scale_start = group_start * (Q_LORA // 32)
+        qb_scales_group = pl.tensor.slice(
+            qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start],
+        )
+        for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
+            q_local = q_mt * MX_M_TILE
+            q_start = group_start + q_local
+            projected_tile = pl.slice(projected, [MX_M_TILE, Q_LORA], [q_local, 0])
+            latent_tile = pl.slice(query_latent, [MX_M_TILE, Q_LORA], [q_start, 0])
+            qb_payload_tile = pl.tensor.slice(qb_payload_group, [MX_M_TILE, Q_LORA], [q_local, 0])
+            qb_scale_offset = q_local * (Q_LORA // 32)
+            qb_scales_tile = pl.tensor.slice(
+                qb_scales_group, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_offset],
+            )
+            with pl.spmd(1, name_hint="q_norm_quant"):
+                q_norm_quant_decode(
+                    projected_tile, q_norm_weight, latent_tile,
+                    qb_payload_tile, qb_scales_tile, group_rows, q_local,
+                )
+        qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+        qb_workers = pl.max(1, qb_workers)
+        with pl.spmd(qb_workers, name_hint="proj_q_b"):
+            query = _proj_q_b(
+                qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
+                query, rope_cos, rope_sin, group_rows, LOCAL_H * HEAD_DIM, group_start,
+            )
+    return query_latent, query, qb_payload, qb_scales
+
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "norm_rope_publish.cpp",
@@ -228,6 +321,28 @@ def kv_proj(
 
 
 @pl.jit.inline(auto_scope=False)
+def kv_proj_decode(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    wkv: pl.Tensor,
+    wkv_scale: pl.Tensor,
+    kv_projection: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project NZ KV weights to BF16 rows in M80 groups."""
+    for group_start in pl.parallel(0, DECODE_GRAPH_CAPACITY, PROJ_M_TILE):
+        group_rows = pl.min(PROJ_M_TILE, num_tokens)
+        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
+        scale_start = group_start * (D // 32)
+        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
+        with pl.spmd(HEAD_DIM // KV_N_TILE, name_hint="proj_kv", sync_start=True):
+            kv_projection = _proj_kv(
+                group_payload, wkv, group_scales, wkv_scale, kv_projection, group_rows, group_start,
+            )
+    return kv_projection
+
+
+@pl.jit.inline(auto_scope=False)
 def window_publish(
     kv_projection: pl.Tensor,
     kv_norm_weight: pl.Tensor,
@@ -238,12 +353,55 @@ def window_publish(
     cache_scale: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
+    local_scales: pl.Tensor,
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
-    workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
-    with pl.spmd(workers, name_hint="norm_rope_publish", deps=[cache_ready]) as published:
-        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, cache_scale, num_tokens)
-    return published
+    workers = WINDOW_PUBLISH_WORKER_TILE
+    blocks = pl.tensor.dim(cache_scale, 0)
+    local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
+    with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
+        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
+    output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
+    with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens):
+            slot = pl.read(slots, [token])
+            if slot >= 0 and slot < blocks * 128:
+                scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
+                pl.store(scale, [slot, 0], output_rows)
+    return completed
+
+
+@pl.jit.inline(auto_scope=False)
+def window_publish_decode(
+    kv_projection: pl.Tensor,
+    kv_norm_weight: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    local_scales: pl.Tensor,
+    cache_blocks: pl.Scalar[pl.INDEX],
+):
+    """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
+    workers = WINDOW_PUBLISH_WORKER_TILE
+    blocks = cache_blocks
+    local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
+    with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
+        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
+    output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
+    with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens):
+            slot = pl.read(slots, [token])
+            if slot >= 0 and slot < blocks * 128:
+                scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
+                pl.store(scale, [slot, 0], output_rows)
+    return completed
+
 
 
 def golden_rope_interleave(

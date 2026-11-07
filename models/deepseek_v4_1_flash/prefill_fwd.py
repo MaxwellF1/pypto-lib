@@ -52,7 +52,9 @@ _shape_parser.add_argument("--experts-per-rank", type=int)
 _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--dp", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
-C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
+if _shape_options.checkpoint and _shape_options.ep is None and _shape_options.dp is None:
+    C.EP_SIZE = 4
+    C.DP_SIZE = 4
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
 if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
@@ -84,6 +86,8 @@ from config import (
     STATE_CAPACITY,
     MOE_TOKENS,
     ROUTE_T_DYN,
+    DSPARK_DRAFT_LAYERS,
+    DSPARK_TARGET_LAYER_IDS,
 )
 
 from hc import hc_post
@@ -104,10 +108,12 @@ from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
 from prefill_c1a_reuse import prefill_c1a_reuse_attention
 from rmsnorm import rms_norm_tiled
+from expert_routed import create_moe_workspace
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
+DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
@@ -291,7 +297,7 @@ def _prefill_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[
@@ -348,6 +354,9 @@ def _prefill_moe(
     slab_pre: pl.Tensor[[2 * MOE_TOKENS, HC_MULT], pl.FP32],
     slab_mixed: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     slab_rows: pl.Tensor[[MOE_TOKENS], pl.INT32],
+    recv_x_local: pl.InOut[pl.Tensor],
+    routed_pair: pl.InOut[pl.Tensor],
+    routed_partial: pl.InOut[pl.Tensor],
     reuse_ready: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
@@ -393,7 +402,8 @@ def _prefill_moe(
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
-                routed_output, combine_arrived, active, ep_rank, epoch,
+                routed_output, combine_arrived, recv_x_local, routed_pair, routed_partial,
+                active, ep_rank, epoch,
                 hf32=False,
             )
             with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
@@ -457,7 +467,7 @@ def l2_prefill_fwd(
     hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
@@ -497,6 +507,7 @@ def l2_prefill_fwd(
     logit_rows: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
     recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
@@ -568,6 +579,7 @@ def l2_prefill_fwd(
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
+    recv_x_local, routed_pair, routed_partial = create_moe_workspace(LOCAL_EXPERTS, TOPK)
     moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
@@ -620,7 +632,7 @@ def l2_prefill_fwd(
         layer_index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ] = index_wq_b[index_source]
         layer_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [index_source * (Q_LORA // MX_GROUP), 0])
         layer_index_weights: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ] = index_weights_proj[index_source]
-        layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
+        layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
         layer_gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
@@ -646,7 +658,7 @@ def l2_prefill_fwd(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
-                    pl.read(counts, [0]),
+                    encoder_count,
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
@@ -656,9 +668,11 @@ def l2_prefill_fwd(
             with pl.scope():
                 engram_slot = layer // 14
                 layer_engram_scale = pl.slice(engram_wkv_scale, [ENGRAM_K // 32, KV_OUT], [engram_slot * (ENGRAM_K // 32), 0])
+                engram_kv = pl.create_tensor([CAPACITY, KV_OUT], dtype=pl.BF16)
+                engram_kv_fp32 = pl.create_tensor([CAPACITY, KV_OUT], dtype=pl.FP32)
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
-                    engram_weight[engram_slot], hidden, hidden,
+                    engram_weight[engram_slot], hidden, hidden, engram_kv, engram_kv_fp32,
                 )
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
@@ -715,8 +729,19 @@ def l2_prefill_fwd(
             layer_shared_w3, layer_shared_w3_scale, next_pre, ffn_mixed, next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, active, rank, layer + 1,
+            recv_x_local, routed_pair, routed_partial, moe_ready, active, rank, layer + 1,
         )
+        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
+            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+            for core in pl.spmd(48, name_hint="prefill_dspark_target_hidden", deps=[moe_ready]):
+                for token in pl.range(core, CAPACITY, 48):
+                    if token < active:
+                        hc_row = next_hidden[token : token + 1, 0:HC_MULT, 0:D]
+                        hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                        target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
+                    else:
+                        target_bf16 = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [2 * CAPACITY, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [2 * CAPACITY, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
@@ -774,7 +799,7 @@ def l3_prefill_fwd(
     hc_ffn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
@@ -814,6 +839,7 @@ def l3_prefill_fwd(
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[RANKS, CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
 ):
@@ -852,7 +878,9 @@ def l3_prefill_fwd(
 
     Preserve all seven InOut cache tensors across chunks and decode. Their
     source/page dimensions can be flattened into decode pool views.
-    Residual/pre-mix outputs describe these rows after layer 39. New tokens
+    Residual/pre-mix outputs describe these rows after layer 39. The DSpark
+    output packs HC-mean hidden states from layers 37, 38 and 39 per row.
+    New tokens
     start from their own embedding and identity pre-mix; historical mHC state
     is represented by the committed KV/index/compressor caches.
 
@@ -949,7 +977,7 @@ def l3_prefill_fwd(
             final_norm_weight[rank],
             lm_head_weight[rank],
             logit_rows[rank],
-            x_hc_out[rank], pre_mix_out[rank],
+            x_hc_out[rank], pre_mix_out[rank], dspark_target_hidden[rank],
             logits[rank],
             sampled_ids[rank],
             recv_meta,
@@ -1012,7 +1040,7 @@ PREFILL_TENSORS = (
     "final_norm_weight",
     "lm_head_weight",
     "logit_rows",
-    "x_hc_out", "pre_mix_out",
+    "x_hc_out", "pre_mix_out", "dspark_target_hidden",
     "logits",
     "sampled_ids",
 )
@@ -1182,7 +1210,7 @@ def forward_weight_layouts(local_experts: int):
         "hc_ffn_scale": ((layers * 3,), torch.float32),
         "hc_ffn_base": ((layers * M.mix_hc,), torch.float32),
         "ffn_norm_weight": ((layers * d,), torch.bfloat16),
-        "gate_weight": ((layers * experts, d), torch.bfloat16),
+        "gate_weight": ((layers * experts, d), torch.float32),
         "correction_bias": ((layers * experts,), torch.float32),
         "routed_w1": ((layers * local_experts, packed_rows, 128), torch.uint8),
         "routed_w1_scale": ((layers * (local_experts * (d // 32)), inter), torch.float8_e8m0fnu),
@@ -1586,6 +1614,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     outputs = {
         "x_hc_out": ((CAPACITY, HC_MULT, D), torch.float32),
         "pre_mix_out": ((CAPACITY, HC_MULT), torch.float32),
+        "dspark_target_hidden": ((CAPACITY, DSPARK_MAIN_IN), torch.bfloat16),
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
@@ -1766,10 +1795,16 @@ def build_tensor_specs():
     outputs = {
         "x_hc_out": ([RANKS, CAPACITY, HC_MULT, D], torch.float32),
         "pre_mix_out": ([RANKS, CAPACITY, HC_MULT], torch.float32),
+        "dspark_target_hidden": ([RANKS, CAPACITY, DSPARK_MAIN_IN], torch.bfloat16),
         "logits": ([RANKS, 16, VOCAB], torch.float32),
         "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
-    values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
+    active_rows = [CAPACITY, CAPACITY // 2, *([0] * (RANKS - 2))]
+    rank_values = []
+    for count in active_rows:
+        embedding = torch.full((count, D), 0.125, dtype=torch.bfloat16)
+        values = prepare_prefill_inputs(embedding, CAPACITY)
+        rank_values.append(values)
     specs = []
     for name in PREFILL_TENSORS:
         if name in weight_layouts:
@@ -1782,8 +1817,7 @@ def build_tensor_specs():
             shape, dtype = outputs[name]
             value = None
         else:
-            tensor = values[name]
-            value = tensor.unsqueeze(0).repeat(RANKS, *([1] * tensor.ndim))
+            value = torch.stack([values[name] for values in rank_values])
             shape, dtype = list(value.shape), value.dtype
         specs.append(TensorSpec(name, shape, dtype, init_value=value))
     return specs
@@ -1994,6 +2028,24 @@ if __name__ == "__main__":
                 parameters = compiled._get_metadata()[0]
                 arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
                 runtime(*arguments, config=cfg)
-            print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
+                target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
+                final_hc = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.float32)
+                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
+                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("x_hc_out")], final_hc)
+            final_tap = target_hidden[:, :, 2 * D : 3 * D]
+            expected_final_tap = final_hc.mean(dim=2).to(torch.bfloat16)
+            if not torch.isfinite(target_hidden.float()).all():
+                raise AssertionError("DSpark prefill target hidden contains non-finite values")
+            expected_tap = torch.zeros((RANKS, CAPACITY, D), dtype=torch.bfloat16)
+            active_rows = specs[PREFILL_TENSORS.index("counts")].init_value[:, 1].tolist()
+            for rank, count in enumerate(active_rows):
+                expected_tap[rank, :count] = 0.125
+            for tap, layer in enumerate(DSPARK_TARGET_LAYER_IDS):
+                tap_rows = target_hidden[:, :, tap * D : (tap + 1) * D]
+                if not torch.equal(tap_rows, expected_tap):
+                    raise AssertionError(f"DSpark prefill layer {layer} tap differs from the zero-weight reference")
+            if not torch.equal(final_tap, expected_final_tap):
+                raise AssertionError("DSpark prefill final tap does not match final HC state")
+            print("[FWD] Execution and all DSpark taps passed the zero-weight reference; full numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)

@@ -55,8 +55,7 @@ def gemm_mxfp8_to_bf16(
     scale_group_end = scale_group_offset + scale_group_size
     scale_group_backing = scale_backing_flat[0:1, scale_group_offset:scale_group_end]
     scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
-    available_clusters = pl.system.available_cluster_count()
-    workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
+    workers = pl.min(pl.min(output_width // n_tile, max_workers), 32)
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
         full_a = pl.load(payload, [payload_row, 0], [m_tile, width], target_memory=pl.MemorySpace.Mat)
         block_num = pl.tile.get_block_num()
@@ -152,7 +151,7 @@ def gemm_bf16_via_mxfp8_to_bf16_fused(
     name_hint: pl.constexpr,
 ):
     """Compute native M32 MXFP8 products with in-task activation quantization."""
-    workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
+    workers = pl.min(output_width // n_tile, 32)
     for mt in pl.parallel((num_tokens + 31) // 32):
         for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
             block_num = pl.tile.get_block_num()
@@ -193,7 +192,7 @@ def gemm_bf16_to_bf16(
 ):
     """Project ND activations with NZ weights and store BF16 through Fixpipe."""
     blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
-    task_workers = pl.max(pl.min(blocks, workers), 1)
+    task_workers = workers
     entry_deps = pl.array.create(1, pl.TASK_ID)
     entry_deps[0] = ready
     with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as cube_tid:

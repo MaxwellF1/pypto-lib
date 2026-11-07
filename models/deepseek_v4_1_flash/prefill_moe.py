@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-# ci: no-sim
 """DeepSeek-V4.1 prefill MoE with compact TP owner rows and mHC."""
 
 from dataclasses import replace
@@ -45,7 +44,7 @@ from config import T_DYN, PREFILL_MAX_TOKENS, SUPPORTED_TP_SIZES
 from gate import gate_normalized as npu_gate
 from expert_shared import expert_shared
 from expert_routed import (
-    dispatch,
+    dispatch, create_moe_workspace,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
     expert_routed_scatter,
 )
@@ -130,7 +129,7 @@ def combine_scattered(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
+                pld.system.wait(
                     signal=combine_arrived, offsets=[src, 0, 0],
                     expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                 )
@@ -158,7 +157,7 @@ def prefill_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -183,6 +182,9 @@ def prefill_moe(
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    recv_x_local: pl.InOut[pl.Tensor],
+    routed_pair: pl.InOut[pl.Tensor],
+    routed_partial: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
@@ -213,7 +215,10 @@ def prefill_moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-        npu_gate(ffn_input, gate_weight, correction_bias, num_tokens, x_norm_mx, x_norm_scale, indices, weights)
+        npu_gate(
+            ffn_input, gate_weight, correction_bias, num_tokens,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
+        )
         dispatch_indices = indices
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
@@ -225,7 +230,6 @@ def prefill_moe(
             shared_output,
         )
 
-        recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
         # Contiguous ND backing for the routed-expert MX_A_ZZ view.
         recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
@@ -238,6 +242,7 @@ def prefill_moe(
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             data_arrived, num_tokens, ep_rank, moe_epoch,
+            local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
 
         scatter_done = expert_routed_scatter(
@@ -246,7 +251,7 @@ def prefill_moe(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready,
+            routed_output, input_ready, routed_pair, routed_partial, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
         output_ready = combine_scattered(
             shared_result, sublayer,
@@ -265,7 +270,7 @@ def prefill_moe(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
             for peer in pl.range(EP_SIZE):
                 if peer != ep_rank:
-                    pld.system.defer_wait(
+                    pld.system.wait(
                         signal=combine_arrived, offsets=[peer, 1, 0],
                         expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                     )
@@ -284,7 +289,7 @@ def l2_prefill_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -319,6 +324,7 @@ def l2_prefill_moe(
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
+    recv_x_local, routed_pair, routed_partial = create_moe_workspace(N_LOCAL_EXPERTS, TOPK)
     prefill_moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
@@ -328,7 +334,7 @@ def l2_prefill_moe(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch,
+        recv_x_local, routed_pair, routed_partial, local_num_tokens, ep_rank, moe_epoch,
         hf32=False,
     )
     clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
@@ -343,7 +349,7 @@ def l3_prefill_moe(
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
@@ -467,7 +473,7 @@ def prefill_moe_sublayer(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -494,6 +500,9 @@ def prefill_moe_sublayer(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    recv_x_local: pl.InOut[pl.Tensor],
+    routed_pair: pl.InOut[pl.Tensor],
+    routed_partial: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
@@ -527,7 +536,7 @@ def prefill_moe_sublayer(
         weights = pl.create_tensor([TOKENS, TOPK], dtype=pl.FP32)
         npu_gate(
             local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-            x_norm_mx, x_norm_scale, indices, weights,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
         dispatch_indices = indices
 
@@ -540,7 +549,6 @@ def prefill_moe_sublayer(
             shared_output,
         )
 
-        recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
         # Contiguous ND backing for the routed-expert MX_A_ZZ view.
         recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
@@ -553,6 +561,7 @@ def prefill_moe_sublayer(
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             data_arrived, local_num_tokens, ep_rank, moe_epoch,
+            local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
 
         scatter_done = expert_routed_scatter(
@@ -561,7 +570,7 @@ def prefill_moe_sublayer(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready,
+            routed_output, input_ready, routed_pair, routed_partial, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
         output_ready = combine_scattered(
             shared_result, local_ffn_owned,
@@ -580,7 +589,7 @@ def prefill_moe_sublayer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
             for peer in pl.range(EP_SIZE):
                 if peer != ep_rank:
-                    pld.system.defer_wait(
+                    pld.system.wait(
                         signal=combine_arrived, offsets=[peer, 1, 0],
                         expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                     )
@@ -710,7 +719,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     specs = [
         TensorSpec("x", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16, init_value=lambda: x),
         TensorSpec("norm_weight", [EP_SIZE, D], torch.bfloat16, init_value=lambda: norm_weight),
-        TensorSpec("gate_weight", [EP_SIZE, N_EXPERTS, D], torch.bfloat16, init_value=lambda: gate_weight),
+        TensorSpec("gate_weight", [EP_SIZE, N_EXPERTS, D], torch.float32, init_value=lambda: gate_weight),
         TensorSpec("correction_bias", [EP_SIZE, N_EXPERTS], torch.float32, init_value=lambda: correction_bias),
         TensorSpec("routed_w1", list(routed_w1_shape), torch.uint8, init_value=lambda: routed_weights()[0]),
         TensorSpec("routed_w1_scale", list(routed_w1_scale_shape), e8m0, init_value=lambda: routed_weights()[1]),

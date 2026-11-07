@@ -45,6 +45,9 @@ QUANT_TASK_TILE = QUANT_TILE * 4
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
+# Graph launch capacity is metadata-constant; original kernels retain dynamic task/active bounds.
+GATE_GRAPH_WORKERS = min(16, (T_PAD // GATE_M_TILE) * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE))
+GATE_GRAPH_ROUTE_TILES = (T + GATE_T_TILE - 1) // GATE_T_TILE
 SCORE_PAD = 32 if N_EXPERTS <= 32 else 256 if N_EXPERTS <= 256 else 384
 
 
@@ -128,11 +131,7 @@ def gate_normalized(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    if active_tokens < 0:
-        active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+    active_tokens = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), T)
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
     for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
@@ -160,11 +159,7 @@ def gate_from_bf16(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    if active_tokens < 0:
-        active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
+    active_tokens = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), T)
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
@@ -181,8 +176,7 @@ def gate_from_bf16(
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
     gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-    gate_worker_limit = pl.min(16, pl.system.available_cluster_count())
-    gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
+    gate_workers = GATE_GRAPH_WORKERS
     with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         route_scores_buf, biased_scores_buf = _gate_scores_vf(
             xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
@@ -190,7 +184,7 @@ def gate_from_bf16(
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
-    task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    task_route_tiles = GATE_GRAPH_ROUTE_TILES
     with pl.spmd(pl.max(task_route_tiles, 1), name_hint="route_sort"):
         indices, weights = _gate_route_sort_vf(
             biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE,
