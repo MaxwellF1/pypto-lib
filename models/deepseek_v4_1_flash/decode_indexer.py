@@ -56,7 +56,7 @@ PROJ_K_TILE = 128
 PROJ_N_TILE = 256
 
 
-from lightning_indexer import ATTENTION, POOL, LI_SOURCE, LI_INCLUDES, prepare_score_metadata, score_paged
+from lightning_indexer import ATTENTION, ATTENTION_WITH_POOL, LI_SOURCE, LI_INCLUDES, prepare_score_metadata, score_paged
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "idx_q.cpp",
@@ -2101,18 +2101,20 @@ def _deepseek_select(
 
 
 @pl.jit.extern(core_type="aiv", source=LI_SOURCE, include_dirs=LI_INCLUDES)
-def _deepseek_select_pool(
+def _deepseek_select_with_pool(
     scores: pl.Tensor,
     lengths: pl.Tensor,
     indices: pl.Out[pl.Tensor],
     table: pl.Tensor,
     request_ids: pl.Tensor,
     pool_counts: pl.Out[pl.Tensor],
+    block_scores: pl.Tensor,
+    pool_ids: pl.Out[pl.Tensor],
     mode: pl.Scalar[pl.INT64],
     active: pl.Scalar[pl.INT64],
     sorted_index: pl.Scalar[pl.INT64],
     page_rows: pl.Scalar[pl.INT64],
-) -> pl.Tensor:
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     ...
 
 
@@ -2133,22 +2135,6 @@ def deepseek_select_attention(
         _deepseek_select(
             scores, lengths, physical, table, request_ids, lengths,
             ATTENTION, active, native_sorted, page_rows,
-        )
-
-
-@pl.jit.inline(auto_scope=False)
-def deepseek_select_pool(
-    block_scores: pl.Tensor,
-    token_lengths: pl.Tensor,
-    pool_ids: pl.Tensor,
-    pool_counts: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    active = pl.cast(num_tokens, pl.INT64)
-    with pl.spmd(64, name_hint="qli_deepseek_pool_select"):
-        _deepseek_select_pool(
-            block_scores, token_lengths, pool_ids, block_scores, token_lengths, pool_counts,
-            POOL, active, 1, 128,
         )
 
 
@@ -2183,12 +2169,14 @@ def select_qli(
             query, query_scale, raw_weights, key, key_scale, table,
             request_ids, lengths, metadata, scores, active, block_scores, True,
         )
-        deepseek_select_attention(
-            scores, lengths, table, request_ids, output, active, page_rows, sorted_index,
-        )
-        deepseek_select_pool(
-            block_scores, lengths, pool_ids, pool_counts, active,
-        )
+        native_active = pl.cast(num_tokens, pl.INT64)
+        native_sorted = pl.cast(sorted_index, pl.INT64)
+        with pl.spmd(64, name_hint="qli_deepseek_attention_with_pool"):
+            _deepseek_select_with_pool(
+                scores, lengths, output, table, request_ids,
+                pool_counts, block_scores, pool_ids,
+                ATTENTION_WITH_POOL, native_active, native_sorted, page_rows,
+            )
     else:
         score_paged(
             query, query_scale, raw_weights, key, key_scale, table,

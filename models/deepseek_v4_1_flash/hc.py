@@ -372,6 +372,37 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     return inv_rms, mixes_partials
 
 
+@pl.jit.inline(auto_scope=False)
+def _hc_collapse_row(
+    source: pl.Tile[[HC_DIM], pl.FP32, pl.Mem.Vec],
+    mix: pl.Tile[[MIX_PAD], pl.FP32, pl.Mem.Vec],
+    local: pl.Scalar[pl.INDEX],
+):
+    """Collapse one row and round it to BF16 in UB."""
+    collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+    with pl.reg_scope():
+        full = pl.reg.full_mask(lanes=64)
+        mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
+        mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
+        mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
+        mix3 = pl.reg.load(mix, offset=local * HC_MULT + 3, lanes=1)
+        p0 = pl.reg.broadcast(mix0, lanes=64, dtype=pl.FP32)
+        p1 = pl.reg.broadcast(mix1, lanes=64, dtype=pl.FP32)
+        p2 = pl.reg.broadcast(mix2, lanes=64, dtype=pl.FP32)
+        p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(D // 64):
+            offset = chunk * 64
+            x0 = pl.reg.mul(pl.reg.load(source, offset=offset, lanes=64), p0, full)
+            x1 = pl.reg.mul(pl.reg.load(source, offset=D + offset, lanes=64), p1, full)
+            x2 = pl.reg.mul(pl.reg.load(source, offset=2 * D + offset, lanes=64), p2, full)
+            x3 = pl.reg.mul(pl.reg.load(source, offset=3 * D + offset, lanes=64), p3, full)
+            value = pl.reg.add(pl.reg.add(pl.reg.add(x0, x1, full), x2, full), x3, full)
+            rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
+            _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
+    collapsed = pl.reshape(collapsed, [1, D])
+    return collapsed
+
+
 @pl.jit.inline
 def _hc_collapse_rows(
     x_hc: pl.Tensor,
@@ -401,31 +432,12 @@ def _hc_collapse_rows(
                 mix_flat, [0, start * HC_MULT], [1, MIX_PAD],
                 valid_shape=[1, rows * HC_MULT], target_memory=pl.MemorySpace.Vec,
             )
+            mix = pl.reshape(mix, [MIX_PAD])
             for local in pl.pipeline(rows, stage=2):
                 row = start + local
-                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.MemorySpace.Vec)
+                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.Mem.Vec)
                 source = pl.reshape(source, [HC_DIM])
-                collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
-                with pl.reg_scope():
-                    full = pl.reg.full_mask(lanes=64)
-                    mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
-                    mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
-                    mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
-                    mix3 = pl.reg.load(mix, offset=local * HC_MULT + 3, lanes=1)
-                    p0 = pl.reg.broadcast(mix0, lanes=64, dtype=pl.FP32)
-                    p1 = pl.reg.broadcast(mix1, lanes=64, dtype=pl.FP32)
-                    p2 = pl.reg.broadcast(mix2, lanes=64, dtype=pl.FP32)
-                    p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
-                    for chunk in pl.hardware_loop(D // 64):
-                        offset = chunk * 64
-                        x0 = pl.reg.mul(pl.reg.load(source, offset=offset, lanes=64), p0, full)
-                        x1 = pl.reg.mul(pl.reg.load(source, offset=D + offset, lanes=64), p1, full)
-                        x2 = pl.reg.mul(pl.reg.load(source, offset=2 * D + offset, lanes=64), p2, full)
-                        x3 = pl.reg.mul(pl.reg.load(source, offset=3 * D + offset, lanes=64), p3, full)
-                        value = pl.reg.add(pl.reg.add(pl.reg.add(x0, x1, full), x2, full), x3, full)
-                        rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
-                        _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
-                collapsed = pl.reshape(collapsed, [1, D])
+                collapsed = _hc_collapse_row(source, mix, local)
                 if store_collapsed:
                     pl.store(collapsed, [row, 0], raw_output)
                 if row < active_rows:

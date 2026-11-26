@@ -381,12 +381,12 @@ def route_tokens(
     gate_worker_limit = pl.min(16, pl.system.available_cluster_count())
     gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
     if pl.tensor.dim(gate_bias, 0) > n_experts:
-        with pl.spmd(gate_workers, name_hint="gate_token_bias", sync_start=True):
+        with pl.spmd(gate_workers, name_hint="gate_token_bias"):
             route_scores_buf, biased_scores_buf = _gate_scores_vf(
                 xg_buf, gate_w, gate_bias_matrix, route_scores_buf, biased_scores_buf, gate_tasks, True,
             )
     else:
-        with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
+        with pl.spmd(gate_workers, name_hint="gate"):
             route_scores_buf, biased_scores_buf = _gate_scores_vf(
                 xg_buf, gate_w, gate_bias_matrix, route_scores_buf, biased_scores_buf, gate_tasks, False,
             )

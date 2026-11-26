@@ -50,7 +50,7 @@ from gate import gate, route_tokens
 from expert_shared import SWIGLU_WORKER_TILE, W13_WORKER_TILE, W2_WORKER_TILE, expert_shared
 from mega_moe import (
     FP4_PANEL_ROWS, _resident_down_weight, _resident_gate_up_half,
-    specialize_mega_moe, use_packed_decode_weights, workspace_bytes,
+    specialize_mega_moe_hc_post, use_packed_decode_weights, workspace_bytes,
 )
 from expert_routed import (
     ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE, dispatch,
@@ -336,7 +336,7 @@ def split_moe(
 
 def make_decode_moe(local_experts, topk, packed_routed_weights=False):
     """Wire HC and routing to the fused experts specialized for this entry."""
-    fused_experts = specialize_mega_moe(local_experts, topk, packed_routed_weights)
+    fused_experts = specialize_mega_moe_hc_post(local_experts, topk, packed_routed_weights)
 
     @pl.jit.inline(auto_scope=False)
     def moe(
@@ -389,14 +389,13 @@ def make_decode_moe(local_experts, topk, packed_routed_weights=False):
             else:
                 dispatch_indices = indices
 
-            sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
             fused_experts(
-                dispatch_indices, x_norm, weights, sublayer,
+                dispatch_indices, x_norm, weights,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale,
                 moe_workspace, num_tokens,
+                x_hc, post_mix, residual_mix, x_next,
             )
-            hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=None, dep_count=0)
         return x_next
 
     return moe
